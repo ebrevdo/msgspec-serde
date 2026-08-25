@@ -191,6 +191,7 @@ class _Context:
             tuple[str, int], ObjectDefinition | None
         ] = {}
         self._union_arms: dict[str, tuple[_UnionArm, ...]] = {}
+        self._union_arm_names: frozenset[str] | None = None
         self._union_pairs: dict[str, tuple[_UnionPair, ...]] = {}
         self._dynamic_pairs: dict[str, tuple[_DynamicPair, ...]] = {}
 
@@ -390,6 +391,18 @@ class _Context:
         result = tuple(pairs)
         self._union_pairs[item.name] = result
         return result
+
+    def is_union_arm(self, item: ObjectDefinition) -> bool:
+        names = self._union_arm_names
+        if names is None:
+            names = frozenset(
+                arm.object.name
+                for enum in self.schema.enums
+                if enum.is_union
+                for arm in self.union_arms(enum)
+            )
+            self._union_arm_names = names
+        return item.name in names
 
     def dynamic_pairs(self, item: ObjectDefinition) -> tuple[_DynamicPair, ...]:
         cached = self._dynamic_pairs.get(item.name)
@@ -851,12 +864,13 @@ def _render_model(
             raise GenerationError(
                 f"table {item.name} uses reserved {description} {conflict!r}"
             )
-        options.extend(
-            (
-                f"tag={item.name!r}",
-                f"tag_field={_MSGSPEC_TAG_FIELD!r}",
+        if context.is_union_arm(item):
+            options.extend(
+                (
+                    f"tag={item.name!r}",
+                    f"tag_field={_MSGSPEC_TAG_FIELD!r}",
+                )
             )
-        )
     if has_numeric_vectors:
         options.append("eq=False")
     lines = [f"class {name}(msgspec.Struct, {', '.join(options)}):"]
@@ -2022,7 +2036,7 @@ def render_module(
             (
                 "",
                 "",
-                f"register_dynamic_type({root_name}, {root_name}View)",
+                f"register_dynamic_type({root.name!r}, {root_name}, {root_name}View)",
             )
         )
 

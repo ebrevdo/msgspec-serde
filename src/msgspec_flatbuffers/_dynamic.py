@@ -14,6 +14,9 @@ from ._runtime import TableView
 
 _MSGSPEC_TAG_FIELD = "__msgspec_flatbuffers_type__"
 _OPAQUE_DATA_FIELD = "__msgspec_flatbuffers_data__"
+_DYNAMIC_VALUE_FIELD = "value"
+_KNOWN_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _DYNAMIC_VALUE_FIELD))
+_OPAQUE_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _OPAQUE_DATA_FIELD))
 _ABSENT: Any = object()
 _MAX_NEGATIVE_ENTRIES_PER_INDEX = 1024
 
@@ -49,12 +52,13 @@ class _DynamicTypeRegistry:
 
     def register(
         self,
+        tag: str,
         model_type: type[msgspec.Struct],
         view_type: type[TableView],
     ) -> DynamicType:
-        """Register one msgspec model tag and FlatBuffer view."""
+        """Register one dynamic type name, materialized model, and view."""
 
-        entry = _validated_entry(model_type, view_type)
+        entry = _validated_entry(tag, model_type, view_type)
         with self._lock:
             existing = (
                 self._by_tag.get(entry.tag),
@@ -310,6 +314,7 @@ def _require_allowed_prefix(tag: str, prefix: str | None) -> None:
 
 
 def _validated_entry(
+    tag: str,
     model_type: type[msgspec.Struct],
     view_type: type[TableView],
 ) -> DynamicType:
@@ -325,13 +330,7 @@ def _validated_entry(
     if not callable(getattr(view_type, "to_model", None)):
         raise TypeError("dynamic FlatBuffer views must define to_model()")
 
-    config = model_type.__struct_config__
-    tag = _validate_tag(config.tag)
-    if config.tag_field != _MSGSPEC_TAG_FIELD:
-        raise ValueError(
-            "dynamic FlatBuffer model tag configuration does not match the registry"
-        )
-    return DynamicType(tag, model_type, view_type)
+    return DynamicType(_validate_tag(tag), model_type, view_type)
 
 
 def dynamic_allow_prefix(pattern: str) -> str:
@@ -350,12 +349,13 @@ def dynamic_allow_prefix(pattern: str) -> str:
 
 
 def register_dynamic_type(
+    tag: str,
     model_type: type[msgspec.Struct],
     view_type: type[TableView],
 ) -> DynamicType:
     """Register a dynamic type in the process-wide registry."""
 
-    return dynamic_types.register(model_type, view_type)
+    return dynamic_types.register(tag, model_type, view_type)
 
 
 def register_dynamic_module(tag: str, module: str) -> str:
@@ -397,11 +397,15 @@ def dynamic_to_builtins(
 ) -> object:
     """Convert a dynamic value for msgspec's JSON and builtin encoders."""
 
-    if value._value is not None:
-        return msgspec.to_builtins(value._value, enc_hook=enc_hook)
+    model = value._value
+    if model is None:
+        return {
+            _MSGSPEC_TAG_FIELD: value._tag,
+            _OPAQUE_DATA_FIELD: value._data,
+        }
     return {
         _MSGSPEC_TAG_FIELD: value._tag,
-        _OPAQUE_DATA_FIELD: value._data,
+        _DYNAMIC_VALUE_FIELD: msgspec.to_builtins(model, enc_hook=enc_hook),
     }
 
 
@@ -419,20 +423,27 @@ def dynamic_from_builtins(
     if not isinstance(tag, str):
         raise ValueError(
             f"dynamic FlatBuffer object is missing {_MSGSPEC_TAG_FIELD!r}"
-        )
+    )
     value_type._require_allowed(tag)
     if _OPAQUE_DATA_FIELD in value:
-        if len(value) != 2:
+        if value.keys() != _OPAQUE_DYNAMIC_FIELDS:
             raise ValueError(
                 "opaque dynamic FlatBuffer objects have unexpected fields"
             )
         data = msgspec.convert(value[_OPAQUE_DATA_FIELD], type=bytes)
         return value_type.opaque(tag, data)
 
+    if value.keys() != _KNOWN_DYNAMIC_FIELDS:
+        raise ValueError("dynamic FlatBuffer objects must contain type and value")
+
     entry = dynamic_types.lookup_tag(tag)
     if entry is None:
         raise ValueError(f"unregistered dynamic FlatBuffer tag {tag!r}")
-    model = msgspec.convert(value, type=entry.model_type, dec_hook=dec_hook)
+    model = msgspec.convert(
+        value[_DYNAMIC_VALUE_FIELD],
+        type=entry.model_type,
+        dec_hook=dec_hook,
+    )
     return value_type._known(entry, model)
 
 

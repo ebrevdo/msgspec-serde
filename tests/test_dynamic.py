@@ -105,9 +105,19 @@ def test_known_dynamic_value_round_trips_msgspec_formats(
     annotation = envelope.Envelope.__annotations__["payload"]
     assert annotation.startswith("_Dynamic_Envelope_payload")
     assert "payload_type" not in envelope.Envelope.__annotations__
+    assert payload.Metric.__struct_config__.tag is None
+    assert envelope.Envelope.__struct_config__.tag is None
 
     builtins = msgspec.to_builtins(model, enc_hook=enc_hook)
-    assert builtins["payload"]["__msgspec_flatbuffers_type__"] == METRIC_TAG
+    metric_value = {
+        "name": "latency",
+        "values": [1.25, 2.5],
+    }
+    assert msgspec.to_builtins(model.payload.value, enc_hook=enc_hook) == metric_value
+    assert builtins["payload"] == {
+        "__msgspec_flatbuffers_type__": METRIC_TAG,
+        "value": metric_value,
+    }
     assert msgspec.convert(
         builtins,
         type=envelope.Envelope,
@@ -115,11 +125,17 @@ def test_known_dynamic_value_round_trips_msgspec_formats(
     ) == model
 
     encoded = msgspec.json.encode(model, enc_hook=enc_hook)
-    assert msgspec.json.decode(
+    decoded = msgspec.json.decode(
         encoded,
         type=envelope.Envelope,
         dec_hook=dec_hook,
-    ) == model
+    )
+    assert decoded == model
+    assert type(decoded.payload).__name__ == "_Dynamic_Envelope_payload"
+    assert isinstance(decoded.payload.value, payload.Metric)
+
+    flatbuffer = decoded.to_flatbuffer()
+    assert envelope.EnvelopeView.from_buffer(flatbuffer).to_model() == decoded
 
     disallowed = copy.deepcopy(builtins)
     disallowed["payload"]["__msgspec_flatbuffers_type__"] = "Other.Metric"
@@ -352,11 +368,7 @@ def test_dynamic_field_rejects_inconsistent_wire_values(
 
 
 def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
-    class Model(
-        msgspec.Struct,
-        tag="Registry.Model",
-        tag_field="__msgspec_flatbuffers_type__",
-    ):
+    class Model(msgspec.Struct):
         value: int
 
         def to_flatbuffer(self) -> bytes:
@@ -377,8 +389,8 @@ def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
         misses = list(executor.map(registry.lookup_tag, ["Registry.Model"] * 32))
     assert misses == [None] * 32
 
-    entry = registry.register(Model, View)
-    assert registry.register(Model, View) is entry
+    entry = registry.register("Registry.Model", Model, View)
+    assert registry.register("Registry.Model", Model, View) is entry
     assert registry.lookup_tag("Registry.Model") is entry
     assert registry.lookup_model(Model) is entry
 
@@ -391,7 +403,7 @@ def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
 
     def register() -> object:
         barrier.wait()
-        return racing.register(Model, View)
+        return racing.register("Registry.Model", Model, View)
 
     with ThreadPoolExecutor(max_workers=9) as executor:
         readers = [executor.submit(lookup) for _ in range(8)]
@@ -401,17 +413,13 @@ def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
     assert racing.lookup_tag("Registry.Model") is registered
 
     with pytest.raises(ValueError, match="conflicts"):
-        registry.register(Model, OtherView)
+        registry.register("Registry.Model", Model, OtherView)
 
 
 def test_lazy_dynamic_module_imports_outside_registry_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Model(
-        msgspec.Struct,
-        tag="Lazy.Model",
-        tag_field="__msgspec_flatbuffers_type__",
-    ):
+    class Model(msgspec.Struct):
         def to_flatbuffer(self) -> bytes:
             return b"buffer"
 
@@ -426,7 +434,7 @@ def test_lazy_dynamic_module_imports_outside_registry_lock(
 
     def load(module: str) -> object:
         imports.append(module)
-        registry.register(Model, View)
+        registry.register("Lazy.Model", Model, View)
         return object()
 
     monkeypatch.setattr(dynamic_module, "import_module", load)

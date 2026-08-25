@@ -248,10 +248,10 @@ def test_msgspec_hooks_preserve_arrays_and_tagged_unions(
 
     marker = "__msgspec_flatbuffers_type__"
     builtins_value = msgspec.to_builtins(model, enc_hook=enc_hook)
-    assert builtins_value[marker] == "Example.Nested.Envelope"
+    assert marker not in builtins_value
     payload_value = builtins_value["payload"]
     assert isinstance(payload_value, dict)
-    assert payload_value[marker] == "Example.Nested.Payload"
+    assert marker not in payload_value
     assert payload_value["measurements"] == [0.25, 1.5, 8.0]
     favorite = payload_value["favorite"]
     assert isinstance(favorite, dict)
@@ -340,8 +340,8 @@ def test_msgspec_hooks_preserve_arrays_and_tagged_unions(
             dec_hook=dec_hook,
         )
 
-    assert envelope.Envelope.__struct_config__.tag == "Example.Nested.Envelope"
-    assert envelope.Envelope.__struct_config__.tag_field == marker
+    assert envelope.Envelope.__struct_config__.tag is None
+    assert payload.Payload.__struct_config__.tag is None
     assert payload.Cat.__struct_config__.tag == "Example.Nested.Cat"
     assert payload.Dog.__struct_config__.tag == "Example.Nested.Dog"
 

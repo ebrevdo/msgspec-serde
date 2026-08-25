@@ -26,7 +26,7 @@ _UINT8 = struct.Struct('<B')
 _FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x01\xa7objects\x91\x85\xa4name\xb9Example.Evolution.Reading\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x95\x88\xa4name\xa2id\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\x00\xa4kind\xa6scalar\xa6scalar\xa6uint64\x87\xa4name\xa5label\xa4slot\x01\xa6offset\x06\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string\x88\xa4name\xa7samples\xa4slot\x02\xa6offset\x08\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa7float32\x88\xa4name\xa7quality\xa4slot\x03\xa6offset\n\xa8optional\xc2\xa8required\xc2\xa7defaultd\xa4kind\xa6scalar\xa6scalar\xa5uint8\x87\xa4name\xa4note\xa4slot\x04\xa6offset\x0c\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string')
 
 
-class Reading(msgspec.Struct, frozen=True, kw_only=True, tag='Example.Evolution.Reading', tag_field='__msgspec_flatbuffers_type__', eq=False):
+class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
     id: int = 0
     label: str | None = None
     samples: npt.NDArray[np.float32] | None = None

@@ -379,8 +379,21 @@ assert isinstance(payload.value, MetricView)
 ```
 
 The standard `enc_hook` and `dec_hook` use the same process-wide registry for
-dictionary and JSON conversion. Registered values use their normal fully
-qualified msgspec table tag.
+dictionary and JSON conversion. The dynamic wrapper stores the registered type
+name separately from the ordinary, untagged extension model:
+
+```json
+{
+  "__msgspec_flatbuffers_type__": "Example.Dynamic.Metric",
+  "value": {
+    "name": "latency",
+    "values": [1.25, 2.5]
+  }
+}
+```
+
+The extension model itself has no msgspec tag. Msgspec tags are generated only
+for tables that are alternatives in an IDL union.
 
 An unknown tag inside the allowed namespace is materialized as an opaque
 `DynamicValue`. Its tag and payload bytes survive dictionary, JSON, and
