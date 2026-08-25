@@ -16,7 +16,6 @@ from msgspec_flatbuffers import (
     build_scalar_vector,
 )
 
-
 _INT32 = struct.Struct("<i")
 _UINT32 = struct.Struct("<I")
 

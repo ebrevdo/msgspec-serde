@@ -101,6 +101,28 @@ _ViewT = TypeVar("_ViewT", bound="TableView | StructView")
 _UnionT = TypeVar("_UnionT")
 
 
+def _has_default_view_construction(
+    view_type: type[Any],
+    base_type: type[Any],
+) -> bool:
+    return (
+        view_type.__init__ is base_type.__init__
+        and view_type.__new__ is object.__new__
+        and type(view_type).__call__ is type.__call__
+    )
+
+
+def _supports_fast_vector_construction(
+    view_type: type[Any],
+    base_type: type[Any],
+) -> bool:
+    return (
+        _has_default_view_construction(view_type, base_type)
+        and getattr(view_type._from_validated_vector, "__func__", None)
+        is base_type._from_validated_vector.__func__
+    )
+
+
 class BufferBoundsError(ValueError):
     """Raised when a FlatBuffers offset points outside the backing buffer."""
 
@@ -144,9 +166,7 @@ class UnionDispatch:
         self.none_tag = none_tag
         self._table_types = alternatives
         self._has_untrusted_types = any(
-            view_type.__init__ is not TableView.__init__
-            or view_type.__new__ is not object.__new__
-            or type(view_type).__call__ is not type.__call__
+            not _has_default_view_construction(view_type, TableView)
             for view_type in alternatives.values()
         )
 
@@ -359,35 +379,6 @@ def build_string_vector(
     )
 
 
-def _estimate_sampled_vector_size(
-    values: Sequence[_T],
-    item_size: Callable[[_T], int],
-) -> int:
-    """Estimate offset-vector payloads from at most six fixed samples."""
-
-    length = len(values)
-    if length == 0:
-        return 8
-    if length <= 6:
-        payload_size = sum(map(item_size, values))
-    else:
-        middle = length // 2
-        payload_size = (
-            item_size(values[0])
-            + item_size(values[1])
-            + item_size(values[middle - 1])
-            + item_size(values[middle])
-            + item_size(values[-2])
-            + item_size(values[-1])
-        )
-        payload_size = (payload_size * length + 5) // 6
-    return 8 + length * _UINT32.size + payload_size
-
-
-def _estimate_string_vector_size(values: Sequence[str]) -> int:
-    return _estimate_sampled_vector_size(values, len) + len(values) * 8
-
-
 class CachedVector(Sequence[_T], Generic[_T]):
     """A fixed-length vector that strongly caches every accessed element."""
 
@@ -583,16 +574,16 @@ class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
         if not isinstance(dispatch, UnionDispatch):
             raise TypeError("FlatBuffers unions require a UnionDispatch")
 
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         _require_span(
-            view,
+            buffer_view,
             value_start,
             value_length * _UINT32.size,
             description="union value vector data",
         )
         tag_bytes = memoryview(types).cast("B").toreadonly()
 
-        self._buffer = view
+        self._buffer = buffer_view
         self._dispatch = dispatch
         self._tag_bytes = tag_bytes
         self._tag_size = tag_unpacker.size
@@ -633,12 +624,12 @@ class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
                 f"union value target at offset {target} with size 1 "
                 f"exceeds a {buffer_size}-byte buffer"
             )
-        if dispatch._has_untrusted_types and (
-            view_type.__init__ is not TableView.__init__
-            or view_type.__new__ is not object.__new__
-            or type(view_type).__call__ is not type.__call__
+        if (
+            dispatch._has_untrusted_types
+            and not _has_default_view_construction(view_type, TableView)
         ):
-            return view_type(buffer, target)
+            view: Any = view_type(buffer, target)
+            return view
 
         if target > buffer_size - _INT32.size:
             raise BufferBoundsError(
@@ -718,22 +709,19 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
         super().__init__(length)
         if not issubclass(view_type, TableView):
             raise TypeError("FlatBuffers table vectors require a TableView type")
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         _require_span(
-            view,
+            buffer_view,
             start,
             length * _UINT32.size,
             description="table vector data",
         )
-        self._buffer = view
+        self._buffer = buffer_view
         self._start = start
         self._view_type = view_type
-        self._trusted_construction = (
-            view_type.__init__ is TableView.__init__
-            and view_type.__new__ is object.__new__
-            and type(view_type).__call__ is type.__call__
-            and getattr(view_type._from_validated_vector, "__func__", None)
-            is TableView._from_validated_vector.__func__
+        self._trusted_construction = _supports_fast_vector_construction(
+            view_type,
+            TableView,
         )
         self._last_vtable_offset: int | None = None
         self._last_vtable_size = 0
@@ -928,23 +916,20 @@ class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
             raise ValueError(
                 "FlatBuffers struct vector stride is smaller than its struct"
             )
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         _require_span(
-            view,
+            buffer_view,
             start,
             length * stride,
             description="struct vector data",
         )
-        self._buffer = view
+        self._buffer = buffer_view
         self._start = start
         self._stride = stride
         self._view_type = view_type
-        self._trusted_construction = (
-            view_type.__init__ is StructView.__init__
-            and view_type.__new__ is object.__new__
-            and type(view_type).__call__ is type.__call__
-            and getattr(view_type._from_validated_vector, "__func__", None)
-            is StructView._from_validated_vector.__func__
+        self._trusted_construction = _supports_fast_vector_construction(
+            view_type,
+            StructView,
         )
 
     def _load(self, index: int) -> _ViewT:
@@ -989,14 +974,14 @@ class StringVector(CachedVector[str]):
 
     def __init__(self, buffer: memoryview, start: int, length: int) -> None:
         super().__init__(length)
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         _require_span(
-            view,
+            buffer_view,
             start,
             length * _UINT32.size,
             description="string vector data",
         )
-        self._buffer = view
+        self._buffer = buffer_view
         self._start = start
 
     def _load(self, index: int) -> str:
@@ -1024,6 +1009,7 @@ class StringVector(CachedVector[str]):
             raise InvalidBufferError("FlatBuffers string is not null-terminated")
         return bytes(buffer[start : start + length]).decode("utf-8")
 
+
 class _CachedView:
     __slots__ = ("_cache_storage",)
 
@@ -1044,7 +1030,7 @@ class _CachedView:
     def _cache(self, cache: dict[str, Any]) -> None:
         self._cache_storage = cache
 
-    def _cached(self, key: str, loader: Any) -> Any:
+    def _cached(self, key: str, loader: Callable[[], _T]) -> _T:
         cache = self._cache_storage
         if cache is None:
             value = loader()
@@ -1066,15 +1052,15 @@ class StructView(_CachedView):
 
     def __init__(self, buffer: Buffer, struct_offset: int) -> None:
         self._cache_storage = None
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         size = self.__flatbuffer_size__
-        buffer_size = len(view)
+        buffer_size = len(buffer_view)
         if size < 0 or struct_offset < 0 or struct_offset > buffer_size - size:
             raise BufferBoundsError(
                 f"struct data at offset {struct_offset} with size {size} "
                 f"exceeds a {buffer_size}-byte buffer"
             )
-        self._buffer = view
+        self._buffer = buffer_view
         self._struct_offset = struct_offset
 
     @classmethod
@@ -1133,15 +1119,15 @@ class TableView(_CachedView):
 
     def __init__(self, buffer: Buffer, table_offset: int) -> None:
         self._cache_storage = None
-        view = _readonly_bytes(buffer)
-        buffer_size = len(view)
+        buffer_view = _readonly_bytes(buffer)
+        buffer_size = len(buffer_view)
         if table_offset < 0 or table_offset > buffer_size - _INT32.size:
             raise BufferBoundsError(
                 f"table header at offset {table_offset} with size {_INT32.size} "
                 f"exceeds a {buffer_size}-byte buffer"
             )
 
-        vtable_distance = _INT32.unpack_from(view, table_offset)[0]
+        vtable_distance = _INT32.unpack_from(buffer_view, table_offset)[0]
         vtable_offset = table_offset - vtable_distance
         if (
             vtable_offset < 0
@@ -1152,8 +1138,10 @@ class TableView(_CachedView):
                 f"with size {_VTABLE_HEADER_SIZE} exceeds a "
                 f"{buffer_size}-byte buffer"
             )
-        vtable_size = _UINT16.unpack_from(view, vtable_offset)[0]
-        object_size = _UINT16.unpack_from(view, vtable_offset + _UINT16.size)[0]
+        vtable_size = _UINT16.unpack_from(buffer_view, vtable_offset)[0]
+        object_size = _UINT16.unpack_from(
+            buffer_view, vtable_offset + _UINT16.size
+        )[0]
         if vtable_size < 4 or vtable_size % 2 or object_size < 4:
             raise InvalidBufferError("invalid FlatBuffers table metadata")
         if vtable_offset > buffer_size - vtable_size:
@@ -1167,7 +1155,7 @@ class TableView(_CachedView):
                 f"exceeds a {buffer_size}-byte buffer"
             )
 
-        self._buffer = view
+        self._buffer = buffer_view
         self._table_offset = table_offset
         self._vtable_offset = vtable_offset
         self._vtable_size = vtable_size
@@ -1207,37 +1195,49 @@ class TableView(_CachedView):
         A size-prefixed view retains only its declared payload.
         """
 
-        view = _readonly_bytes(buffer)
+        buffer_view = _readonly_bytes(buffer)
         root_offset = offset
         if size_prefixed:
-            _require_span(view, offset, _UINT32.size, description="size prefix")
-            size = _UINT32.unpack_from(view, offset)[0]
+            _require_span(
+                buffer_view, offset, _UINT32.size, description="size prefix"
+            )
+            size = _UINT32.unpack_from(buffer_view, offset)[0]
             payload_start = offset + _UINT32.size
             _require_span(
-                view,
+                buffer_view,
                 payload_start,
                 size,
                 description="size-prefixed buffer",
             )
             payload_end = payload_start + size
-            view = view[payload_start:payload_end]
+            buffer_view = buffer_view[payload_start:payload_end]
             root_offset = 0
 
-        _require_span(view, root_offset, _UINT32.size, description="root offset")
-        if check_identifier and cls.__flatbuffer_identifier__ is not None:
+        _require_span(
+            buffer_view, root_offset, _UINT32.size, description="root offset"
+        )
+        expected_identifier = cls.__flatbuffer_identifier__
+        if check_identifier and expected_identifier is not None:
             identifier_offset = root_offset + _UINT32.size
-            _require_span(view, identifier_offset, 4, description="file identifier")
-            identifier = bytes(view[identifier_offset : identifier_offset + 4])
-            if identifier != cls.__flatbuffer_identifier__:
+            _require_span(
+                buffer_view,
+                identifier_offset,
+                4,
+                description="file identifier",
+            )
+            actual_identifier = bytes(
+                buffer_view[identifier_offset : identifier_offset + 4]
+            )
+            if actual_identifier != expected_identifier:
                 raise InvalidBufferError(
-                    f"expected file identifier {cls.__flatbuffer_identifier__!r}, "
-                    f"got {identifier!r}"
+                    f"expected file identifier {expected_identifier!r}, "
+                    f"got {actual_identifier!r}"
                 )
 
-        relative_offset = _UINT32.unpack_from(view, root_offset)[0]
+        relative_offset = _UINT32.unpack_from(buffer_view, root_offset)[0]
         if relative_offset == 0:
             raise InvalidBufferError("root table offset is null")
-        return cls(view, root_offset + relative_offset)
+        return cls(buffer_view, root_offset + relative_offset)
 
     @classmethod
     def from_root(
@@ -1494,6 +1494,7 @@ __all__ = [
     "TableView",
     "UnionDispatch",
     "UnionVector",
+    "build_byte_vector",
     "build_offset_vector",
     "build_scalar_vector",
     "build_string_vector",

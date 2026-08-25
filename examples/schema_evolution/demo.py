@@ -1,7 +1,6 @@
 """Demonstrate forward- and backward-compatible FlatBuffers readers."""
 
 import numpy as np
-
 from schema_evolution_generated.example.evolution.reading_v1 import (
     Reading as ReadingV1,
 )

@@ -2,6 +2,16 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from ._conversion import dec_hook, enc_hook
+from ._dynamic import (
+    DynamicType,
+    DynamicValue,
+    DynamicView,
+    dynamic_types,
+    encode_dynamic,
+    register_dynamic_module,
+    register_dynamic_type,
+)
 from ._runtime import (
     BufferBoundsError,
     CachedVector,
@@ -28,16 +38,7 @@ from .compiler import (
     load_bfbs,
     parse_bfbs,
 )
-from ._conversion import dec_hook, enc_hook
-from ._dynamic import (
-    DynamicType,
-    DynamicValue,
-    DynamicView,
-    dynamic_types,
-    encode_dynamic,
-    register_dynamic_module,
-    register_dynamic_type,
-)
+from .generator import GenerationError, generate, render_module
 from .schema import (
     AdvancedFeature,
     BaseType,
@@ -52,7 +53,6 @@ from .schema import (
     ServiceDefinition,
     TypeReference,
 )
-from .generator import GenerationError, generate, render_module
 
 try:
     __version__ = version("msgspec-flatbuffers")
@@ -64,17 +64,17 @@ __all__ = [
     "BaseType",
     "BufferBoundsError",
     "CachedVector",
-    "EnumDefinition",
-    "EnumValue",
     "DynamicType",
     "DynamicValue",
     "DynamicView",
+    "EnumDefinition",
+    "EnumValue",
     "FieldDefinition",
     "FlatcError",
     "FlatcNotFoundError",
     "GenerationError",
-    "InvalidSchemaError",
     "InvalidBufferError",
+    "InvalidSchemaError",
     "ObjectDefinition",
     "OpenIntEnum",
     "RpcCallDefinition",
@@ -91,20 +91,20 @@ __all__ = [
     "UnionDispatch",
     "UnionVector",
     "__version__",
+    "build_byte_vector",
+    "build_offset_vector",
+    "build_scalar_vector",
+    "build_string_vector",
     "compile_schema",
     "compile_schema_to_bfbs",
     "dec_hook",
     "dynamic_types",
     "enc_hook",
     "encode_dynamic",
-    "build_byte_vector",
-    "build_offset_vector",
-    "build_scalar_vector",
-    "build_string_vector",
     "generate",
     "load_bfbs",
     "parse_bfbs",
-    "render_module",
     "register_dynamic_module",
     "register_dynamic_type",
+    "render_module",
 ]

@@ -32,7 +32,6 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
-
 REPEAT = 7
 TABLE_SCAN_COUNT = 256
 STRUCT_SCAN_COUNT = 256
@@ -68,7 +67,7 @@ class PreparedFixture(NamedTuple):
     temporary_directory: tempfile.TemporaryDirectory[str]
     generated: ModuleType
     main_buffer: memoryview
-    warm_view: Any
+    reused_view: Any
     build_models: dict[str, Any]
     build_metadata: dict[str, dict[str, Any]]
     generated_sha256: str
@@ -83,7 +82,7 @@ BENCHMARKS = {
         unit="us/scan",
         scale=1e6,
         note=(
-            f"Creates a root view, loads the vector, and materializes all "
+            "Creates a root view, loads the vector, and materializes all "
             f"{TABLE_SCAN_COUNT} table child views."
         ),
     ),
@@ -95,7 +94,7 @@ BENCHMARKS = {
         unit="us/scan",
         scale=1e6,
         note=(
-            f"Creates a root view, loads the vector, and materializes all "
+            "Creates a root view, loads the vector, and materializes all "
             f"{STRUCT_SCAN_COUNT} inline struct views."
         ),
     ),
@@ -118,7 +117,7 @@ BENCHMARKS = {
         note=f"Returns a tuple containing all {TABLE_SCAN_COUNT} cached views.",
     ),
     "cold_to_model": BenchmarkSpec(
-        label="cold view to_model",
+        label="new view to_model",
         statement="cold_to_model(view_type, main_buffer)",
         number=100,
         warmup_number=10,
@@ -127,13 +126,13 @@ BENCHMARKS = {
         note="Creates a new root view and materializes the entire object graph.",
     ),
     "warm_to_model": BenchmarkSpec(
-        label="warm view to_model",
-        statement="warm_view.to_model()",
+        label="reused view to_model",
+        statement="reused_view.to_model()",
         number=300,
         warmup_number=30,
         unit="us/call",
         scale=1e6,
-        note="Converts the same view after every lazy child and string cache is warm.",
+        note="Converts the same existing view without constructing another root view.",
     ),
     "small_default_build": BenchmarkSpec(
         label="small default model build",
@@ -247,6 +246,10 @@ def _indexed_scan(vector: Sequence[Any]) -> Any:
     return last
 
 
+def _same_identities(first: Sequence[Any], second: Sequence[Any]) -> bool:
+    return all(left is right for left, right in zip(first, second))
+
+
 def _cold_to_model(view_type: type[Any], buffer: Buffer) -> Any:
     return view_type.from_buffer(buffer).to_model()
 
@@ -263,7 +266,7 @@ def _fully_scanned_tables(
         raise AssertionError("benchmark table vector is absent")
     first_scan = tuple(tables)
     second_scan = tuple(tables)
-    if not all(first is second for first, second in zip(first_scan, second_scan)):
+    if not _same_identities(first_scan, second_scan):
         raise AssertionError("table-vector identities are not strongly cached")
     if tables.cached_count != len(tables):
         raise AssertionError("full scan did not populate every table cache entry")
@@ -374,18 +377,18 @@ def _assert_main_semantics(
     second_tables = tuple(tables)
     first_structs = tuple(structs)
     second_structs = tuple(structs)
-    if not all(first is second for first, second in zip(first_tables, second_tables)):
+    if not _same_identities(first_tables, second_tables):
         raise AssertionError("table-vector identities are not strongly cached")
-    if not all(first is second for first, second in zip(first_structs, second_structs)):
+    if not _same_identities(first_structs, second_structs):
         raise AssertionError("struct-vector identities are not strongly cached")
     if tables.cached_count != len(tables) or structs.cached_count != len(structs):
         raise AssertionError("full scans did not populate every vector cache entry")
 
-    warm_model = view.to_model()
-    if warm_model != model or view.to_model() != model:
-        raise AssertionError("warm view failed its semantic model conversion")
+    reused_model = view.to_model()
+    if reused_model != model or view.to_model() != model:
+        raise AssertionError("reused view failed its semantic model conversion")
     if _cold_to_model(generated.MonsterView, buffer) != model:
-        raise AssertionError("cold view failed its semantic model conversion")
+        raise AssertionError("new view failed its semantic model conversion")
     return view
 
 
@@ -478,14 +481,14 @@ def _prepare_fixture() -> PreparedFixture:
 
     main_model = _make_main_model(generated)
     main_buffer = main_model.to_flatbuffer()
-    warm_view = _assert_main_semantics(generated, main_model, main_buffer)
+    reused_view = _assert_main_semantics(generated, main_model, main_buffer)
     build_models = _make_build_models(generated)
     build_metadata = _assert_build_semantics(generated, build_models)
     return PreparedFixture(
         temporary_directory=temporary_directory,
         generated=generated,
         main_buffer=main_buffer,
-        warm_view=warm_view,
+        reused_view=reused_view,
         build_models=build_models,
         build_metadata=build_metadata,
         generated_sha256=generated_sha256,
@@ -565,7 +568,7 @@ def _run_benchmarks() -> dict[str, Any]:
             "struct_model": build_models["struct"],
             "table_model": build_models["table"],
             "view_type": fixture.generated.MonsterView,
-            "warm_view": fixture.warm_view,
+            "reused_view": fixture.reused_view,
         }
         results = {
             name: _run_one(spec, timer_globals)

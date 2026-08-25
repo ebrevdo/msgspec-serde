@@ -20,7 +20,6 @@ import pytest
 
 import msgspec_flatbuffers._dynamic as dynamic_module
 from msgspec_flatbuffers import (
-    DynamicValue,
     DynamicView,
     GenerationError,
     InvalidBufferError,
@@ -78,7 +77,7 @@ def _model(payload: ModuleType, envelope: ModuleType) -> Any:
         name="latency",
         values=np.array([1.25, 2.5], dtype=np.float32),
     )
-    return envelope.Envelope(payload=DynamicValue(metric), note="known")
+    return envelope.Envelope(payload=envelope.EnvelopePayload(metric), note="known")
 
 
 @pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
@@ -102,8 +101,8 @@ def test_known_dynamic_value_round_trips_msgspec_formats(
 ) -> None:
     payload, envelope = generated_modules
     model = _model(payload, envelope)
-    annotation = envelope.Envelope.__annotations__["payload"]
-    assert annotation.startswith("_Dynamic_Envelope_payload")
+    assert envelope.Envelope.__annotations__["payload"] == "EnvelopePayload | None"
+    assert "EnvelopePayload" in envelope.__all__
     assert "payload_type" not in envelope.Envelope.__annotations__
     assert payload.Metric.__struct_config__.tag is None
     assert envelope.Envelope.__struct_config__.tag is None
@@ -131,7 +130,7 @@ def test_known_dynamic_value_round_trips_msgspec_formats(
         dec_hook=dec_hook,
     )
     assert decoded == model
-    assert type(decoded.payload).__name__ == "_Dynamic_Envelope_payload"
+    assert type(decoded.payload) is envelope.EnvelopePayload
     assert isinstance(decoded.payload.value, payload.Metric)
 
     flatbuffer = decoded.to_flatbuffer()
@@ -154,18 +153,23 @@ def test_known_dynamic_value_round_trips_flatbuffer(
     model = _model(payload, envelope)
     buffer = model.to_flatbuffer()
     view = envelope.EnvelopeView.from_buffer(buffer)
-    assert view.payload_type == METRIC_TAG
-    assert view.payload is not None
-    assert view.payload.readonly
-    assert view.payload.obj is buffer.obj
+    native_model = envelope.Envelope.from_flatbuffer(buffer)
+    assert native_model == model
+    assert type(native_model.payload) is envelope.EnvelopePayload
+    raw = view.payload_raw
+    assert view.payload_type_raw == METRIC_TAG
+    assert raw is not None
+    assert raw.readonly
+    assert raw.obj is buffer.obj
 
-    dynamic = view.payload_dynamic()
+    dynamic = view.payload
     assert isinstance(dynamic, DynamicView)
-    assert dynamic is view.payload_dynamic()
+    assert dynamic is view.payload
     assert dynamic.tag == METRIC_TAG
-    assert isinstance(dynamic.value, payload.MetricView)
-    assert dynamic.value is dynamic.value
-    assert dynamic.value.name == "latency"
+    value = dynamic.value
+    assert isinstance(value, payload.MetricView)
+    assert value is dynamic.value
+    assert value.name == "latency"
     assert view.to_model() == model
 
 
@@ -177,7 +181,7 @@ def test_large_dynamic_payload_uses_exact_native_sizing(
         name="large",
         values=np.arange(65_536, dtype=np.float32),
     )
-    model = envelope.Envelope(payload=DynamicValue(metric))
+    model = envelope.Envelope(payload=envelope.EnvelopePayload(metric))
 
     buffer = model.to_flatbuffer()
 
@@ -197,7 +201,7 @@ def test_dynamic_field_rejects_invalid_model_values(
 
     with pytest.raises(ValueError, match="outside"):
         envelope.Envelope(
-            payload=DynamicValue.opaque("Other.Metric", b"data")
+            payload=envelope.EnvelopePayload.opaque("Other.Metric", b"data")
         ).to_flatbuffer()
 
 
@@ -213,10 +217,14 @@ def test_dynamic_view_rejects_invalid_nested_flatbuffer(
     payload_start, _ = payload_info
     invalid_payload[payload_start + 4 : payload_start + 8] = b"NOPE"
     invalid_view = envelope.EnvelopeView.from_buffer(invalid_payload)
-    invalid_dynamic = invalid_view.payload_dynamic()
+    invalid_dynamic = invalid_view.payload
     assert invalid_dynamic is not None
     with pytest.raises(InvalidBufferError, match="file identifier"):
         _ = invalid_dynamic.value
+    with pytest.raises(InvalidBufferError, match="file identifier"):
+        invalid_view.to_model()
+    with pytest.raises(InvalidBufferError, match="file identifier"):
+        envelope.Envelope.from_flatbuffer(invalid_payload)
 
 
 def test_dynamic_view_rejects_disallowed_wire_tag(
@@ -238,14 +246,17 @@ def test_dynamic_view_rejects_disallowed_wire_tag(
         b"Outside.Dynamic.Metric"
     )
     with pytest.raises(ValueError, match="outside"):
-        envelope.EnvelopeView.from_buffer(disallowed_tag).payload_dynamic()
+        _ = envelope.EnvelopeView.from_buffer(disallowed_tag).payload
 
 
 def test_unknown_allowed_dynamic_value_is_preserved(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     _, envelope = generated_modules
-    opaque = DynamicValue.opaque("Example.Dynamic.Future", b"unknown payload")
+    opaque = envelope.EnvelopePayload.opaque(
+        "Example.Dynamic.Future",
+        b"unknown payload",
+    )
     model = envelope.Envelope(payload=opaque, note="forward")
 
     builtins = msgspec.to_builtins(model, enc_hook=enc_hook)
@@ -274,13 +285,14 @@ def test_unknown_allowed_dynamic_value_is_preserved(
         )
 
     view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
-    dynamic = view.payload_dynamic()
+    dynamic = view.payload
     assert dynamic is not None
     assert dynamic.tag == "Example.Dynamic.Future"
     assert not dynamic.is_known
     assert dynamic.value is None
     assert bytes(dynamic.data) == b"unknown payload"
     assert view.to_model() == model
+    assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
 
 
 def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> None:
@@ -334,16 +346,17 @@ def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> No
         favorite=extension.Cat(name="Miso"),
         residents=[extension.Dog(name="Tess"), extension.Cat(name="Luna")],
     )
-    model = envelope.Envelope(payload=DynamicValue(payload))
+    model = envelope.Envelope(payload=envelope.EnvelopePayload(payload))
 
     view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
-    dynamic = view.payload_dynamic()
+    dynamic = view.payload
     assert dynamic is not None
     nested = dynamic.value
     assert isinstance(nested, extension.UnionExtensionView)
-    assert nested.favorite_view().name == "Miso"
+    assert nested.favorite.name == "Miso"
     assert [resident.name for resident in nested.residents] == ["Tess", "Luna"]
     assert view.to_model() == model
+    assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
 
 
 @pytest.mark.parametrize(
@@ -364,7 +377,7 @@ def test_dynamic_field_rejects_inconsistent_wire_values(
     struct.pack_into("<H", buffer, probe._vtable_offset + vtable_entry_offset, 0)
     inconsistent = envelope.EnvelopeView.from_buffer(buffer)
     with pytest.raises(InvalidBufferError, match=message):
-        inconsistent.payload_dynamic()
+        _ = inconsistent.payload
 
 
 def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
@@ -502,3 +515,25 @@ def test_generated_extension_root_registers_on_import(
     assert entry is not None
     assert entry.model_type is payload.Metric
     assert entry.view_type is payload.MetricView
+
+
+@pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
+def test_public_dynamic_wrapper_name_collisions_are_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "dynamic_name_collision.fbs"
+    source.write_text(
+        " ".join(
+            (
+                'attribute "dynamic_flatbuffer";',
+                'attribute "dynamic_allow";',
+                "namespace Collision;",
+                "table EnvelopePayload { value:int; }",
+                "table Envelope { type:string; payload:[ubyte] (",
+                'dynamic_flatbuffer: "type", dynamic_allow: "Collision.*"); }',
+                "root_type Envelope;",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(GenerationError, match="dynamic value type.*conflicts"):
+        generate(source, tmp_path / "generated", project_root=tmp_path)

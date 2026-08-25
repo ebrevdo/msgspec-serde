@@ -9,9 +9,11 @@ use flatbuffers::{
     FLATBUFFERS_MAX_BUFFER_SIZE, FlatBufferBuilder, Push, PushAlignment, TableFinishedWIPOffset,
     UnionWIPOffset, VOffsetT, WIPOffset,
 };
+use pyo3::IntoPyObjectExt;
 use pyo3::buffer::{Element, PyBuffer, PyUntypedBuffer};
 use pyo3::exceptions::{
-    PyBufferError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError,
+    PyBufferError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyUnicodeDecodeError,
+    PyValueError,
 };
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -105,6 +107,10 @@ struct FieldWire {
     #[serde(default)]
     allowed_prefix: Option<String>,
     #[serde(default)]
+    enum_type: Option<String>,
+    #[serde(default)]
+    dynamic_type: Option<String>,
+    #[serde(default)]
     arms: Vec<ArmWire>,
 }
 
@@ -138,6 +144,27 @@ enum PreparedValue<'py> {
         tag: String,
         data: Bound<'py, PyAny>,
     },
+}
+
+struct BoundTypes {
+    by_pointer: HashMap<usize, usize>,
+    by_name: HashMap<String, Py<PyType>>,
+}
+
+#[derive(Clone, Copy)]
+struct TableInfo {
+    table_offset: usize,
+    vtable_offset: usize,
+    vtable_size: usize,
+    object_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RootDecode<'a> {
+    offset: usize,
+    size_prefixed: bool,
+    identifier: Option<&'a str>,
+    check_identifier: bool,
 }
 
 #[pyclass(module = "msgspec_flatbuffers._native", frozen)]
@@ -253,6 +280,16 @@ fn aligned_payload_size(payload: usize, alignment: usize) -> usize {
     payload.saturating_add(alignment.saturating_sub(1))
 }
 
+#[inline]
+fn include_slot(highest_slot: &mut Option<u16>, slot: u16) {
+    *highest_slot = Some(highest_slot.map_or(slot, |highest| highest.max(slot)));
+}
+
+#[inline]
+fn vtable_offset(slot: u16) -> VOffsetT {
+    4 + slot * 2
+}
+
 fn sampled_sequence_size(
     value: &Bound<'_, PyAny>,
     mut item_size: impl FnMut(Bound<'_, PyAny>) -> PyResult<usize>,
@@ -304,6 +341,71 @@ fn default_f64(value: &Value) -> PyResult<f64> {
 }
 
 impl ScalarValue {
+    fn read(kind: ScalarKind, bytes: &[u8]) -> Self {
+        macro_rules! read {
+            ($ty:ty) => {
+                <$ty>::from_le_bytes(bytes.try_into().expect("checked scalar width"))
+            };
+        }
+        match kind {
+            ScalarKind::Bool => Self::Bool(bytes[0] != 0),
+            ScalarKind::Int8 => Self::Int8(bytes[0] as i8),
+            ScalarKind::Uint8 => Self::Uint8(bytes[0]),
+            ScalarKind::Int16 => Self::Int16(read!(i16)),
+            ScalarKind::Uint16 => Self::Uint16(read!(u16)),
+            ScalarKind::Int32 => Self::Int32(read!(i32)),
+            ScalarKind::Uint32 => Self::Uint32(read!(u32)),
+            ScalarKind::Int64 => Self::Int64(read!(i64)),
+            ScalarKind::Uint64 => Self::Uint64(read!(u64)),
+            ScalarKind::Float32 => Self::Float32(read!(f32)),
+            ScalarKind::Float64 => Self::Float64(read!(f64)),
+        }
+    }
+
+    fn from_default(kind: ScalarKind, default: &Value) -> PyResult<Self> {
+        Ok(match kind {
+            ScalarKind::Bool => Self::Bool(default_bool(default)?),
+            ScalarKind::Int8 => Self::Int8(default_i64(default)? as i8),
+            ScalarKind::Uint8 => Self::Uint8(default_u64(default)? as u8),
+            ScalarKind::Int16 => Self::Int16(default_i64(default)? as i16),
+            ScalarKind::Uint16 => Self::Uint16(default_u64(default)? as u16),
+            ScalarKind::Int32 => Self::Int32(default_i64(default)? as i32),
+            ScalarKind::Uint32 => Self::Uint32(default_u64(default)? as u32),
+            ScalarKind::Int64 => Self::Int64(default_i64(default)?),
+            ScalarKind::Uint64 => Self::Uint64(default_u64(default)?),
+            ScalarKind::Float32 => Self::Float32(default_f64(default)? as f32),
+            ScalarKind::Float64 => Self::Float64(default_f64(default)?),
+        })
+    }
+
+    fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::Bool(value) => value.into_py_any(py),
+            Self::Int8(value) => value.into_py_any(py),
+            Self::Uint8(value) => value.into_py_any(py),
+            Self::Int16(value) => value.into_py_any(py),
+            Self::Uint16(value) => value.into_py_any(py),
+            Self::Int32(value) => value.into_py_any(py),
+            Self::Uint32(value) => value.into_py_any(py),
+            Self::Int64(value) => value.into_py_any(py),
+            Self::Uint64(value) => value.into_py_any(py),
+            Self::Float32(value) => value.into_py_any(py),
+            Self::Float64(value) => value.into_py_any(py),
+        }
+    }
+
+    fn as_u64(self) -> PyResult<u64> {
+        match self {
+            Self::Uint8(value) => Ok(value.into()),
+            Self::Uint16(value) => Ok(value.into()),
+            Self::Uint32(value) => Ok(value.into()),
+            Self::Uint64(value) => Ok(value),
+            _ => Err(PyValueError::new_err(
+                "union discriminator must use an unsigned integer type",
+            )),
+        }
+    }
+
     fn extract(kind: ScalarKind, value: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(match kind {
             ScalarKind::Bool => Self::Bool(value.extract()?),
@@ -577,6 +679,22 @@ fn extract_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Ok(value.cast::<PyBytes>()?.as_bytes().to_vec())
 }
 
+fn nonnegative_usize(value: isize, name: &str) -> PyResult<usize> {
+    usize::try_from(value)
+        .map_err(|_| PyValueError::new_err(format!("{name} must be greater than or equal to zero")))
+}
+
+fn validate_identifier(identifier: Option<&str>) -> PyResult<()> {
+    if let Some(value) = identifier
+        && (value.len() != 4 || !value.is_ascii())
+    {
+        return Err(PyValueError::new_err(
+            "FlatBuffers file identifiers must contain four ASCII bytes",
+        ));
+    }
+    Ok(())
+}
+
 fn buffer_byte_length(value: &Bound<'_, PyAny>) -> PyResult<usize> {
     Ok(PyUntypedBuffer::get(value)?.len_bytes())
 }
@@ -635,6 +753,33 @@ fn immutable_buffer_subslice<'a>(buffer: &PyBuffer<u8>, owner: &'a [u8]) -> PyRe
         .filter(|&end| end <= owner.len())
         .ok_or_else(|| PyBufferError::new_err("buffer lies outside its immutable owner"))?;
     Ok(&owner[start..end])
+}
+
+#[inline]
+fn with_input_bytes<T>(
+    value: &Bound<'_, PyAny>,
+    decode: impl Fn(&[u8]) -> PyResult<T>,
+) -> PyResult<T> {
+    if let Ok(value) = value.cast::<PyBytes>() {
+        return decode(value.as_bytes());
+    }
+    if let Ok(view) = value.cast::<PyMemoryView>() {
+        let owner = view.getattr("obj")?;
+        if let Ok(owner) = owner.cast::<PyBytes>() {
+            let buffer = checked_byte_buffer(value)?;
+            return decode(immutable_buffer_subslice(&buffer, owner.as_bytes())?);
+        }
+        if let Ok(owner) = owner.cast::<NativeBuffer>() {
+            let buffer = checked_byte_buffer(value)?;
+            let owner = owner.borrow();
+            return decode(immutable_buffer_subslice(
+                &buffer,
+                &owner.data[owner.start..],
+            )?);
+        }
+    }
+    let data = extract_bytes(value)?;
+    decode(&data)
 }
 
 struct Align<const VALUE: usize>;
@@ -720,8 +865,12 @@ fn write_struct_scalar(
 pub struct NativePlan {
     objects: Vec<ObjectWire>,
     by_name: HashMap<String, usize>,
-    model_types: OnceLock<HashMap<usize, usize>>,
+    bound_types: OnceLock<BoundTypes>,
     dynamic_encoder: Option<Py<PyAny>>,
+    dynamic_registry: Py<PyAny>,
+    numpy_empty: Py<PyAny>,
+    buffer_bounds_error: Py<PyType>,
+    invalid_buffer_error: Py<PyType>,
 }
 
 impl NativePlan {
@@ -737,6 +886,695 @@ impl NativePlan {
             .target_index
             .map(|index| &self.objects[index])
             .ok_or_else(|| PyValueError::new_err("native field has no target"))
+    }
+
+    fn bound_type<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyType>> {
+        self.bound_types
+            .get()
+            .and_then(|types| types.by_name.get(name))
+            .map(|value| value.bind(py).clone())
+            .ok_or_else(|| PyRuntimeError::new_err(format!("native type {name:?} is not bound")))
+    }
+
+    fn bounds_error(&self, py: Python<'_>, message: impl Into<String>) -> PyErr {
+        PyErr::from_type(self.buffer_bounds_error.bind(py).clone(), (message.into(),))
+    }
+
+    fn invalid_error(&self, py: Python<'_>, message: impl Into<String>) -> PyErr {
+        PyErr::from_type(
+            self.invalid_buffer_error.bind(py).clone(),
+            (message.into(),),
+        )
+    }
+
+    #[inline]
+    fn require_span(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        offset: usize,
+        size: usize,
+        description: &str,
+    ) -> PyResult<()> {
+        if size > data.len() || offset > data.len() - size {
+            return Err(self.bounds_error(
+                py,
+                format!(
+                    "{description} at offset {offset} with size {size} exceeds a {}-byte buffer",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn read_u16(&self, py: Python<'_>, data: &[u8], offset: usize) -> PyResult<u16> {
+        self.require_span(py, data, offset, 2, "uint16")?;
+        Ok(u16::from_le_bytes([data[offset], data[offset + 1]]))
+    }
+
+    #[inline]
+    fn read_u32(&self, py: Python<'_>, data: &[u8], offset: usize) -> PyResult<u32> {
+        self.require_span(py, data, offset, 4, "uint32")?;
+        Ok(u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("checked uint32 span"),
+        ))
+    }
+
+    #[inline]
+    fn read_i32(&self, py: Python<'_>, data: &[u8], offset: usize) -> PyResult<i32> {
+        self.require_span(py, data, offset, 4, "int32")?;
+        Ok(i32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("checked int32 span"),
+        ))
+    }
+
+    fn table_info(&self, py: Python<'_>, data: &[u8], table_offset: usize) -> PyResult<TableInfo> {
+        let distance = self.read_i32(py, data, table_offset)? as i64;
+        let vtable_offset = i64::try_from(table_offset)
+            .ok()
+            .and_then(|offset| offset.checked_sub(distance))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                self.bounds_error(
+                    py,
+                    format!("vtable header lies outside a {}-byte buffer", data.len()),
+                )
+            })?;
+        self.require_span(py, data, vtable_offset, 4, "vtable header")?;
+        let vtable_size = usize::from(self.read_u16(py, data, vtable_offset)?);
+        let object_size = usize::from(self.read_u16(py, data, vtable_offset + 2)?);
+        if vtable_size < 4 || !vtable_size.is_multiple_of(2) || object_size < 4 {
+            return Err(self.invalid_error(py, "invalid FlatBuffers table metadata"));
+        }
+        self.require_span(py, data, vtable_offset, vtable_size, "vtable")?;
+        self.require_span(py, data, table_offset, object_size, "table")?;
+        Ok(TableInfo {
+            table_offset,
+            vtable_offset,
+            vtable_size,
+            object_size,
+        })
+    }
+
+    fn field_position(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        table: TableInfo,
+        vtable_field: usize,
+        size: usize,
+    ) -> PyResult<Option<usize>> {
+        if vtable_field < 4 || !vtable_field.is_multiple_of(2) {
+            return Err(PyValueError::new_err(
+                "vtable field offsets must be even and at least 4",
+            ));
+        }
+        if vtable_field >= table.vtable_size {
+            return Ok(None);
+        }
+        let relative = usize::from(self.read_u16(py, data, table.vtable_offset + vtable_field)?);
+        if relative == 0 {
+            return Ok(None);
+        }
+        if size > table.object_size || relative < 4 || relative > table.object_size - size {
+            return Err(self.invalid_error(py, "field lies outside its FlatBuffers table"));
+        }
+        Ok(Some(table.table_offset + relative))
+    }
+
+    fn offset_target(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        position: usize,
+        description: &str,
+    ) -> PyResult<usize> {
+        let relative = usize::try_from(self.read_u32(py, data, position)?).unwrap();
+        if relative == 0 {
+            return Err(self.invalid_error(py, format!("{description} contains a null offset")));
+        }
+        let target = position.checked_add(relative).ok_or_else(|| {
+            self.bounds_error(py, format!("{description} target offset overflows"))
+        })?;
+        self.require_span(py, data, target, 1, description)?;
+        Ok(target)
+    }
+
+    fn decode_string_at(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        position: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let target = self.offset_target(py, data, position, "string offset")?;
+        let length = usize::try_from(self.read_u32(py, data, target)?).unwrap();
+        let start = target + 4;
+        let size = length
+            .checked_add(1)
+            .ok_or_else(|| self.bounds_error(py, "string length overflows"))?;
+        self.require_span(py, data, start, size, "string data")?;
+        if data[start + length] != 0 {
+            return Err(self.invalid_error(py, "FlatBuffers string is not null-terminated"));
+        }
+        let bytes = &data[start..start + length];
+        let value = std::str::from_utf8(bytes).map_err(|error| {
+            let error_start = error.valid_up_to();
+            let error_end = error_start + error.error_len().unwrap_or(1);
+            PyUnicodeDecodeError::new_err((
+                "utf-8",
+                PyBytes::new(py, bytes).unbind(),
+                error_start,
+                error_end,
+                error.to_string(),
+            ))
+        })?;
+        Ok(PyString::new(py, value).into_any().unbind())
+    }
+
+    fn vector_info(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        table: TableInfo,
+        vtable_field: usize,
+        item_size: usize,
+    ) -> PyResult<Option<(usize, usize)>> {
+        let Some(position) = self.field_position(py, data, table, vtable_field, 4)? else {
+            return Ok(None);
+        };
+        let target = self.offset_target(py, data, position, "vector offset")?;
+        let length = usize::try_from(self.read_u32(py, data, target)?).unwrap();
+        let start = target + 4;
+        let byte_length = length
+            .checked_mul(item_size)
+            .ok_or_else(|| self.bounds_error(py, "vector byte length overflows"))?;
+        self.require_span(py, data, start, byte_length, "vector data")?;
+        Ok(Some((start, length)))
+    }
+
+    fn read_scalar_value(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        position: usize,
+        kind: ScalarKind,
+    ) -> PyResult<ScalarValue> {
+        let width = scalar_size(Some(kind))?;
+        self.require_span(py, data, position, width, "scalar data")?;
+        Ok(ScalarValue::read(kind, &data[position..position + width]))
+    }
+
+    fn apply_enum(
+        &self,
+        py: Python<'_>,
+        field: &FieldWire,
+        value: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let Some(name) = field.enum_type.as_deref() else {
+            return Ok(value);
+        };
+        Ok(self.bound_type(py, name)?.call1((value,))?.unbind())
+    }
+
+    fn decode_numeric_vector(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        start: usize,
+        length: usize,
+        scalar: ScalarKind,
+    ) -> PyResult<Py<PyAny>> {
+        let width = scalar_size(Some(scalar))?;
+        let byte_length = length
+            .checked_mul(width)
+            .ok_or_else(|| self.bounds_error(py, "numeric vector byte length overflows"))?;
+        self.require_span(py, data, start, byte_length, "numeric vector data")?;
+        let native_dtype = match scalar {
+            ScalarKind::Bool => "?",
+            ScalarKind::Int8 => "i1",
+            ScalarKind::Uint8 => "u1",
+            ScalarKind::Int16 => "i2",
+            ScalarKind::Uint16 => "u2",
+            ScalarKind::Int32 => "i4",
+            ScalarKind::Uint32 => "u4",
+            ScalarKind::Int64 => "i8",
+            ScalarKind::Uint64 => "u8",
+            ScalarKind::Float32 => "f4",
+            ScalarKind::Float64 => "f8",
+        };
+        let array = self.numpy_empty.bind(py).call1((length, native_dtype))?;
+        let output = PyUntypedBuffer::get(&array)?;
+        if output.readonly() || !output.is_c_contiguous() || output.len_bytes() != byte_length {
+            return Err(PyRuntimeError::new_err(
+                "NumPy returned incompatible numeric vector storage",
+            ));
+        }
+        if byte_length != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    data[start..start + byte_length].as_ptr(),
+                    output.buf_ptr().cast(),
+                    byte_length,
+                );
+            }
+        }
+        drop(output);
+        if cfg!(target_endian = "big") && width > 1 {
+            array.call_method1("byteswap", (true,))?;
+        }
+        Ok(array.unbind())
+    }
+
+    fn missing_field(&self, py: Python<'_>, field: &FieldWire) -> PyResult<Py<PyAny>> {
+        if field.required {
+            return Err(
+                self.invalid_error(py, format!("required field {:?} is absent", field.name))
+            );
+        }
+        Ok(py.None())
+    }
+
+    fn decode_struct_at(
+        &self,
+        py: Python<'_>,
+        object: &ObjectWire,
+        data: &[u8],
+        offset: usize,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_span(py, data, offset, object.byte_size, "struct data")?;
+        let kwargs = PyDict::new(py);
+        for field in &object.fields {
+            let value = match field.kind {
+                FieldKind::Scalar => {
+                    let scalar = field.scalar.ok_or_else(|| {
+                        PyValueError::new_err("native struct field has no scalar kind")
+                    })?;
+                    let value = self
+                        .read_scalar_value(py, data, offset + field.offset, scalar)?
+                        .into_py(py)?;
+                    self.apply_enum(py, field, value)?
+                }
+                FieldKind::Struct => {
+                    let target = self.target_object(field)?;
+                    self.decode_struct_at(py, target, data, offset + field.offset)?
+                }
+                _ => {
+                    return Err(PyNotImplementedError::new_err(
+                        "unsupported native struct field",
+                    ));
+                }
+            };
+            kwargs.set_item(field.name.as_str(), value)?;
+        }
+        Ok(self
+            .bound_type(py, &object.name)?
+            .call((), Some(&kwargs))?
+            .unbind())
+    }
+
+    fn decode_table_at(
+        &self,
+        py: Python<'_>,
+        object: &ObjectWire,
+        data: &[u8],
+        table_offset: usize,
+    ) -> PyResult<Py<PyAny>> {
+        if object.is_struct {
+            return Err(PyTypeError::new_err(format!(
+                "{} is a struct, not a table",
+                object.name
+            )));
+        }
+        let table = self.table_info(py, data, table_offset)?;
+        let kwargs = PyDict::new(py);
+        for field in &object.fields {
+            let value = self.decode_field(py, field, data, table)?;
+            kwargs.set_item(field.name.as_str(), value)?;
+        }
+        Ok(self
+            .bound_type(py, &object.name)?
+            .call((), Some(&kwargs))?
+            .unbind())
+    }
+
+    fn decode_union(
+        &self,
+        py: Python<'_>,
+        field: &FieldWire,
+        data: &[u8],
+        table: TableInfo,
+    ) -> PyResult<Py<PyAny>> {
+        let type_slot = field
+            .type_slot
+            .ok_or_else(|| PyValueError::new_err("union field has no type slot"))?;
+        let type_scalar = field
+            .type_scalar
+            .ok_or_else(|| PyValueError::new_err("union field has no type scalar"))?;
+        let type_position = self.field_position(
+            py,
+            data,
+            table,
+            usize::from(vtable_offset(type_slot)),
+            scalar_size(Some(type_scalar))?,
+        )?;
+        let tag = match type_position {
+            Some(position) => self
+                .read_scalar_value(py, data, position, type_scalar)?
+                .as_u64()?,
+            None => 0,
+        };
+        let value_position = self.field_position(py, data, table, field.offset, 4)?;
+        if tag == 0 {
+            if value_position.is_some() {
+                return Err(self.invalid_error(py, "union NONE discriminator has a payload"));
+            }
+            return self.missing_field(py, field);
+        }
+        let position = value_position.ok_or_else(|| {
+            self.invalid_error(py, format!("union discriminator {tag} has no payload"))
+        })?;
+        let arm = field
+            .arms
+            .iter()
+            .find(|arm| arm.tag == tag)
+            .ok_or_else(|| self.invalid_error(py, format!("unknown union discriminator {tag}")))?;
+        let target = self.offset_target(py, data, position, "union field offset")?;
+        self.decode_table_at(py, &self.objects[arm.target_index], data, target)
+    }
+
+    fn decode_union_vector(
+        &self,
+        py: Python<'_>,
+        field: &FieldWire,
+        data: &[u8],
+        table: TableInfo,
+    ) -> PyResult<Py<PyAny>> {
+        let type_slot = field
+            .type_slot
+            .ok_or_else(|| PyValueError::new_err("union vector has no type slot"))?;
+        let type_scalar = field
+            .type_scalar
+            .ok_or_else(|| PyValueError::new_err("union vector has no type scalar"))?;
+        let width = scalar_size(Some(type_scalar))?;
+        let types = self.vector_info(
+            py,
+            data,
+            table,
+            usize::from(vtable_offset(type_slot)),
+            width,
+        )?;
+        let values = self.vector_info(py, data, table, field.offset, 4)?;
+        let (type_start, type_length, value_start, value_length) = match (types, values) {
+            (None, None) => return self.missing_field(py, field),
+            (Some((type_start, type_length)), Some((value_start, value_length))) => {
+                (type_start, type_length, value_start, value_length)
+            }
+            _ => {
+                return Err(self.invalid_error(
+                    py,
+                    format!("union vector {:?} type/value presence differs", field.name),
+                ));
+            }
+        };
+        if type_length != value_length {
+            return Err(self.invalid_error(
+                py,
+                format!("union vector {:?} type/value lengths differ", field.name),
+            ));
+        }
+        let mut decoded = Vec::with_capacity(value_length);
+        for index in 0..value_length {
+            let tag = self
+                .read_scalar_value(py, data, type_start + index * width, type_scalar)?
+                .as_u64()?;
+            if tag == 0 {
+                return Err(self.invalid_error(py, "union vectors cannot contain NONE"));
+            }
+            let arm = field
+                .arms
+                .iter()
+                .find(|arm| arm.tag == tag)
+                .ok_or_else(|| {
+                    self.invalid_error(py, format!("unknown union discriminator {tag}"))
+                })?;
+            let position = value_start + index * 4;
+            let target = self.offset_target(py, data, position, "union vector offset")?;
+            decoded.push(self.decode_table_at(
+                py,
+                &self.objects[arm.target_index],
+                data,
+                target,
+            )?);
+        }
+        Ok(PyList::new(py, decoded)?.into_any().unbind())
+    }
+
+    fn decode_dynamic(
+        &self,
+        py: Python<'_>,
+        field: &FieldWire,
+        data: &[u8],
+        table: TableInfo,
+    ) -> PyResult<Py<PyAny>> {
+        let type_slot = field
+            .type_slot
+            .ok_or_else(|| PyValueError::new_err("dynamic field has no type slot"))?;
+        let type_position =
+            self.field_position(py, data, table, usize::from(vtable_offset(type_slot)), 4)?;
+        let payload = self.vector_info(py, data, table, field.offset, 1)?;
+        let (tag, start, length) = match (type_position, payload) {
+            (None, None) => return self.missing_field(py, field),
+            (None, Some(_)) => {
+                return Err(self.invalid_error(
+                    py,
+                    format!("dynamic field {:?} has data without a type tag", field.name),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(self.invalid_error(
+                    py,
+                    format!("dynamic field {:?} type tag has no data", field.name),
+                ));
+            }
+            (Some(position), Some((start, length))) => {
+                let tag = self.decode_string_at(py, data, position)?;
+                (tag, start, length)
+            }
+        };
+        let tag = tag.bind(py).cast::<PyString>()?;
+        let tag_value = tag.to_str()?;
+        let prefix = field
+            .allowed_prefix
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("dynamic field has no allowed prefix"))?;
+        if !tag_value.starts_with(prefix) || tag_value.len() == prefix.len() {
+            return Err(PyValueError::new_err(format!(
+                "dynamic FlatBuffer tag {tag_value:?} is outside {:?}",
+                format!("{prefix}*")
+            )));
+        }
+        let wrapper_name = field
+            .dynamic_type
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("dynamic field has no wrapper type"))?;
+        let wrapper = self.bound_type(py, wrapper_name)?;
+        let bytes = PyBytes::new(py, &data[start..start + length]);
+        let entry = self
+            .dynamic_registry
+            .bind(py)
+            .call_method1("lookup_tag", (tag,))?;
+        if entry.is_none() {
+            return Ok(wrapper.call_method1("opaque", (tag, bytes))?.unbind());
+        }
+        let model_type = entry.getattr("model_type")?;
+        let model = model_type.call_method1("from_flatbuffer", (bytes,))?;
+        Ok(wrapper.call1((model,))?.unbind())
+    }
+
+    fn decode_field(
+        &self,
+        py: Python<'_>,
+        field: &FieldWire,
+        data: &[u8],
+        table: TableInfo,
+    ) -> PyResult<Py<PyAny>> {
+        match field.kind {
+            FieldKind::Scalar => {
+                let scalar = field.scalar.ok_or_else(|| {
+                    PyValueError::new_err("native scalar field has no scalar kind")
+                })?;
+                let position =
+                    self.field_position(py, data, table, field.offset, scalar_size(Some(scalar))?)?;
+                let value = match position {
+                    Some(position) => self.read_scalar_value(py, data, position, scalar)?,
+                    None if field.optional => return Ok(py.None()),
+                    None => ScalarValue::from_default(scalar, &field.default)?,
+                };
+                self.apply_enum(py, field, value.into_py(py)?)
+            }
+            FieldKind::String => {
+                let Some(position) = self.field_position(py, data, table, field.offset, 4)? else {
+                    return self.missing_field(py, field);
+                };
+                self.decode_string_at(py, data, position)
+            }
+            FieldKind::Table => {
+                let Some(position) = self.field_position(py, data, table, field.offset, 4)? else {
+                    return self.missing_field(py, field);
+                };
+                let target = self.offset_target(py, data, position, "table field offset")?;
+                self.decode_table_at(py, self.target_object(field)?, data, target)
+            }
+            FieldKind::Struct => {
+                let target = self.target_object(field)?;
+                let Some(position) =
+                    self.field_position(py, data, table, field.offset, target.byte_size)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                self.decode_struct_at(py, target, data, position)
+            }
+            FieldKind::VectorByte => {
+                let Some((start, length)) = self.vector_info(py, data, table, field.offset, 1)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                Ok(PyBytes::new(py, &data[start..start + length])
+                    .into_any()
+                    .unbind())
+            }
+            FieldKind::VectorScalar => {
+                let scalar = field.scalar.ok_or_else(|| {
+                    PyValueError::new_err("native scalar vector has no scalar kind")
+                })?;
+                let width = scalar_size(Some(scalar))?;
+                let Some((start, length)) =
+                    self.vector_info(py, data, table, field.offset, width)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                if field.enum_type.is_none() {
+                    return self.decode_numeric_vector(py, data, start, length, scalar);
+                }
+                let mut values = Vec::with_capacity(length);
+                for index in 0..length {
+                    let value = self
+                        .read_scalar_value(py, data, start + index * width, scalar)?
+                        .into_py(py)?;
+                    values.push(self.apply_enum(py, field, value)?);
+                }
+                Ok(PyList::new(py, values)?.into_any().unbind())
+            }
+            FieldKind::VectorString => {
+                let Some((start, length)) = self.vector_info(py, data, table, field.offset, 4)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                let mut values = Vec::with_capacity(length);
+                for index in 0..length {
+                    values.push(self.decode_string_at(py, data, start + index * 4)?);
+                }
+                Ok(PyList::new(py, values)?.into_any().unbind())
+            }
+            FieldKind::VectorTable => {
+                let Some((start, length)) = self.vector_info(py, data, table, field.offset, 4)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                let target_object = self.target_object(field)?;
+                let mut values = Vec::with_capacity(length);
+                for index in 0..length {
+                    let position = start + index * 4;
+                    let target = self.offset_target(py, data, position, "table vector offset")?;
+                    values.push(self.decode_table_at(py, target_object, data, target)?);
+                }
+                Ok(PyList::new(py, values)?.into_any().unbind())
+            }
+            FieldKind::VectorStruct => {
+                let target = self.target_object(field)?;
+                let Some((start, length)) =
+                    self.vector_info(py, data, table, field.offset, target.byte_size)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                let mut values = Vec::with_capacity(length);
+                for index in 0..length {
+                    values.push(self.decode_struct_at(
+                        py,
+                        target,
+                        data,
+                        start + index * target.byte_size,
+                    )?);
+                }
+                Ok(PyList::new(py, values)?.into_any().unbind())
+            }
+            FieldKind::Nested => {
+                let Some((start, length)) = self.vector_info(py, data, table, field.offset, 1)?
+                else {
+                    return self.missing_field(py, field);
+                };
+                let target = self.target_object(field)?;
+                let bytes = PyBytes::new(py, &data[start..start + length]);
+                Ok(self
+                    .bound_type(py, &target.name)?
+                    .call_method1("from_flatbuffer", (bytes,))?
+                    .unbind())
+            }
+            FieldKind::Dynamic => self.decode_dynamic(py, field, data, table),
+            FieldKind::Union => self.decode_union(py, field, data, table),
+            FieldKind::UnionVector => self.decode_union_vector(py, field, data, table),
+        }
+    }
+
+    fn decode_root(
+        &self,
+        py: Python<'_>,
+        object: &ObjectWire,
+        input: &[u8],
+        options: RootDecode<'_>,
+    ) -> PyResult<Py<PyAny>> {
+        let (data, root_offset) = if options.size_prefixed {
+            let size = usize::try_from(self.read_u32(py, input, options.offset)?).unwrap();
+            let start = options
+                .offset
+                .checked_add(4)
+                .ok_or_else(|| self.bounds_error(py, "size-prefixed payload offset overflows"))?;
+            self.require_span(py, input, start, size, "size-prefixed buffer")?;
+            (&input[start..start + size], 0)
+        } else {
+            (input, options.offset)
+        };
+        self.require_span(py, data, root_offset, 4, "root offset")?;
+        if options.check_identifier
+            && let Some(expected) = options.identifier
+        {
+            let position = root_offset + 4;
+            self.require_span(py, data, position, 4, "file identifier")?;
+            if &data[position..position + 4] != expected.as_bytes() {
+                return Err(self.invalid_error(
+                    py,
+                    format!(
+                        "expected file identifier {:?}, got {:?}",
+                        expected.as_bytes(),
+                        &data[position..position + 4]
+                    ),
+                ));
+            }
+        }
+        let relative = usize::try_from(self.read_u32(py, data, root_offset)?).unwrap();
+        if relative == 0 {
+            return Err(self.invalid_error(py, "root table offset is null"));
+        }
+        let table_offset = root_offset
+            .checked_add(relative)
+            .ok_or_else(|| self.bounds_error(py, "root table offset overflows"))?;
+        self.decode_table_at(py, object, data, table_offset)
     }
 
     fn encode_dynamic_value<'py>(
@@ -761,12 +1599,12 @@ impl NativePlan {
         field: &'a FieldWire,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<&'a ArmWire> {
-        let model_types = self
-            .model_types
+        let bound_types = self
+            .bound_types
             .get()
             .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
         let value_type = value.get_type();
-        let target = model_types.get(&(value_type.as_ptr() as usize));
+        let target = bound_types.by_pointer.get(&(value_type.as_ptr() as usize));
         let arm =
             target.and_then(|target| field.arms.iter().find(|arm| arm.target_index == *target));
         let type_name = value_type.name()?.to_str()?.to_owned();
@@ -886,7 +1724,7 @@ impl NativePlan {
                 }
             }
 
-            highest_slot = Some(highest_slot.map_or(field.slot, |slot| slot.max(field.slot)));
+            include_slot(&mut highest_slot, field.slot);
             let referenced = match field.kind {
                 FieldKind::Scalar => {
                     let width = scalar_size(field.scalar)?;
@@ -965,8 +1803,7 @@ impl NativePlan {
                 FieldKind::Dynamic => {
                     size = size.saturating_add(7);
                     if let Some(type_slot) = field.type_slot {
-                        highest_slot =
-                            Some(highest_slot.map_or(type_slot, |slot| slot.max(type_slot)));
+                        include_slot(&mut highest_slot, type_slot);
                         size = size.saturating_add(7);
                     }
                     let allowed_prefix = field.allowed_prefix.as_deref().ok_or_else(|| {
@@ -982,8 +1819,7 @@ impl NativePlan {
                 FieldKind::Union => {
                     size = size.saturating_add(7);
                     if let Some(type_slot) = field.type_slot {
-                        highest_slot =
-                            Some(highest_slot.map_or(type_slot, |slot| slot.max(type_slot)));
+                        include_slot(&mut highest_slot, type_slot);
                     }
                     let width = scalar_size(field.type_scalar)?;
                     size = size.saturating_add(aligned_payload_size(width, width));
@@ -993,8 +1829,7 @@ impl NativePlan {
                 FieldKind::UnionVector => {
                     size = size.saturating_add(7);
                     if let Some(type_slot) = field.type_slot {
-                        highest_slot =
-                            Some(highest_slot.map_or(type_slot, |slot| slot.max(type_slot)));
+                        include_slot(&mut highest_slot, type_slot);
                         size = size.saturating_add(7);
                     }
                     let length = sequence_len(value)?;
@@ -1195,7 +2030,7 @@ impl NativePlan {
 
         let table = builder.start_table();
         for (field, state) in object.fields.iter().zip(&states) {
-            let slot = 4 + field.slot * 2;
+            let slot = vtable_offset(field.slot);
             if let Some(offset) = state.offset {
                 builder.push_slot_always(slot, offset);
                 match field.kind {
@@ -1203,19 +2038,20 @@ impl NativePlan {
                         let Some(Discriminator::Offset(type_offset)) = state.discriminator else {
                             return Err(PyTypeError::new_err("dynamic FlatBuffer has no type tag"));
                         };
-                        let type_slot = 4 + field.type_slot.ok_or_else(|| {
+                        let type_slot = vtable_offset(field.type_slot.ok_or_else(|| {
                             PyValueError::new_err("dynamic field has no type slot")
-                        })? * 2;
+                        })?);
                         builder.push_slot_always(type_slot, type_offset);
                     }
                     FieldKind::Union => {
                         let Some(Discriminator::Union(tag)) = state.discriminator else {
                             return Err(PyTypeError::new_err("union has no discriminator"));
                         };
-                        let type_slot = 4 + field
-                            .type_slot
-                            .ok_or_else(|| PyValueError::new_err("union has no type slot"))?
-                            * 2;
+                        let type_slot = vtable_offset(
+                            field
+                                .type_slot
+                                .ok_or_else(|| PyValueError::new_err("union has no type slot"))?,
+                        );
                         push_type_id(builder, type_slot, field.type_scalar, tag)?;
                     }
                     FieldKind::UnionVector => {
@@ -1224,9 +2060,9 @@ impl NativePlan {
                                 "union vector has no discriminator vector",
                             ));
                         };
-                        let type_slot = 4 + field.type_slot.ok_or_else(|| {
+                        let type_slot = vtable_offset(field.type_slot.ok_or_else(|| {
                             PyValueError::new_err("union vector has no type slot")
-                        })? * 2;
+                        })?);
                         builder.push_slot_always(type_slot, type_offset);
                     }
                     _ => {}
@@ -1293,12 +2129,11 @@ impl NativePlan {
 impl NativePlan {
     #[new]
     fn new(data: &Bound<'_, PyBytes>) -> PyResult<Self> {
-        let mut wire: ModuleWire = rmp_serde::from_slice(data.as_bytes()).map_err(|error| {
-            PyValueError::new_err(format!("invalid native packing plan: {error}"))
-        })?;
+        let mut wire: ModuleWire = rmp_serde::from_slice(data.as_bytes())
+            .map_err(|error| PyValueError::new_err(format!("invalid native plan: {error}")))?;
         if wire.version != 1 {
             return Err(PyValueError::new_err(format!(
-                "unsupported native packing plan version {}",
+                "unsupported native plan version {}",
                 wire.version
             )));
         }
@@ -1333,37 +2168,94 @@ impl NativePlan {
             .iter()
             .flat_map(|object| &object.fields)
             .any(|field| field.kind == FieldKind::Dynamic);
+        let dynamic = data.py().import("msgspec_flatbuffers._dynamic")?;
         let dynamic_encoder = if has_dynamic {
-            Some(
-                data.py()
-                    .import("msgspec_flatbuffers._dynamic")?
-                    .getattr("encode_dynamic")?
-                    .unbind(),
-            )
+            Some(dynamic.getattr("encode_dynamic")?.unbind())
         } else {
             None
         };
+        let dynamic_registry = dynamic.getattr("dynamic_types")?.unbind();
+        let numpy_empty = data.py().import("numpy")?.getattr("empty")?.unbind();
+        let runtime = data.py().import("msgspec_flatbuffers._runtime")?;
+        let buffer_bounds_error = runtime
+            .getattr("BufferBoundsError")?
+            .cast_into::<PyType>()?
+            .unbind();
+        let invalid_buffer_error = runtime
+            .getattr("InvalidBufferError")?
+            .cast_into::<PyType>()?
+            .unbind();
         Ok(Self {
             objects: wire.objects,
             by_name,
-            model_types: OnceLock::new(),
+            bound_types: OnceLock::new(),
             dynamic_encoder,
+            dynamic_registry,
+            numpy_empty,
+            buffer_bounds_error,
+            invalid_buffer_error,
         })
     }
 
     fn bind_types(&self, types: &Bound<'_, PyDict>) -> PyResult<()> {
-        let mut model_types = HashMap::with_capacity(types.len());
-        for (name, model_type) in types.iter() {
+        let mut by_pointer = HashMap::with_capacity(types.len());
+        let mut by_name = HashMap::with_capacity(types.len());
+        for (name, bound_type) in types.iter() {
             let name = name.extract::<String>()?;
-            let object_index = *self.by_name.get(&name).ok_or_else(|| {
-                PyValueError::new_err(format!("cannot bind unknown native model type {name:?}"))
-            })?;
-            let model_type = model_type.cast::<PyType>()?;
-            model_types.insert(model_type.as_ptr() as usize, object_index);
+            let bound_type = bound_type.cast::<PyType>()?;
+            if let Some(object_index) = self.by_name.get(&name) {
+                by_pointer.insert(bound_type.as_ptr() as usize, *object_index);
+            }
+            by_name.insert(name, bound_type.clone().unbind());
         }
-        self.model_types
-            .set(model_types)
+        self.bound_types
+            .set(BoundTypes {
+                by_pointer,
+                by_name,
+            })
             .map_err(|_| PyRuntimeError::new_err("native model types are already bound"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (root, buffer, *, identifier=None, offset=0, size_prefixed=false, check_identifier=true))]
+    fn unpack(
+        &self,
+        py: Python<'_>,
+        root: &str,
+        buffer: &Bound<'_, PyAny>,
+        identifier: Option<&str>,
+        offset: isize,
+        size_prefixed: bool,
+        check_identifier: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let offset = nonnegative_usize(offset, "offset")?;
+        validate_identifier(identifier)?;
+        let root = self.object(root)?;
+        let options = RootDecode {
+            offset,
+            size_prefixed,
+            identifier,
+            check_identifier,
+        };
+        with_input_bytes(buffer, |data| self.decode_root(py, root, data, options))
+    }
+
+    fn unpack_view(
+        &self,
+        py: Python<'_>,
+        object: &str,
+        buffer: &Bound<'_, PyAny>,
+        offset: isize,
+    ) -> PyResult<Py<PyAny>> {
+        let offset = nonnegative_usize(offset, "offset")?;
+        let object = self.object(object)?;
+        with_input_bytes(buffer, |data| {
+            if object.is_struct {
+                self.decode_struct_at(py, object, data, offset)
+            } else {
+                self.decode_table_at(py, object, data, offset)
+            }
+        })
     }
 
     #[pyo3(signature = (root, model, *, identifier=None, size_prefixed=false, initial_size=0))]
@@ -1376,18 +2268,8 @@ impl NativePlan {
         size_prefixed: bool,
         initial_size: isize,
     ) -> PyResult<Bound<'py, PyMemoryView>> {
-        if initial_size < 0 {
-            return Err(PyValueError::new_err(
-                "initial_size must be greater than or equal to zero",
-            ));
-        }
-        if let Some(value) = identifier
-            && (value.len() != 4 || !value.is_ascii())
-        {
-            return Err(PyValueError::new_err(
-                "FlatBuffers file identifiers must contain four ASCII bytes",
-            ));
-        }
+        let initial_size = nonnegative_usize(initial_size, "initial_size")?;
+        validate_identifier(identifier)?;
         let root_object = self.object(root)?;
         let mut root_fields = self.load_fields(root_object, model)?;
         let finish_size = 4usize
@@ -1397,7 +2279,7 @@ impl NativePlan {
             .estimate_table_fields(root_object, &mut root_fields)?
             .saturating_add(finish_size);
         let estimate = estimate.saturating_mul(101).saturating_add(99) / 100;
-        let capacity = (initial_size as usize).max(estimate);
+        let capacity = initial_size.max(estimate);
         if capacity > FLATBUFFERS_MAX_BUFFER_SIZE {
             return Err(PyValueError::new_err(
                 "estimated FlatBuffer size exceeds the 2 GiB format limit",

@@ -11,7 +11,6 @@ import pytest
 
 from msgspec_flatbuffers import compile_schema, generate, load_bfbs
 
-
 ROOT = Path(__file__).parents[1]
 EXAMPLE = ROOT / "examples" / "schema_evolution"
 SCHEMAS = EXAMPLE / "schemas"
@@ -111,6 +110,7 @@ def test_installed_flatc_can_drive_current_generator(
     versioned_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     source = SCHEMAS / f"reading_{version}.fbs"
+    v1, v2 = versioned_modules
 
     schema = compile_schema(source, project_root=EXAMPLE)
     module_path = generate(
@@ -134,7 +134,7 @@ def test_installed_flatc_can_drive_current_generator(
         label=f"generated from {version}",
         samples=np.array([6.25], dtype=np.float32),
     ).to_flatbuffer()
-    fixed = versioned_modules[0 if version == "v1" else 1]
+    fixed = v1 if version == "v1" else v2
     checked_in = fixed.ReadingView.from_buffer(rebuilt)
     assert checked_in.id == 31
     assert checked_in.label == f"generated from {version}"

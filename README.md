@@ -91,7 +91,7 @@ table Weapon {
 table Monster {
   name:string;
   inventory:[ubyte];
-  scores:[uint];
+  scores:[float];
   weapons:[Weapon];
 }
 
@@ -174,6 +174,14 @@ Convert a view into an independent msgspec model:
 model: Monster = view.to_model()
 ```
 
+To materialize a root buffer directly, use the matching model class:
+
+```python
+model = Monster.from_flatbuffer(buffer)
+```
+
+This is equivalent to `MonsterView.from_buffer(buffer).to_model()`.
+
 `to_model()` copies the full object graph into ordinary Python values. The
 result is not cached, so separate calls produce separate snapshots.
 
@@ -198,14 +206,14 @@ use independent, owned Python values.
 | Scalar | `int`, `float`, or `bool` | `int`, `float`, or `bool` |
 | String | Cached `str` | `str` |
 | `[ubyte]` | Read-only `memoryview` | `bytes` |
-| `[ubyte] (nested_flatbuffer: "Payload")` | Raw `memoryview` and typed `PayloadView` | `Payload` |
-| String tag plus `[ubyte] (dynamic_flatbuffer: "type")` | Raw tag, `memoryview`, and `DynamicView` | `DynamicValue` |
+| `[ubyte] (nested_flatbuffer: "Payload")` | Cached `PayloadView`; raw bytes through `payload_raw` | `Payload` |
+| String tag plus `[ubyte] (dynamic_flatbuffer: "type")` | Cached `DynamicView`; raw tag and bytes through `_raw` fields | Generated `DynamicValue` subtype |
 | Numeric vector | Read-only NumPy array | Writable, owning NumPy array with the generated dtype |
 | Enum vector | Read-only NumPy array | `list[Enum]` |
 | String vector | Cached sequence | `list[str]` |
 | Table field | Cached nested view | Nested msgspec model |
 | Table or struct vector | Cached view sequence | `list` of models |
-| Union | Discriminator and typed variant view | Selected variant model |
+| Union | Selected variant view; discriminator through `<field>_type` | Selected variant model |
 | Union vector | Discriminator array and cached variant views | `list` of variant models |
 
 Numeric and union-discriminator vectors use the FlatBuffers little-endian
@@ -243,10 +251,8 @@ from_json: Monster = msgspec.json.decode(
 `dec_hook` restores each generated NumPy dtype, including arrays inside nested
 tables and lists. Decoded arrays own their storage and are writable.
 
-Every generated table model uses its fully qualified IDL name as a stable
-msgspec tag. The tag is encoded in the reserved
-`__msgspec_flatbuffers_type__` field, allowing msgspec to decode table-valued
-union fields and union vectors without a custom union codec.
+Tables used as IDL union alternatives receive stable msgspec tags based on
+their fully qualified IDL names. Other generated tables remain untagged.
 
 ## IDL-declared nested FlatBuffers
 
@@ -272,17 +278,17 @@ buffer = envelope.to_flatbuffer()
 payload: Payload | None = envelope.payload
 ```
 
-The view exposes both the raw bytes and a typed helper whose target is inferred
-from the IDL:
+The view uses the same semantic field name and returns the corresponding view.
+The `_raw` property exposes the underlying byte vector:
 
 ```python
 envelope_view = EnvelopeView.from_buffer(buffer)
 
-raw: memoryview | None = envelope_view.payload
-payload_view: PayloadView | None = envelope_view.payload_view()
+payload_view: PayloadView | None = envelope_view.payload
+raw: memoryview | None = envelope_view.payload_raw
 ```
 
-`payload_view()` is zero-copy and cached. It validates the nested target's file
+`payload` is zero-copy and cached. It validates the nested target's file
 identifier when the target IDL declares one. If the stored payload is
 size-prefixed, request that framing explicitly:
 
@@ -355,27 +361,33 @@ root_type Metric;
 ```
 
 The generated extension module registers its root model and view when imported.
-No manual type registration is needed:
+The module containing the dynamic field exports a public wrapper type for that
+field. No manual type registration is needed:
 
 ```python
-from msgspec_flatbuffers import DynamicValue
+from example.dynamic.envelope import Envelope, EnvelopePayload
+from example.dynamic.payload import Metric
 
 envelope = Envelope(
-    payload=DynamicValue(Metric(name="latency")),
+    payload=EnvelopePayload(Metric(name="latency")),
 )
 ```
 
-The materialized model contains one `DynamicValue` field. Its concrete table
-tag is written to the sibling string when the FlatBuffer is built. The view
-retains the raw tag and byte vector and adds a cached dynamic helper:
+`EnvelopePayload` is a generated `DynamicValue` subtype that applies the
+field's allowed namespace. Its concrete table tag is written to the sibling
+string when the FlatBuffer is built. The view exposes the matching
+`DynamicView` under the same field name:
 
 ```python
 view = EnvelopeView.from_buffer(envelope.to_flatbuffer())
-payload = view.payload_dynamic()
+payload = view.payload
 
 assert payload is not None
 assert payload.tag == "Example.Dynamic.Metric"
 assert isinstance(payload.value, MetricView)
+
+raw_tag = view.payload_type_raw
+raw_data = view.payload_raw
 ```
 
 The standard `enc_hook` and `dec_hook` use the same process-wide registry for
@@ -449,11 +461,12 @@ residents: list[Cat | Dog] | None = payload.residents
 ```
 
 The model builder selects each discriminator from the variant's Python type.
-The lazy view exposes the discriminator and the selected typed view separately:
+The lazy view uses the same field names while retaining access to the wire
+discriminators:
 
 ```python
 favorite_type: Pet = payload_view.favorite_type
-favorite_view: CatView | DogView | None = payload_view.favorite_view()
+favorite_view: CatView | DogView | None = payload_view.favorite
 
 resident_types = payload_view.residents_type
 residents = payload_view.residents
@@ -475,6 +488,7 @@ FlatBuffers may be encoded with a four-byte size prefix:
 ```python
 framed = monster.to_flatbuffer(size_prefixed=True)
 framed_view = MonsterView.from_buffer(framed, size_prefixed=True)
+framed_model = Monster.from_flatbuffer(framed, size_prefixed=True)
 ```
 
 `size_prefixed` defaults to `False`. A size-prefixed view is restricted to the
@@ -508,7 +522,7 @@ validation:
 view = MonsterView.from_buffer(buffer, check_identifier=False)
 ```
 
-`<field>_as()`, `<field>_view()`, and `<field>_dynamic()` also follow the target
+Typed nested and dynamic fields, along with `<field>_as()`, follow the target
 view's declared identifier automatically.
 
 ## Supported schemas and limitations

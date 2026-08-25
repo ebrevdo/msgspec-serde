@@ -47,6 +47,24 @@ class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
     def __ne__(self, other: object) -> bool:
         return not self == other
 
+    @classmethod
+    def from_flatbuffer(
+        cls,
+        buffer: bytes | bytearray | memoryview,
+        *,
+        offset: int = 0,
+        size_prefixed: bool = False,
+        check_identifier: bool = True,
+    ) -> Reading:
+        return _FB_NATIVE_MODULE.unpack(
+            'Example.Evolution.Reading',
+            buffer,
+            identifier='EVOL',
+            offset=offset,
+            size_prefixed=size_prefixed,
+            check_identifier=check_identifier,
+        )
+
     def to_flatbuffer(
         self,
         *,
@@ -127,52 +145,10 @@ class ReadingView(TableView):
         return value
 
     def to_model(self) -> Reading:
-        _fb_buffer = self._buffer
-        _fb_vtable_size = self._vtable_size
-        _fb_vtable_offset = self._vtable_offset
-        _fb_object_size = self._object_size
-        _fb_table_offset = self._table_offset
-        if 4 >= _fb_vtable_size:
-            _id = 0
-        else:
-            _id_relative = _UINT16.unpack_from(_fb_buffer, _fb_vtable_offset + 4)[0]
-            if _id_relative == 0:
-                _id = 0
-            elif _id_relative < 4 or _id_relative > _fb_object_size - 8:
-                raise InvalidBufferError("field lies outside its FlatBuffers table")
-            else:
-                _id = _UINT64.unpack_from(_fb_buffer, _fb_table_offset + _id_relative)[0]
-        try:
-            _label = self._fb_cached_label
-        except AttributeError:
-            _label = self._read_string(6)
-            self._fb_cached_label = _label
-        try:
-            _samples = self._fb_cached_samples
-        except AttributeError:
-            _samples = self._read_numpy_vector(8, '<f4')
-            self._fb_cached_samples = _samples
-        if 10 >= _fb_vtable_size:
-            _quality = 100
-        else:
-            _quality_relative = _UINT16.unpack_from(_fb_buffer, _fb_vtable_offset + 10)[0]
-            if _quality_relative == 0:
-                _quality = 100
-            elif _quality_relative < 4 or _quality_relative > _fb_object_size - 1:
-                raise InvalidBufferError("field lies outside its FlatBuffers table")
-            else:
-                _quality = _UINT8.unpack_from(_fb_buffer, _fb_table_offset + _quality_relative)[0]
-        try:
-            _note = self._fb_cached_note
-        except AttributeError:
-            _note = self._read_string(12)
-            self._fb_cached_note = _note
-        return Reading(
-            id=_id,
-            label=None if _label is None else _label,
-            samples=None if _samples is None else np.array(_samples, dtype=np.float32, copy=True),
-            quality=_quality,
-            note=None if _note is None else _note,
+        return _FB_NATIVE_MODULE.unpack_view(
+            'Example.Evolution.Reading',
+            self._buffer,
+            self._table_offset,
         )
 
 

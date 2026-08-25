@@ -9,6 +9,7 @@ import statistics
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -28,7 +29,7 @@ def _load_module(name: str, path: Path) -> ModuleType:
     return module
 
 
-def _measure(function: Any, number: int) -> float:
+def _measure(function: Callable[[], object], number: int) -> float:
     samples: list[float] = []
     function()
     function()
@@ -116,7 +117,9 @@ def main() -> None:
             label="built in Rust",
             optional_count=9,
         )
-        wide_values = {f"value_{index}": index + 1 for index in range(32)}
+        wide_values: dict[str, int | str] = {
+            f"value_{index}": index + 1 for index in range(32)
+        }
         wide_values.update(
             {f"text_{index}": f"value-{index}" for index in range(8)}
         )

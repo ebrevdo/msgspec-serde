@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from collections.abc import Sequence
 from enum import IntEnum
-from typing import Any, overload
+from typing import Any
 
 import flatbuffers
 import numpy as np
@@ -15,7 +15,6 @@ from msgspec_flatbuffers import (
     TableView,
     build_scalar_vector,
 )
-from msgspec_flatbuffers._runtime import _estimate_sampled_vector_size
 
 
 class ExampleView(TableView):
@@ -106,34 +105,8 @@ def _minimal_table_buffer() -> bytearray:
     return buffer
 
 
-class SamplingProbe(Sequence[int]):
-    def __init__(self, length: int) -> None:
-        self.length = length
-        self.accessed: list[int] = []
-
-    def __len__(self) -> int:
-        return self.length
-
-    @overload
-    def __getitem__(self, index: int) -> int: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> Sequence[int]: ...
-
-    def __getitem__(self, index: int | slice) -> int | Sequence[int]:
-        if isinstance(index, slice):
-            return range(self.length)[index]
-        self.accessed.append(index)
-        return index
-
-
-def test_vector_size_estimate_uses_six_deterministic_samples() -> None:
-    values = SamplingProbe(100)
-
-    size = _estimate_sampled_vector_size(values, lambda value: value + 100)
-
-    assert values.accessed == [0, 1, 49, 50, -2, -1]
-    assert size == 8 + 100 * 4 + (697 * 100 + 5) // 6
+def _size_prefixed(payload: bytes | bytearray) -> bytes:
+    return struct.pack("<I", len(payload)) + payload
 
 
 def test_from_root_keeps_a_read_only_view_of_the_original_buffer() -> None:
@@ -150,7 +123,7 @@ def test_size_prefixed_root_is_bounded_to_its_declared_payload() -> None:
     payload = _minimal_table_buffer()
     leading = b"lead"
     trailing = b"trailing frame"
-    framed = bytearray(leading + struct.pack("<I", len(payload)) + payload + trailing)
+    framed = bytearray(leading + _size_prefixed(payload) + trailing)
 
     view = ExampleView.from_root(
         framed,
@@ -185,7 +158,7 @@ def test_size_prefixed_root_rejects_a_declared_payload_past_the_input() -> None:
 
 def test_concatenated_size_prefixed_roots_keep_separate_buffers() -> None:
     payload = _minimal_table_buffer()
-    frame = struct.pack("<I", len(payload)) + payload
+    frame = _size_prefixed(payload)
     combined = bytearray(frame + frame)
 
     first = ExampleView.from_root(combined, size_prefixed=True)
@@ -206,7 +179,7 @@ def test_size_prefixed_root_cannot_use_a_vtable_before_its_payload() -> None:
     payload = bytearray(8)
     struct.pack_into("<I", payload, 0, 4)
     struct.pack_into("<i", payload, 4, 12)
-    framed = leading_vtable + struct.pack("<I", len(payload)) + payload
+    framed = leading_vtable + _size_prefixed(payload)
 
     with pytest.raises(BufferBoundsError, match="vtable header"):
         ExampleView.from_root(

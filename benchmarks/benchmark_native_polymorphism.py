@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from msgspec_flatbuffers import DynamicValue, generate
+from msgspec_flatbuffers import generate
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -87,16 +87,20 @@ def main() -> None:
         models: dict[str, tuple[object, int]] = {
             "dynamic_inner_large": (large_metric, 5),
             "dynamic_known_small": (
-                dynamic_envelope.Envelope(payload=DynamicValue(small_metric)),
+                dynamic_envelope.Envelope(
+                    payload=dynamic_envelope.EnvelopePayload(small_metric)
+                ),
                 500,
             ),
             "dynamic_known_large": (
-                dynamic_envelope.Envelope(payload=DynamicValue(large_metric)),
+                dynamic_envelope.Envelope(
+                    payload=dynamic_envelope.EnvelopePayload(large_metric)
+                ),
                 5,
             ),
             "dynamic_opaque_small": (
                 dynamic_envelope.Envelope(
-                    payload=DynamicValue.opaque(
+                    payload=dynamic_envelope.EnvelopePayload.opaque(
                         "Example.Dynamic.Future",
                         b"opaque",
                     )
@@ -105,7 +109,7 @@ def main() -> None:
             ),
             "dynamic_opaque_1mib": (
                 dynamic_envelope.Envelope(
-                    payload=DynamicValue.opaque(
+                    payload=dynamic_envelope.EnvelopePayload.opaque(
                         "Example.Dynamic.Future",
                         bytes(1 << 20),
                     )

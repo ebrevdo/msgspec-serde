@@ -13,8 +13,8 @@ import msgspec
 from ._runtime import TableView
 
 _MSGSPEC_TAG_FIELD = "__msgspec_flatbuffers_type__"
-_OPAQUE_DATA_FIELD = "__msgspec_flatbuffers_data__"
 _DYNAMIC_VALUE_FIELD = "value"
+_OPAQUE_DATA_FIELD = "__msgspec_flatbuffers_data__"
 _KNOWN_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _DYNAMIC_VALUE_FIELD))
 _OPAQUE_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _OPAQUE_DATA_FIELD))
 _ABSENT: Any = object()
@@ -43,12 +43,12 @@ class _DynamicTypeRegistry:
     )
 
     def __init__(self) -> None:
-        self._lock = Lock()
-        self._by_tag: dict[str, DynamicType | None] = {}
         self._by_model: dict[type[object], DynamicType | None] = {}
+        self._by_tag: dict[str, DynamicType | None] = {}
+        self._lock = Lock()
         self._modules: dict[str, str] = {}
-        self._negative_tag_count = 0
         self._negative_model_count = 0
+        self._negative_tag_count = 0
 
     def register(
         self,
@@ -60,24 +60,24 @@ class _DynamicTypeRegistry:
 
         entry = _validated_entry(tag, model_type, view_type)
         with self._lock:
-            existing = (
-                self._by_tag.get(entry.tag),
-                self._by_model.get(entry.model_type),
-            )
-            if any(item is not None and item != entry for item in existing):
+            tag_entry = self._by_tag.get(entry.tag)
+            model_entry = self._by_model.get(entry.model_type)
+            if (tag_entry is not None and tag_entry != entry) or (
+                model_entry is not None and model_entry != entry
+            ):
                 raise ValueError(
                     "dynamic FlatBuffer registration conflicts with an existing "
                     "tag or model"
                 )
-            for item in existing:
-                if item is not None:
-                    return item
-            if self._by_tag.get(entry.tag, _ABSENT) is None:
-                self._negative_tag_count -= 1
-            if self._by_model.get(model_type, _ABSENT) is None:
+            if tag_entry is not None:
+                return tag_entry
+            if model_entry is not None:
+                return model_entry
+            self._discard_cached_tag_miss(entry.tag)
+            if self._by_model.get(entry.model_type, _ABSENT) is None:
                 self._negative_model_count -= 1
             self._by_tag[entry.tag] = entry
-            self._by_model[model_type] = entry
+            self._by_model[entry.model_type] = entry
         return entry
 
     def register_module(self, tag: str, module: str) -> str:
@@ -93,9 +93,7 @@ class _DynamicTypeRegistry:
                     f"dynamic FlatBuffer tag {tag!r} already maps to {existing!r}"
                 )
             self._modules[tag] = module
-            if self._by_tag.get(tag, _ABSENT) is None:
-                del self._by_tag[tag]
-                self._negative_tag_count -= 1
+            self._discard_cached_tag_miss(tag)
         return module
 
     def lookup_tag(self, tag: str) -> DynamicType | None:
@@ -120,6 +118,11 @@ class _DynamicTypeRegistry:
                     self._by_model[model_type] = None
                     self._negative_model_count += 1
             return None
+
+    def _discard_cached_tag_miss(self, tag: str) -> None:
+        if self._by_tag.get(tag, _ABSENT) is None:
+            del self._by_tag[tag]
+            self._negative_tag_count -= 1
 
     def _load_or_cache_tag(self, tag: str) -> DynamicType | None:
         with self._lock:
@@ -151,10 +154,11 @@ class DynamicValue:
     _allowed_prefix: ClassVar[str | None] = None
 
     def __init__(self, value: msgspec.Struct) -> None:
-        entry = dynamic_types.lookup_model(type(value))
+        model_type = type(value)
+        entry = dynamic_types.lookup_model(model_type)
         if entry is None:
             raise TypeError(
-                f"unregistered dynamic FlatBuffer model {type(value).__qualname__}"
+                f"unregistered dynamic FlatBuffer model {model_type.__qualname__}"
             )
         self._tag = entry.tag
         self._entry: DynamicType | None = entry
@@ -269,10 +273,11 @@ class DynamicView:
             return self._value_type.opaque(self._tag, self._data)
         entry, view = resolved
         model = cast(Any, view).to_model()
-        if type(model) is not entry.model_type:
+        model_type = type(model)
+        if model_type is not entry.model_type:
             raise TypeError(
                 f"{entry.view_type.__qualname__}.to_model() returned "
-                f"{type(model).__qualname__}, expected {entry.model_type.__qualname__}"
+                f"{model_type.__qualname__}, expected {entry.model_type.__qualname__}"
             )
         return self._value_type._known(entry, model)
 
@@ -306,7 +311,9 @@ def _validate_tag(tag: object) -> str:
 
 def _require_allowed_prefix(tag: str, prefix: str | None) -> None:
     _validate_tag(tag)
-    if prefix is None or (tag.startswith(prefix) and len(tag) > len(prefix)):
+    if prefix is None:
+        return
+    if tag.startswith(prefix) and len(tag) > len(prefix):
         return
     raise ValueError(
         f"dynamic FlatBuffer tag {tag!r} is outside {prefix + '*'!r}"
@@ -348,6 +355,12 @@ def dynamic_allow_prefix(pattern: str) -> str:
     return pattern[:-1]
 
 
+def register_dynamic_module(tag: str, module: str) -> str:
+    """Register a trusted module for lazy loading of one type tag."""
+
+    return dynamic_types.register_module(tag, module)
+
+
 def register_dynamic_type(
     tag: str,
     model_type: type[msgspec.Struct],
@@ -356,12 +369,6 @@ def register_dynamic_type(
     """Register a dynamic type in the process-wide registry."""
 
     return dynamic_types.register(tag, model_type, view_type)
-
-
-def register_dynamic_module(tag: str, module: str) -> str:
-    """Register a trusted module for lazy loading of one type tag."""
-
-    return dynamic_types.register_module(tag, module)
 
 
 def encode_dynamic(
@@ -423,7 +430,7 @@ def dynamic_from_builtins(
     if not isinstance(tag, str):
         raise ValueError(
             f"dynamic FlatBuffer object is missing {_MSGSPEC_TAG_FIELD!r}"
-    )
+        )
     value_type._require_allowed(tag)
     if _OPAQUE_DATA_FIELD in value:
         if value.keys() != _OPAQUE_DYNAMIC_FIELDS:

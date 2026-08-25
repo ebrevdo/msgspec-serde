@@ -12,7 +12,7 @@ from .generator import GenerationError, generate
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="msgspec-flatbuffers")
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands = parser.add_subparsers(required=True)
 
     generate_parser = subcommands.add_parser(
         "generate",
@@ -42,8 +42,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command != "generate":
-        parser.error(f"unknown command: {args.command}")
 
     try:
         for schema in args.schemas:

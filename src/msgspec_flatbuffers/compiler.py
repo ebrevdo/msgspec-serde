@@ -42,9 +42,10 @@ class FlatcError(RuntimeError):
 
 
 def _resolve_flatc(flatc: StrPath) -> str:
-    executable = shutil.which(os.fspath(flatc))
+    requested = os.fspath(flatc)
+    executable = shutil.which(requested)
     if executable is None:
-        raise FlatcNotFoundError(f"flatc executable not found: {os.fspath(flatc)!r}")
+        raise FlatcNotFoundError(f"flatc executable not found: {requested!r}")
     return executable
 
 
@@ -75,6 +76,7 @@ def compile_schema_to_bfbs(
 
     executable = _resolve_flatc(flatc)
     with tempfile.TemporaryDirectory(prefix="msgspec-flatbuffers-") as output:
+        output_path = Path(output)
         command = [
             executable,
             "-b",
@@ -108,11 +110,11 @@ def compile_schema_to_bfbs(
                 result.stderr,
             )
 
-        expected = Path(output, f"{source.stem}.bfbs")
+        expected = output_path / f"{source.stem}.bfbs"
         if expected.is_file():
             return expected.read_bytes()
 
-        artifacts = list(Path(output).glob("*.bfbs"))
+        artifacts = list(output_path.glob("*.bfbs"))
         if len(artifacts) == 1:
             return artifacts[0].read_bytes()
         raise FlatcError(

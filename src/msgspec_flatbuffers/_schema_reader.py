@@ -32,6 +32,7 @@ from .schema import (
 )
 
 _T = TypeVar("_T")
+_U = TypeVar("_U")
 _KNOWN_ADVANCED_FEATURES = (
     AdvancedFeature.ARRAYS
     | AdvancedFeature.UNIONS
@@ -72,6 +73,17 @@ def _documents(
 ) -> tuple[str, ...]:
     return tuple(
         _text(getter(index), description).strip() for index in range(length)
+    )
+
+
+def _convert_required(
+    length: int,
+    getter: Callable[[int], _T | None],
+    converter: Callable[[_T], _U],
+    description: str,
+) -> tuple[_U, ...]:
+    return tuple(
+        converter(_required(getter(index), description)) for index in range(length)
     )
 
 
@@ -153,9 +165,11 @@ def _field(item: ReflectedField) -> FieldDefinition:
 
 
 def _object(item: ReflectedObject) -> ObjectDefinition:
-    fields = tuple(
-        _field(_required(item.Fields(index), "object field"))
-        for index in range(item.FieldsLength())
+    fields = _convert_required(
+        item.FieldsLength(),
+        item.Fields,
+        _field,
+        "object field",
     )
     return ObjectDefinition(
         name=_text(item.Name(), "object name"),
@@ -190,9 +204,11 @@ def _enum_value(item: ReflectedEnumValue) -> EnumValue:
 
 def _enum(item: ReflectedEnum) -> EnumDefinition:
     underlying_type = _required(item.UnderlyingType(), "enum underlying type")
-    values = tuple(
-        _enum_value(_required(item.Values(index), "enum value"))
-        for index in range(item.ValuesLength())
+    values = _convert_required(
+        item.ValuesLength(),
+        item.Values,
+        _enum_value,
+        "enum value",
     )
     return EnumDefinition(
         name=_text(item.Name(), "enum name"),
@@ -226,9 +242,11 @@ def _rpc_call(item: ReflectedRpcCall) -> RpcCallDefinition:
 
 
 def _service(item: ReflectedService) -> ServiceDefinition:
-    calls = tuple(
-        _rpc_call(_required(item.Calls(index), "RPC call"))
-        for index in range(item.CallsLength())
+    calls = _convert_required(
+        item.CallsLength(),
+        item.Calls,
+        _rpc_call,
+        "RPC call",
     )
     return ServiceDefinition(
         name=_text(item.Name(), "service name"),
@@ -262,21 +280,29 @@ def _parse_schema(root: ReflectedSchema) -> Schema:
             f"binary schema uses unknown advanced feature bits 0x{unknown_features:x}"
         )
 
-    objects = tuple(
-        _object(_required(root.Objects(index), "object"))
-        for index in range(root.ObjectsLength())
+    objects = _convert_required(
+        root.ObjectsLength(),
+        root.Objects,
+        _object,
+        "object",
     )
-    enums = tuple(
-        _enum(_required(root.Enums(index), "enum"))
-        for index in range(root.EnumsLength())
+    enums = _convert_required(
+        root.EnumsLength(),
+        root.Enums,
+        _enum,
+        "enum",
     )
-    services = tuple(
-        _service(_required(root.Services(index), "service"))
-        for index in range(root.ServicesLength())
+    services = _convert_required(
+        root.ServicesLength(),
+        root.Services,
+        _service,
+        "service",
     )
-    files = tuple(
-        _schema_file(_required(root.FbsFiles(index), "schema file"))
-        for index in range(root.FbsFilesLength())
+    files = _convert_required(
+        root.FbsFilesLength(),
+        root.FbsFiles,
+        _schema_file,
+        "schema file",
     )
     root_table = root.RootTable()
     file_identifier = _optional_text(root.FileIdent(), "file identifier") or None

@@ -31,7 +31,6 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
-
 REPEAT = 7
 WEAPON_COUNT = 256
 SCORE_COUNT = 4096
@@ -121,13 +120,13 @@ BENCHMARKS = {
         ),
     ),
     "to_model": BenchmarkSpec(
-        label="view to_model",
+        label="existing view to_model",
         statement="view.to_model()",
         number=50,
         warmup_number=5,
         unit="us/call",
         scale=1e6,
-        note="Steady-state conversion after all lazy child and string caches are warm.",
+        note="Materializes a model from the same existing root view.",
     ),
     "to_flatbuffer": BenchmarkSpec(
         label="model to_flatbuffer",
@@ -254,7 +253,6 @@ def _prepare_fixture() -> PreparedFixture:
     if scores.flags.writeable:
         raise AssertionError("benchmark numeric vector is unexpectedly writable")
 
-    # Warm every lazy child/string cache before timing steady-state to_model().
     if view.to_model() != model:
         raise AssertionError("generated fixture failed its semantic round trip")
 
