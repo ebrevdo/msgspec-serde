@@ -1,0 +1,7 @@
+{
+  "id": 9,
+  "label": "current sensor",
+  "samples": [3.5],
+  "quality": 87,
+  "note": "added by schema v2"
+}

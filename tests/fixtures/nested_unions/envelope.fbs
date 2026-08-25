@@ -1,0 +1,11 @@
+include "payload.fbs";
+
+namespace Example.Nested;
+
+table Envelope {
+  payload:[ubyte] (nested_flatbuffer: "Payload");
+  note:string;
+}
+
+root_type Envelope;
+file_identifier "ENVP";

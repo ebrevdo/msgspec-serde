@@ -1,0 +1,12 @@
+include "payload.fbs";
+
+namespace Example.Required;
+
+table RequiredHolder {
+  nested:[ubyte] (nested_flatbuffer: "Example.Nested.Payload", required);
+  pet:Example.Nested.Pet (required);
+  pets:[Example.Nested.Pet] (required);
+}
+
+root_type RequiredHolder;
+file_identifier "REQD";

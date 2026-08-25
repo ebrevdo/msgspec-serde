@@ -1,0 +1,43 @@
+namespace Example;
+
+/// A color used by a monster.
+enum Color : byte {
+  Red = 1,
+  Green,
+  Blue,
+}
+
+struct Vec3 {
+  x:float;
+  y:float;
+  z:float;
+}
+
+table Weapon {
+  name:string (required);
+  damage:short = 0;
+}
+
+/// A representative root table.
+table Monster {
+  pos:Vec3;
+  mana:short = 150;
+  hp:short = 100;
+  name:string;
+  inventory:[ubyte];
+  color:Color = Blue;
+  weapons:[Weapon];
+  scores:[float];
+  tags:[string];
+  path:[Vec3];
+  optional_energy:int = null;
+  colors:[Color];
+}
+
+rpc_service MonsterService {
+  GetMonster(Monster):Monster;
+}
+
+root_type Monster;
+file_identifier "MONS";
+file_extension "mon";

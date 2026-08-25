@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific Python tooling and local files
+.ty/
+.idea/
+.vscode/
+.DS_Store
+.env.*
+!.env.example
+
+# Rust build and temporary files
+rust/target/
+**/*.rs.bk
+*.pdb
+*.profraw

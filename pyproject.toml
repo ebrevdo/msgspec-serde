@@ -1,0 +1,40 @@
+[project]
+name = "msgspec-flatbuffers"
+version = "0.1.0"
+description = "Generate lazy FlatBuffers views and msgspec models from FlatBuffers schemas"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flatbuffers>=24.3.25",
+    "msgspec>=0.19",
+    "numpy>=2",
+]
+
+[project.scripts]
+msgspec-flatbuffers = "msgspec_flatbuffers.cli:main"
+
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "pyo3"
+profile = "release"
+editable-profile = "release"
+manifest-path = "rust/Cargo.toml"
+module-name = "msgspec_flatbuffers._native"
+python-source = "src"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ty",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+
+[tool.ty.src]
+include = ["src", "tests", "examples"]
+exclude = ["src/msgspec_flatbuffers/_reflection"]

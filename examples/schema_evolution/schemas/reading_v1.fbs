@@ -1,0 +1,10 @@
+namespace Example.Evolution;
+
+table Reading {
+  id:ulong;
+  label:string;
+  samples:[float];
+}
+
+root_type Reading;
+file_identifier "EVOL";

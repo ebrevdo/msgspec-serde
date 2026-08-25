@@ -1,0 +1,23 @@
+namespace Example.Nested;
+
+table Cat {
+  name:string (required);
+  lives:ubyte = 9;
+}
+
+table Dog {
+  name:string (required);
+  good:bool = true;
+}
+
+union Pet { Cat, Dog }
+
+table Payload {
+  favorite:Pet;
+  residents:[Pet];
+  serial:uint;
+  measurements:[double];
+}
+
+root_type Payload;
+file_identifier "PAYL";

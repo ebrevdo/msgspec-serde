@@ -1,0 +1,16 @@
+namespace Example.Dynamic;
+
+attribute "dynamic_flatbuffer";
+attribute "dynamic_allow";
+
+table Envelope {
+  payload_type:string;
+  payload:[ubyte] (
+    dynamic_flatbuffer: "payload_type",
+    dynamic_allow: "Example.Dynamic.*"
+  );
+  note:string;
+}
+
+root_type Envelope;
+file_identifier "DYNE";

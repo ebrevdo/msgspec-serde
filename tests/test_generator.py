@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import importlib.util
+import shutil
+import struct
+import subprocess
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
+
+import numpy as np
+import pytest
+
+from msgspec_flatbuffers import BufferBoundsError, InvalidBufferError, generate
+from msgspec_flatbuffers.cli import main
+
+FIXTURE = Path(__file__).parent / "fixtures" / "monster.fbs"
+HAS_FLATC = shutil.which("flatc") is not None
+pytestmark = pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
+
+
+def _load_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@contextmanager
+def _temporary_sys_path(path: Path) -> Iterator[None]:
+    path_string = str(path)
+    sys.path.insert(0, path_string)
+    try:
+        yield
+    finally:
+        sys.path.remove(path_string)
+
+
+def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    module_path = generate(FIXTURE, generated_root)
+    first_source = module_path.read_text(encoding="utf-8")
+    assert "scores: npt.NDArray[np.float32] | None" in first_source
+    assert "weapons: list[Weapon] | None" in first_source
+    assert "tags: list[str] | None" in first_source
+    assert "path: list[Vec3] | None" in first_source
+    assert "colors: list[Color] | None" in first_source
+
+    assert module_path.relative_to(generated_root) == Path("example/monster.py")
+    assert generate(FIXTURE, generated_root) == module_path
+    assert module_path.read_text(encoding="utf-8") == first_source
+
+    generated = _load_module("test_generated_monster", module_path)
+    model = generated.Monster(
+        pos=generated.Vec3(x=1.0, y=2.0, z=3.0),
+        mana=175,
+        hp=80,
+        name="fred",
+        inventory=b"\x00\x01\x02\xff",
+        color=generated.Color.Green,
+        weapons=[
+            generated.Weapon(name="Sword", damage=3),
+            generated.Weapon(name="Axe", damage=5),
+        ],
+        scores=np.array([1.5, 2.5, 3.5], dtype=np.float32),
+        tags=["one", "two"],
+        path=[
+            generated.Vec3(x=4.0, y=5.0, z=6.0),
+            generated.Vec3(x=7.0, y=8.0, z=9.0),
+        ],
+        optional_energy=123,
+        colors=[generated.Color.Red, generated.Color.Blue],
+    )
+
+    buffer = model.to_flatbuffer()
+    assert isinstance(buffer, memoryview)
+    assert buffer.readonly
+    assert type(buffer.obj).__name__ == "NativeBuffer"
+    with pytest.raises(TypeError):
+        buffer[0] = 0
+    view = generated.MonsterView.from_buffer(buffer)
+
+    assert view.name == "fred"
+    assert view.name is view.name
+    assert view.pos.z == 3.0
+    assert view.inventory.readonly
+    assert bytes(view.inventory) == b"\x00\x01\x02\xff"
+    assert view.scores.dtype == np.dtype("<f4")
+    assert not view.scores.flags.owndata
+    assert not view.scores.flags.writeable
+    np.testing.assert_array_equal(view.scores, [1.5, 2.5, 3.5])
+    assert view.scores is view.scores
+    with pytest.raises(ValueError):
+        view.scores.setflags(write=True)
+    with pytest.raises(TypeError):
+        view.inventory[0] = 9
+
+    weapons = view.weapons
+    assert weapons is view.weapons
+    assert weapons.cached_count == 0
+    first_scan = tuple(weapons)
+    assert weapons.cached_count == 2
+    second_scan = tuple(weapons)
+    assert all(first is second for first, second in zip(first_scan, second_scan))
+
+    tags = view.tags
+    assert tags.cached_count == 0
+    assert tuple(tags) == ("one", "two")
+    assert tags.cached_count == 2
+
+    path = view.path
+    assert path.cached_count == 0
+    assert path[1].y == 8.0
+    assert path[1] is path[1]
+    assert path.cached_count == 1
+    assert view.optional_energy == 123
+
+    first_model = view.to_model()
+    second_model = view.to_model()
+    assert first_model == model
+    assert second_model == model
+    assert not (first_model != model)
+    wrong_dtype = model.__replace__(
+        scores=np.array([1.5, 2.5, 3.5], dtype=np.float64)
+    )
+    assert first_model != wrong_dtype
+    assert first_model is not second_model
+    assert first_model.scores is not None
+    assert first_model.scores.flags.owndata
+    assert first_model.scores.flags.writeable
+    assert not np.shares_memory(first_model.scores, view.scores)
+    assert second_model.scores is not None
+    assert not np.shares_memory(first_model.scores, second_model.scores)
+    assert first_model.weapons is not None
+    assert first_model.tags is not None
+    assert first_model.path is not None
+    assert first_model.colors is not None
+    first_model.weapons.append(generated.Weapon(name="Bow", damage=2))
+    first_model.tags.append("three")
+    first_model.path.append(generated.Vec3(x=10.0, y=11.0, z=12.0))
+    first_model.colors.append(generated.Color.Green)
+    first_model.scores[0] = 99.0
+    assert view.scores[0] == 1.5
+    assert len(view.weapons) == 2
+    assert tuple(view.tags) == ("one", "two")
+    assert generated.MonsterView.from_buffer(
+        first_model.to_flatbuffer()
+    ).to_model() == first_model
+
+    with pytest.raises(AttributeError):
+        model.hp = 1
+    with pytest.raises(AttributeError):
+        view.extra_state = "not allowed"
+
+    size_prefixed = model.to_flatbuffer(size_prefixed=True)
+    size_prefixed_view = generated.MonsterView.from_buffer(
+        size_prefixed,
+        size_prefixed=True,
+    )
+    assert size_prefixed_view.hp == 80
+    assert bytes(size_prefixed_view.buffer) == size_prefixed[4:]
+
+    undersized_identifier = bytearray(size_prefixed)
+    struct.pack_into("<I", undersized_identifier, 0, 4)
+    with pytest.raises(BufferBoundsError, match="file identifier"):
+        generated.MonsterView.from_buffer(
+            undersized_identifier,
+            size_prefixed=True,
+        )
+
+    defaults = generated.MonsterView.from_buffer(
+        generated.Monster().to_flatbuffer()
+    )
+    assert defaults.optional_energy is None
+    assert defaults.weapons is None
+    assert defaults.scores is None
+    assert defaults.tags is None
+    assert defaults.path is None
+    assert defaults.colors is None
+
+    empty_buffer = generated.Monster().to_flatbuffer()
+    assert len(empty_buffer) == 16
+    assert empty_buffer.obj._allocation_size == 17
+
+    empty_vectors = generated.Monster(
+        weapons=[],
+        scores=np.array([], dtype=np.float32),
+        tags=[],
+        path=[],
+        colors=[],
+    )
+    empty_materialized = generated.MonsterView.from_buffer(
+        empty_vectors.to_flatbuffer()
+    ).to_model()
+    assert empty_materialized == empty_vectors
+    assert empty_materialized.weapons == []
+    assert empty_materialized.tags == []
+    assert empty_materialized.path == []
+    assert empty_materialized.colors == []
+    assert empty_materialized.scores is not None
+    assert empty_materialized.scores.shape == (0,)
+    assert empty_materialized.scores.flags.owndata
+    assert empty_materialized.scores.flags.writeable
+
+    wrong_identifier = bytearray(buffer)
+    wrong_identifier[4:8] = b"NOPE"
+    with pytest.raises(InvalidBufferError, match="file identifier"):
+        generated.MonsterView.from_buffer(wrong_identifier)
+
+    invalid_vector = bytearray(buffer)
+    unchecked = generated.MonsterView.from_buffer(invalid_vector)
+    inventory_field = unchecked._field_position(12, 4)
+    assert inventory_field is not None
+    inventory_length = inventory_field + struct.unpack_from(
+        "<I",
+        invalid_vector,
+        inventory_field,
+    )[0]
+    struct.pack_into("<I", invalid_vector, inventory_length, 2**32 - 1)
+    with pytest.raises(BufferBoundsError, match="vector data"):
+        generated.MonsterView.from_buffer(invalid_vector).inventory
+
+    invalid_table_vector = bytearray(buffer)
+    unchecked = generated.MonsterView.from_buffer(invalid_table_vector)
+    weapons_info = unchecked._vector_info(16, 4)
+    assert weapons_info is not None
+    weapons_start, weapons_length = weapons_info
+    assert weapons_length == 2
+    struct.pack_into("<I", invalid_table_vector, weapons_start, 0)
+    corrupt_weapons = generated.MonsterView.from_buffer(
+        invalid_table_vector
+    ).weapons
+    assert corrupt_weapons is not None
+    with pytest.raises(InvalidBufferError, match="table vector element"):
+        corrupt_weapons[0]
+
+    reference_root = tmp_path / "reference"
+    reference_root.mkdir()
+    subprocess.run(
+        [
+            "flatc",
+            "--python",
+            "--python-typing",
+            "-o",
+            str(reference_root),
+            str(FIXTURE),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    with _temporary_sys_path(reference_root):
+        reference_path = reference_root / "Example" / "Monster.py"
+        reference = _load_module("Example.Monster", reference_path)
+        reference_view = reference.Monster.GetRootAs(buffer)
+        assert reference_view.Name() == b"fred"
+        assert reference_view.Hp() == 80
+        assert reference_view.WeaponsLength() == 2
+        assert reference_view.ScoresLength() == 3
+        assert reference_view.TagsLength() == 2
+        assert reference_view.PathLength() == 2
+        assert reference_view.OptionalEnergy() == 123
+
+
+def test_generate_resolves_types_from_another_fbs_module(tmp_path: Path) -> None:
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    common = definitions / "common.fbs"
+    common.write_text(
+        "namespace Shared; table Child { value:int; }",
+        encoding="utf-8",
+    )
+    root = tmp_path / "root.fbs"
+    root.write_text(
+        '\n'.join(
+            [
+                'include "common.fbs";',
+                "namespace Example;",
+                "table Root { child:Shared.Child; }",
+                "root_type Root;",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+
+    generate(common, output, project_root=tmp_path)
+    module_path = generate(
+        root,
+        output,
+        include_dirs=[definitions],
+        project_root=tmp_path,
+    )
+
+    with _temporary_sys_path(output):
+        generated = _load_module("example.root", module_path)
+
+        model = generated.Root(child=generated.Child(value=42))
+        view = generated.RootView.from_buffer(model.to_flatbuffer())
+        assert view.child.value == 42
+        assert view.child is view.child
+        assert view.to_model() == model
+
+
+def test_byte_vector_can_be_loaded_as_a_cached_nested_view(tmp_path: Path) -> None:
+    base_schema = tmp_path / "base_extensions.fbs"
+    base_schema.write_text(
+        "\n".join(
+            [
+                "namespace Example;",
+                "table Extension { type_id:ulong; data:[ubyte]; }",
+                "table Base { extensions:[Extension]; }",
+                "root_type Base;",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    adam_schema = tmp_path / "adam_extension.fbs"
+    adam_schema.write_text(
+        "\n".join(
+            [
+                "namespace Example;",
+                "table AdamExtension { beta1:double; beta2:double; }",
+                "root_type AdamExtension;",
+                'file_identifier "ADAM";',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+    base_path = generate(base_schema, output, project_root=tmp_path)
+    adam_path = generate(adam_schema, output, project_root=tmp_path)
+
+    with _temporary_sys_path(output):
+        base = _load_module("example.base_extensions", base_path)
+        adam = _load_module("example.adam_extension", adam_path)
+
+        type_id = 0xA813
+        payload = adam.AdamExtension(beta1=0.9, beta2=0.999).to_flatbuffer()
+        outer = base.Base(
+            extensions=[base.Extension(type_id=type_id, data=payload)]
+        ).to_flatbuffer()
+        extensions = base.BaseView.from_buffer(outer).extensions
+        assert extensions is not None
+        extension = extensions[0]
+        payload_view = extension.data
+        assert payload_view is not None
+
+        nested = extension.data_as(adam.AdamExtensionView)
+
+        assert nested is not None
+        assert nested.beta1 == 0.9
+        assert nested.beta2 == 0.999
+        assert nested is extension.data_as(adam.AdamExtensionView)
+        assert nested.buffer is payload_view
+        assert payload_view.obj is outer.obj
+
+        missing_data = base.Base(
+            extensions=[base.Extension(type_id=type_id)]
+        ).to_flatbuffer()
+        missing_extensions = base.BaseView.from_buffer(missing_data).extensions
+        assert missing_extensions is not None
+        assert missing_extensions[0].data_as(adam.AdamExtensionView) is None
+
+        prefixed_payload = adam.AdamExtension(
+            beta1=0.8,
+            beta2=0.888,
+        ).to_flatbuffer(size_prefixed=True)
+        prefixed_outer = base.Base(
+            extensions=[base.Extension(type_id=type_id, data=prefixed_payload)]
+        ).to_flatbuffer()
+        prefixed_extensions = base.BaseView.from_buffer(prefixed_outer).extensions
+        assert prefixed_extensions is not None
+        prefixed_extension = prefixed_extensions[0]
+        prefixed_nested = prefixed_extension.data_as(
+            adam.AdamExtensionView,
+            size_prefixed=True,
+        )
+        assert prefixed_nested is not None
+        assert prefixed_nested.beta1 == 0.8
+        assert prefixed_nested is prefixed_extension.data_as(
+            adam.AdamExtensionView,
+            size_prefixed=True,
+        )
+
+        invalid_payload = bytearray(payload)
+        invalid_payload[4:8] = b"NOPE"
+        invalid_outer = base.Base(
+            extensions=[base.Extension(type_id=type_id, data=invalid_payload)]
+        ).to_flatbuffer()
+        invalid_extensions = base.BaseView.from_buffer(invalid_outer).extensions
+        assert invalid_extensions is not None
+        with pytest.raises(InvalidBufferError, match="file identifier"):
+            invalid_extensions[0].data_as(adam.AdamExtensionView)
+
+
+def test_native_builder_presizes_shallow_vectors(tmp_path: Path) -> None:
+    module_path = generate(FIXTURE, tmp_path / "generated")
+    generated = _load_module("test_generated_presizing", module_path)
+    inventory = b"x" * 65_536
+    scores = np.arange(16_384, dtype=np.float32)
+    model = generated.Monster(inventory=inventory, scores=scores)
+
+    buffer = model.to_flatbuffer()
+
+    assert buffer.obj._allocation_size >= len(buffer)
+    assert buffer.obj._allocation_size * 100 <= len(buffer) * 102
+    rebuilt = generated.MonsterView.from_buffer(buffer).to_model()
+    assert rebuilt == model
+
+
+def test_numeric_vector_serialization_requires_generated_numpy_dtype(
+    tmp_path: Path,
+) -> None:
+    module_path = generate(FIXTURE, tmp_path / "generated")
+    generated = _load_module("test_generated_numeric_dtype", module_path)
+
+    with pytest.raises(TypeError, match="native Float32 data"):
+        generated.Monster(
+            scores=np.array([1.0, 2.0], dtype=np.float64)
+        ).to_flatbuffer()
+
+    non_native = np.dtype(np.float32).newbyteorder("S")
+    with pytest.raises(TypeError, match="native Float32 data"):
+        generated.Monster(
+            scores=np.array([1.0, 2.0], dtype=non_native)
+        ).to_flatbuffer()
+
+
+def test_native_builder_samples_variable_size_vectors(tmp_path: Path) -> None:
+    module_path = generate(FIXTURE, tmp_path / "generated")
+    source = module_path.read_text(encoding="utf-8")
+    assert "import flatbuffers" not in source
+    assert "def _build_" not in source
+    assert "def _estimate_" not in source
+    generated = _load_module("test_generated_sampled_presizing", module_path)
+    weapons = [
+        generated.Weapon(name="w" * (2_000 + index), damage=index)
+        for index in range(100)
+    ]
+    tags = ["t" * (1_000 + index) for index in range(100)]
+    model = generated.Monster(weapons=weapons, tags=tags)
+
+    buffer = model.to_flatbuffer(initial_size=16)
+
+    assert buffer.obj._allocation_size > 250_000
+    assert buffer.obj._allocation_size * 100 <= len(buffer) * 102
+    assert generated.MonsterView.from_buffer(buffer).to_model() == model
+
+
+def test_cli_generates_a_module(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    output = tmp_path / "output"
+
+    assert main(["generate", str(FIXTURE), "-o", str(output)]) == 0
+
+    generated = output / "example" / "monster.py"
+    assert generated.is_file()
+    assert str(generated) in capsys.readouterr().out
