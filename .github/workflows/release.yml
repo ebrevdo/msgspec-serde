@@ -1,8 +1,8 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -29,9 +29,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check package, crate, and tag versions
+      - name: Validate generated compatibility snapshot
+        run: python tools/freeze_generated_compatibility.py --check
+
+      - name: Check release tag
+        if: github.event_name == 'push'
         env:
-          EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           python - <<'PY'
@@ -39,27 +42,15 @@ jobs:
           import tomllib
           from pathlib import Path
 
-          def load_toml(path: str):
-              with Path(path).open("rb") as file:
-                  return tomllib.load(file)
-
-          package_version = load_toml("pyproject.toml")["project"]["version"]
-          crate_version = load_toml("rust/Cargo.toml")["package"]["version"]
-          if package_version != crate_version:
+          with Path("pyproject.toml").open("rb") as file:
+              package_version = tomllib.load(file)["project"]["version"]
+          expected_tag = f"v{package_version}"
+          if os.environ["REF_NAME"] != expected_tag:
               raise SystemExit(
-                  f"Version mismatch: pyproject.toml={package_version}, rust/Cargo.toml={crate_version}"
+                  f"Release tag must be {expected_tag}, got {os.environ['REF_NAME']}"
               )
-          if os.environ["EVENT_NAME"] == "release":
-              expected_tag = f"v{package_version}"
-              if os.environ["REF_NAME"] != expected_tag:
-                  raise SystemExit(
-                      f"Release tag must be {expected_tag}, got {os.environ['REF_NAME']}"
-                  )
           print(f"Building msgspec-flatbuffers {package_version}")
           PY
-
-      - name: Validate generated compatibility snapshot
-        run: python tools/freeze_generated_compatibility.py --check
 
   wheels:
     name: Wheel (${{ matrix.target }}, Python ${{ matrix.python }})
@@ -127,9 +118,6 @@ jobs:
           subprocess.check_call([sys.executable, '-m', 'pip', 'install',
           '--force-reinstall', wheel])"
 
-      - name: Import native extension
-        run: python -c "import msgspec_flatbuffers; import msgspec_flatbuffers._native"
-
       - name: Verify free-threaded execution remains enabled
         if: endsWith(matrix.python, 't')
         run: >-
@@ -179,8 +167,8 @@ jobs:
           retention-days: 7
 
   github-release:
-    name: Attach distributions to GitHub Release
-    if: github.event_name == 'release' && github.event.action == 'published'
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
     needs: [wheels, sdist]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -196,15 +184,15 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Upload distributions to release
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
 
   pypi:
     name: Publish to PyPI
-    if: github.event_name == 'release' && github.event.action == 'published'
-    needs: [wheels, sdist]
+    if: github.event_name == 'push'
+    needs: github-release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:

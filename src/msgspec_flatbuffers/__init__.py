@@ -25,10 +25,6 @@ from ._runtime import (
     TableView,
     UnionDispatch,
     UnionVector,
-    build_byte_vector,
-    build_offset_vector,
-    build_scalar_vector,
-    build_string_vector,
 )
 from ._version import __version__, _major_minor
 from .compiler import (
@@ -132,10 +128,6 @@ __all__ = [
     "UnionDispatch",
     "UnionVector",
     "__version__",
-    "build_byte_vector",
-    "build_offset_vector",
-    "build_scalar_vector",
-    "build_string_vector",
     "compile_schema",
     "compile_schema_to_bfbs",
     "dec_hook",

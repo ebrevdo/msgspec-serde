@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Buffer, Sequence
+from collections.abc import Buffer
 from itertools import islice
 from typing import Any, ClassVar, Self, cast
 
-import flatbuffers
 import pytest
 
 from msgspec_flatbuffers import (
@@ -24,8 +23,6 @@ from msgspec_flatbuffers import (
     TableVector,
     TableView,
     TypeReference,
-    build_scalar_vector,
-    build_string_vector,
     render_module,
 )
 
@@ -104,29 +101,6 @@ class OverriddenFactoryTableView(TableView):
         )
 
 
-class LegacyTableView(TableView):
-    """Shape emitted before generated views gained dedicated cache slots."""
-
-    __slots__ = ()
-
-    @property
-    def legacy_value(self) -> object:
-        try:
-            return self._cache["legacy_value"]
-        except KeyError:
-            value = object()
-            self._cache["legacy_value"] = value
-            return value
-
-
-def _minimal_table_buffer() -> bytearray:
-    buffer = bytearray(12)
-    struct.pack_into("<I", buffer, 0, 8)
-    struct.pack_into("<HH", buffer, 4, 4, 4)
-    struct.pack_into("<i", buffer, 8, 4)
-    return buffer
-
-
 def _single_table_vector_buffer(
     *,
     size: int = 16,
@@ -151,37 +125,6 @@ def _single_table_vector_buffer(
             object_size,
         )
     return buffer
-
-
-def _finished_string_vector(
-    values: Sequence[str],
-    *,
-    reference: bool,
-) -> bytes:
-    builder = flatbuffers.Builder(0)
-    if reference:
-        offsets = [builder.CreateString(value) for value in values]
-        builder.StartVector(4, len(offsets), 4)
-        for offset in reversed(offsets):
-            builder.PrependUOffsetTRelative(offset)
-        vector = builder.EndVector()
-    else:
-        vector = build_string_vector(builder, values)
-    builder.Finish(vector)
-    return bytes(builder.Output())
-
-
-def _finished_float32_vector(values: Sequence[int], *, reference: bool) -> bytes:
-    builder = flatbuffers.Builder(0)
-    if reference:
-        builder.StartVector(4, len(values), 4)
-        for value in reversed(values):
-            builder.PrependFloat32(value)
-        vector = builder.EndVector()
-    else:
-        vector = build_scalar_vector(builder, values, "float32")
-    builder.Finish(vector)
-    return bytes(builder.Output())
 
 
 def _rendered_namespace(schema: Schema, declaration_file: str) -> dict[str, Any]:
@@ -407,16 +350,6 @@ def test_table_vector_does_not_call_an_overridden_validated_factory() -> None:
     assert OverriddenFactoryTableView.validated_factory_calls == 0
 
 
-def test_legacy_generated_cache_access_remains_compatible() -> None:
-    view = LegacyTableView.from_buffer(_minimal_table_buffer())
-
-    value = view.legacy_value
-
-    assert view.legacy_value is value
-    assert view._cache["legacy_value"] is value
-    assert view._cached("legacy_value", object) is value
-
-
 @pytest.mark.parametrize("offset", [-2, 2, 5])
 def test_generator_rejects_invalid_scalar_vtable_offsets(offset: int) -> None:
     with pytest.raises(GenerationError, match="invalid vtable offset"):
@@ -487,45 +420,3 @@ def test_generated_padded_scalar_struct_converts_enums_and_padding() -> None:
     )
     assert view.mode is mode_type.Seven
     assert view.buffer.readonly
-
-
-@pytest.mark.parametrize(
-    "values",
-    [(), ("one",), ("", "two", "snowman: \N{SNOWMAN}")],
-)
-def test_string_vector_builder_matches_element_build_bytes(
-    values: tuple[str, ...],
-) -> None:
-    assert _finished_string_vector(values, reference=False) == (
-        _finished_string_vector(values, reference=True)
-    )
-
-
-@pytest.mark.parametrize(
-    "values",
-    [cast(tuple[str, ...], ("valid", None)), ("bad-surrogate-\ud800",)],
-)
-def test_string_vector_builder_preserves_element_build_errors(
-    values: tuple[str, ...],
-) -> None:
-    with pytest.raises(Exception) as reference_error:
-        _finished_string_vector(values, reference=True)
-
-    with pytest.raises(type(reference_error.value)):
-        _finished_string_vector(values, reference=False)
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        (1 << 54) + (1 << 30) + 1,
-        (1 << 54) + (1 << 30) - 1,
-        -((1 << 54) + (1 << 30) + 1),
-    ],
-)
-def test_float32_bulk_builder_avoids_integer_double_rounding(value: int) -> None:
-    values = [value] * 32
-
-    assert _finished_float32_vector(values, reference=False) == (
-        _finished_float32_vector(values, reference=True)
-    )

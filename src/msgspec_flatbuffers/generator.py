@@ -2214,15 +2214,16 @@ def render_module(
         "import numpy as np",
         "import numpy.typing as npt",
         "",
-        "from msgspec_flatbuffers import (",
-        "    _check_generated_code_version,",
-        *(f"    {name}," for name in runtime_imports),
-        ")",
-        "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types",
-        "from msgspec_flatbuffers._native import NativePlan as _NativePlan",
+        "from msgspec_flatbuffers import _check_generated_code_version",
         "",
         f"__msgspec_flatbuffers_generated_version__ = {_GENERATOR_VERSION!r}",
         "_check_generated_code_version(__msgspec_flatbuffers_generated_version__)",
+        "",
+        "from msgspec_flatbuffers import (  # noqa: E402",
+        *(f"    {name}," for name in runtime_imports),
+        ")",
+        "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types  # noqa: E402",
+        "from msgspec_flatbuffers._native import NativePlan as _NativePlan  # noqa: E402",
     ]
     if enum_dependency_modules:
         lines.append("")

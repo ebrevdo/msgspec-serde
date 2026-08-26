@@ -1,8 +1,8 @@
-"""Second-round benchmarks for cold views, dense caches, and builders.
+"""Benchmarks for generated views, caches, and FlatBuffer builders.
 
 Run from the repository root with::
 
-    uv run --no-sync python benchmarks/benchmark_round2.py --json results.json
+    uv run --no-sync python benchmarks/benchmark.py --json results.json
 
 The workloads, iteration counts, and seven-sample repetition are fixed so that
 source-pinned baseline and optimized runs are directly comparable. ``timeit``
@@ -304,7 +304,7 @@ def _make_main_model(generated: ModuleType) -> Any:
         pos=generated.Vec3(x=1.0, y=2.0, z=3.0),
         mana=175,
         hp=80,
-        name="round-two-benchmark",
+        name="benchmark",
         inventory=inventory,
         color=generated.Color.Green,
         weapons=weapons,
@@ -472,12 +472,16 @@ def _prepare_fixture() -> PreparedFixture:
     from msgspec_flatbuffers import generate
 
     temporary_directory = tempfile.TemporaryDirectory(
-        prefix="msgspec-flatbuffers-round2-"
+        prefix="msgspec-flatbuffers-benchmark-"
     )
     generated_root = Path(temporary_directory.name) / "generated"
     module_path = generate(FIXTURE, generated_root)
     generated_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
-    generated = _load_module("_msgspec_flatbuffers_round2_fixture", module_path)
+    sys.path.insert(0, str(generated_root))
+    try:
+        generated = _load_module("_msgspec_flatbuffers_benchmark_fixture", module_path)
+    finally:
+        sys.path.pop(0)
 
     main_model = _make_main_model(generated)
     main_buffer = main_model.to_flatbuffer()
@@ -614,7 +618,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     environment = report["environment"]
     fixture = report["fixture"]
     print(
-        "msgspec-flatbuffers round-two benchmark "
+        "msgspec-flatbuffers benchmark "
         f"(Python {environment['python']}, {environment['flatc']})"
     )
     print(

@@ -1,22 +1,12 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from enum import IntEnum
 from threading import Barrier
-from typing import Any
 
-import flatbuffers
-import numpy as np
 import pytest
 
-from msgspec_flatbuffers import (
-    BufferBoundsError,
-    CachedVector,
-    TableView,
-    build_scalar_vector,
-)
+from msgspec_flatbuffers import BufferBoundsError, CachedVector, TableView
 
 
 class ExampleView(TableView):
@@ -27,11 +17,6 @@ class StringExampleView(TableView):
     @property
     def name(self) -> str | None:
         return self._read_string(4)
-
-
-class ExampleEnum(IntEnum):
-    ZERO = 0
-    ONE = 1
 
 
 class ObjectVector(CachedVector[object]):
@@ -66,49 +51,6 @@ class ConcurrentLoadVector(CachedVector[object]):
         return object()
 
 
-_SCALAR_BUILDERS = {
-    "bool": ("PrependBool", 1),
-    "int8": ("PrependInt8", 1),
-    "uint8": ("PrependUint8", 1),
-    "int16": ("PrependInt16", 2),
-    "uint16": ("PrependUint16", 2),
-    "int32": ("PrependInt32", 4),
-    "uint32": ("PrependUint32", 4),
-    "int64": ("PrependInt64", 8),
-    "uint64": ("PrependUint64", 8),
-    "float32": ("PrependFloat32", 4),
-    "float64": ("PrependFloat64", 8),
-}
-
-
-def _reference_scalar_vector(
-    builder: flatbuffers.Builder,
-    values: Sequence[Any],
-    scalar_type: str,
-) -> int:
-    prepender_name, size = _SCALAR_BUILDERS[scalar_type]
-    builder.StartVector(size, len(values), size)
-    prepend = getattr(builder, prepender_name)
-    for value in reversed(values):
-        prepend(value)
-    return builder.EndVector()
-
-
-def _finished_vector(
-    values: Sequence[Any],
-    scalar_type: str,
-    *,
-    reference: bool,
-) -> bytes:
-    builder = flatbuffers.Builder(0)
-    if reference:
-        offset = _reference_scalar_vector(builder, values, scalar_type)
-    else:
-        offset = build_scalar_vector(builder, values, scalar_type)
-    builder.Finish(offset)
-    return bytes(builder.Output())
-
-
 def _minimal_table_buffer() -> bytearray:
     buffer = bytearray(12)
     struct.pack_into("<I", buffer, 0, 8)
@@ -121,10 +63,10 @@ def _size_prefixed(payload: bytes | bytearray) -> bytes:
     return struct.pack("<I", len(payload)) + payload
 
 
-def test_from_root_keeps_a_read_only_view_of_the_original_buffer() -> None:
+def test_from_buffer_keeps_a_read_only_view_of_the_original_buffer() -> None:
     buffer = _minimal_table_buffer()
 
-    view = ExampleView.from_root(buffer)
+    view = ExampleView.from_buffer(buffer)
 
     assert view.table_offset == 8
     assert view.buffer.readonly
@@ -137,7 +79,7 @@ def test_size_prefixed_root_is_bounded_to_its_declared_payload() -> None:
     trailing = b"trailing frame"
     framed = bytearray(leading + _size_prefixed(payload) + trailing)
 
-    view = ExampleView.from_root(
+    view = ExampleView.from_buffer(
         framed,
         offset=len(leading),
         size_prefixed=True,
@@ -158,14 +100,14 @@ def test_size_prefixed_root_rejects_a_payload_too_small_for_its_root(
     framed = bytearray(struct.pack("<I", declared_size) + payload)
 
     with pytest.raises(BufferBoundsError):
-        ExampleView.from_root(framed, size_prefixed=True)
+        ExampleView.from_buffer(framed, size_prefixed=True)
 
 
 def test_size_prefixed_root_rejects_a_declared_payload_past_the_input() -> None:
     framed = struct.pack("<I", 12) + bytes(11)
 
     with pytest.raises(BufferBoundsError, match="size-prefixed buffer"):
-        ExampleView.from_root(framed, size_prefixed=True)
+        ExampleView.from_buffer(framed, size_prefixed=True)
 
 
 def test_concatenated_size_prefixed_roots_keep_separate_buffers() -> None:
@@ -173,8 +115,8 @@ def test_concatenated_size_prefixed_roots_keep_separate_buffers() -> None:
     frame = _size_prefixed(payload)
     combined = bytearray(frame + frame)
 
-    first = ExampleView.from_root(combined, size_prefixed=True)
-    second = ExampleView.from_root(
+    first = ExampleView.from_buffer(combined, size_prefixed=True)
+    second = ExampleView.from_buffer(
         combined,
         offset=len(frame),
         size_prefixed=True,
@@ -194,7 +136,7 @@ def test_size_prefixed_root_cannot_use_a_vtable_before_its_payload() -> None:
     framed = leading_vtable + _size_prefixed(payload)
 
     with pytest.raises(BufferBoundsError, match="vtable header"):
-        ExampleView.from_root(
+        ExampleView.from_buffer(
             framed,
             offset=len(leading_vtable),
             size_prefixed=True,
@@ -211,7 +153,7 @@ def test_size_prefixed_field_cannot_use_trailing_string_bytes() -> None:
     declared_size = 20
     framed = struct.pack("<I", declared_size) + payload
 
-    view = StringExampleView.from_root(framed, size_prefixed=True)
+    view = StringExampleView.from_buffer(framed, size_prefixed=True)
 
     with pytest.raises(BufferBoundsError, match="string length"):
         _ = view.name
@@ -225,12 +167,12 @@ def test_size_prefixed_field_cannot_use_trailing_string_bytes() -> None:
         (b"\x00\x00\x00\x00", -1),
     ],
 )
-def test_from_root_rejects_out_of_bounds_offsets(
+def test_from_buffer_rejects_out_of_bounds_offsets(
     buffer: bytes,
     offset: int,
 ) -> None:
     with pytest.raises(BufferBoundsError):
-        ExampleView.from_root(buffer, offset=offset)
+        ExampleView.from_buffer(buffer, offset=offset)
 
 
 def test_view_rejects_noncontiguous_input() -> None:
@@ -286,53 +228,3 @@ def test_cached_vector_does_not_cache_loader_exceptions() -> None:
     assert vector[0] == 0
     assert vector.cached_count == 1
     assert vector.attempts == 2
-
-
-@pytest.mark.parametrize(
-    ("scalar_type", "values"),
-    [
-        ("bool", [False, True] * 16),
-        ("int8", [-128, -1, 0, 127] * 8),
-        ("int8", [ExampleEnum.ZERO, ExampleEnum.ONE] * 16),
-        ("uint8", [0, 1, 127, 255] * 8),
-        ("int16", [-32768, -1, 0, 32767] * 8),
-        ("uint16", [0, 1, 32768, 65535] * 8),
-        ("int32", [-(2**31), -1, 0, 2**31 - 1] * 8),
-        ("uint32", [0, 1, 2**31, 2**32 - 1] * 8),
-        ("int64", [-(2**63), -1, 0, 2**63 - 1] * 8),
-        ("uint64", [0, 1, 2**63, 2**64 - 1] * 8),
-        ("float32", [-1.25, 0.0, 1.5, 3.25] * 8),
-        ("float64", [-1.25, 0.0, 1.5, 3.25] * 8),
-    ],
-)
-def test_bulk_scalar_vectors_match_element_builds(
-    scalar_type: str,
-    values: list[bool | int | float],
-) -> None:
-    assert _finished_vector(values, scalar_type, reference=False) == (
-        _finished_vector(values, scalar_type, reference=True)
-    )
-
-
-@pytest.mark.parametrize(
-    ("scalar_type", "values"),
-    [
-        ("bool", [False] * 31 + [2]),
-        ("bool", [False] * 31 + [float("nan")]),
-        ("int8", [0] * 31 + [128]),
-        ("uint8", [0] * 31 + [-1]),
-        ("int32", [0] * 31 + [1.5]),
-        ("float32", [0.0] * 31 + ["1.0"]),
-        ("float32", [0.0] * 31 + [float(np.finfo(np.float32).max) * 2]),
-        ("int32", np.zeros((8, 4), dtype=np.int32)),
-    ],
-)
-def test_bulk_scalar_vectors_preserve_element_build_errors(
-    scalar_type: str,
-    values: Sequence[Any],
-) -> None:
-    with pytest.raises(Exception) as reference_error:
-        _finished_vector(values, scalar_type, reference=True)
-
-    with pytest.raises(type(reference_error.value)):
-        _finished_vector(values, scalar_type, reference=False)

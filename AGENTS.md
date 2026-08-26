@@ -15,10 +15,8 @@
 - Set the same release version in `pyproject.toml` and `rust/Cargo.toml`.
 - Before publishing, run `just freeze-release`, review and commit the new
   `tests/generated_compatibility/releases/vX_Y_Z/` snapshot, then run
-  `just check`.
+  `just release-check`.
 - Never regenerate or edit an older release snapshot.
-- Publish a GitHub release tagged `vX.Y.Z`. The release workflow validates the
-  versions, builds and attaches wheels and the source distribution, and
-  publishes them to PyPI.
-- Release CI validates and tests the committed compatibility snapshot. It does
-  not create or commit the snapshot.
+- Push the release commit, then create and push the `vX.Y.Z` tag. The release
+  workflow validates and tests the snapshot, builds the distributions, creates
+  the GitHub release, and publishes to PyPI.

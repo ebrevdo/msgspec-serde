@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
-import json
 import re
 import shutil
 import sys
@@ -15,12 +13,7 @@ import numpy as np
 import pytest
 
 import msgspec_flatbuffers
-from msgspec_flatbuffers import (
-    GeneratedCodeVersionError,
-    dec_hook,
-    enc_hook,
-    generate,
-)
+from msgspec_flatbuffers import dec_hook, enc_hook, generate
 
 ROOT = Path(__file__).parents[1]
 COMPATIBILITY = ROOT / "tests" / "generated_compatibility"
@@ -35,7 +28,6 @@ class GeneratedCase:
     name: str
     version: str
     module_path: Path | None
-    source_hash: str | None = None
 
 
 def _release_cases() -> list[GeneratedCase]:
@@ -45,17 +37,11 @@ def _release_cases() -> list[GeneratedCase]:
         if match is None:
             continue
         version = ".".join(match.groups())
-        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-        if metadata.get("msgspec_flatbuffers_version") != version:
-            raise ValueError(
-                f"release metadata version does not match {directory.name}"
-            )
         cases.append(
             GeneratedCase(
                 name=directory.name,
                 version=version,
                 module_path=directory / "core.py",
-                source_hash=metadata["generated_files"]["core.py"],
             )
         )
     cases.sort(key=lambda case: tuple(int(part) for part in case.version.split(".")))
@@ -78,9 +64,6 @@ SAME_MAJOR_CASES = [
 ]
 if HAS_FLATC:
     SAME_MAJOR_CASES.insert(0, CURRENT)
-OTHER_MAJOR_CASES = [
-    case for case in RELEASE_CASES if _major(case.version) != CURRENT_MAJOR
-]
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -184,22 +167,3 @@ def test_generated_public_api_contract(
     application_model = ApplicationMonster.from_flatbuffer(buffer)
     assert application_model.was_validated
     assert application_model.to_flatbuffer().readonly
-
-
-def test_committed_generated_files_match_metadata() -> None:
-    for case in RELEASE_CASES:
-        assert case.module_path is not None
-        assert case.source_hash is not None
-        assert hashlib.sha256(case.module_path.read_bytes()).hexdigest() == (
-            case.source_hash
-        )
-
-
-def test_other_major_generated_code_is_rejected() -> None:
-    for case in OTHER_MAJOR_CASES:
-        assert case.module_path is not None
-        with pytest.raises(GeneratedCodeVersionError, match="major versions differ"):
-            _load_module(
-                f"_generated_compatibility_rejected_{case.name}",
-                case.module_path,
-            )

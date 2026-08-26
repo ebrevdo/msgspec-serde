@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import re
-import subprocess
 import tomllib
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +11,6 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = ROOT / "tests" / "generated_compatibility" / "core.fbs"
 RELEASES = ROOT / "tests" / "generated_compatibility" / "releases"
-METADATA_NAME = "metadata.json"
 VERSION_PATTERN = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 
 
@@ -47,35 +43,6 @@ def _snapshot_path(version: str) -> Path:
     return RELEASES / f"v{version.replace('.', '_')}"
 
 
-def _sha256(path: Path) -> str:
-    with path.open("rb") as file:
-        return hashlib.file_digest(file, "sha256").hexdigest()
-
-
-def _generated_files(snapshot: Path) -> dict[str, str]:
-    generated: dict[str, str] = {}
-    for path in sorted(snapshot.rglob("*")):
-        relative = path.relative_to(snapshot)
-        if (
-            not path.is_file()
-            or relative.name == METADATA_NAME
-            or "__pycache__" in relative.parts
-        ):
-            continue
-        generated[relative.as_posix()] = _sha256(path)
-    return generated
-
-
-def _metadata(version: str, snapshot: Path, flatc_version: str) -> dict[str, object]:
-    return {
-        "flatc_version": flatc_version,
-        "generated_files": _generated_files(snapshot),
-        "msgspec_flatbuffers_version": version,
-        "schema": SCHEMA.relative_to(ROOT).as_posix(),
-        "schema_sha256": _sha256(SCHEMA),
-    }
-
-
 def _freeze(version: str, flatc: str) -> Path:
     target = _snapshot_path(version)
     if target.exists():
@@ -92,12 +59,6 @@ def _freeze(version: str, flatc: str) -> Path:
             "run uv sync"
         )
 
-    flatc_version = subprocess.run(
-        [flatc, "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
     RELEASES.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".snapshot-", dir=RELEASES) as temporary:
         stage = Path(temporary) / "snapshot"
@@ -108,39 +69,15 @@ def _freeze(version: str, flatc: str) -> Path:
             project_root=ROOT,
             gen_onefile=True,
         )
-        metadata = _metadata(version, stage, flatc_version)
-        (stage / METADATA_NAME).write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
         stage.rename(target)
     return target
 
 
 def _check(version: str) -> Path:
     snapshot = _snapshot_path(version)
-    metadata_path = snapshot / METADATA_NAME
-    if not metadata_path.is_file():
-        raise SnapshotError(f"release snapshot is missing: {snapshot}")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    expected = {
-        "msgspec_flatbuffers_version": version,
-        "schema": SCHEMA.relative_to(ROOT).as_posix(),
-        "schema_sha256": _sha256(SCHEMA),
-    }
-    for key, value in expected.items():
-        if metadata.get(key) != value:
-            raise SnapshotError(
-                f"invalid {key} in {metadata_path}: "
-                f"expected {value!r}, got {metadata.get(key)!r}"
-            )
-    flatc_version = metadata.get("flatc_version")
-    if not isinstance(flatc_version, str) or not flatc_version:
-        raise SnapshotError(f"flatc_version is missing from {metadata_path}")
-    actual_files = _generated_files(snapshot)
-    if metadata.get("generated_files") != actual_files:
-        raise SnapshotError(f"generated file hashes do not match {metadata_path}")
     generated_source = snapshot / "core.py"
+    if not generated_source.is_file():
+        raise SnapshotError(f"release snapshot is missing: {snapshot}")
     version_marker = f"__msgspec_flatbuffers_generated_version__ = {version!r}"
     if version_marker not in generated_source.read_text(encoding="utf-8"):
         raise SnapshotError(
@@ -172,7 +109,7 @@ def main() -> int:
     try:
         version = _release_version()
         snapshot = _check(version) if args.check else _freeze(version, args.flatc)
-    except (KeyError, OSError, SnapshotError, subprocess.CalledProcessError) as error:
+    except (KeyError, OSError, SnapshotError) as error:
         parser.error(str(error))
     action = "validated" if args.check else "created"
     print(f"{action} {snapshot.relative_to(ROOT)}")

@@ -85,11 +85,11 @@ def test_rendered_module_embeds_and_checks_generator_version() -> None:
         declaration_file,
     )
 
-    assert (
-        "from msgspec_flatbuffers import (\n    _check_generated_code_version,"
-        in source
-    )
+    check_import = "from msgspec_flatbuffers import _check_generated_code_version"
+    runtime_import = "from msgspec_flatbuffers import (  # noqa: E402"
+    assert source.index(check_import) < source.index(runtime_import)
     assert (
         f"__msgspec_flatbuffers_generated_version__ = {INSTALLED_VERSION!r}" in source
     )
-    assert "_check_generated_code_version(" in source
+    check_call = "_check_generated_code_version("
+    assert source.index(check_call) < source.index(runtime_import)

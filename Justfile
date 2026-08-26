@@ -28,6 +28,10 @@ check: lint test rust-check
 build:
     uv build
 
+# Run the benchmark suite and pass through optional arguments.
+benchmark *args:
+    uv run --no-sync python benchmarks/benchmark.py {{args}}
+
 # Freeze generated code for the current release.
 freeze-release:
     uv run python tools/freeze_generated_compatibility.py
@@ -35,3 +39,6 @@ freeze-release:
 # Validate the committed generated-code snapshot.
 check-release:
     python tools/freeze_generated_compatibility.py --check
+
+# Run every local release check and build distributions.
+release-check: check check-release build

@@ -13,7 +13,6 @@ from msgspec_flatbuffers import (
     TableView,
     UnionDispatch,
     UnionVector,
-    build_scalar_vector,
 )
 
 _INT32 = struct.Struct("<i")
@@ -79,7 +78,10 @@ def _build_union_vector(
         else:
             builder.PrependUOffsetTRelative(offset)
     values = builder.EndVector()
-    types = build_scalar_vector(builder, tags, "int32")
+    builder.StartVector(_INT32.size, len(tags), _INT32.size)
+    for tag in reversed(tags):
+        builder.PrependInt32(tag)
+    types = builder.EndVector()
     builder.StartObject(2)
     builder.PrependUOffsetTRelativeSlot(1, values, 0)
     builder.PrependUOffsetTRelativeSlot(0, types, 0)

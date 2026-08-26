@@ -7,7 +7,6 @@ from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from enum import IntEnum
 from typing import Any, ClassVar, Generic, Self, TypeVar, overload
 
-import flatbuffers
 import numpy as np
 import numpy.typing as npt
 
@@ -36,20 +35,6 @@ _SCALAR_FORMATS: dict[str, struct.Struct] = {
     "uint64": _UINT64,
     "float32": _FLOAT32,
     "float64": _FLOAT64,
-}
-
-_SCALAR_PREPENDERS: dict[str, str] = {
-    "bool": "PrependBool",
-    "int8": "PrependInt8",
-    "uint8": "PrependUint8",
-    "int16": "PrependInt16",
-    "uint16": "PrependUint16",
-    "int32": "PrependInt32",
-    "uint32": "PrependUint32",
-    "int64": "PrependInt64",
-    "uint64": "PrependUint64",
-    "float32": "PrependFloat32",
-    "float64": "PrependFloat64",
 }
 
 _SCALAR_DTYPES: dict[str, np.dtype[Any]] = {
@@ -82,7 +67,6 @@ _VECTOR_DTYPES: dict[str, np.dtype[Any]] = {
 
 _MISSING: Any = object()
 _DENSE_CACHE_LIMIT = 8
-_NUMPY_VECTOR_MIN = 32
 _INTEGER_UNPACKER_FORMATS = {
     ("i", 1): "<b",
     ("u", 1): "<B",
@@ -250,139 +234,6 @@ def _cache_materialized_prefix(
 ) -> None:
     for index, value in enumerate(values):
         cache.setdefault(index, value)
-
-
-def build_scalar_vector(
-    builder: flatbuffers.Builder,
-    values: Sequence[Any] | npt.NDArray[Any],
-    scalar_type: str,
-) -> int:
-    """Build a vector of fixed-width scalar values."""
-
-    length = len(values)
-    if isinstance(values, np.ndarray) or length >= _NUMPY_VECTOR_MIN:
-        array = _validated_scalar_array(values, scalar_type)
-        if array is not None:
-            if scalar_type in ("bool", "int8", "uint8"):
-                return builder.CreateByteVector(array.tobytes(order="C"))
-            return builder.CreateNumpyVector(array)
-
-    scalar = _SCALAR_FORMATS[scalar_type]
-    builder.StartVector(scalar.size, length, scalar.size)
-    prepend = getattr(builder, _SCALAR_PREPENDERS[scalar_type])
-    for value in reversed(values):
-        prepend(value)
-    return builder.EndVector()
-
-
-def _validated_scalar_array(
-    values: Sequence[Any] | npt.NDArray[Any],
-    scalar_type: str,
-) -> npt.NDArray[Any] | None:
-    """Return a bulk-build array when NumPy preserves scalar validation."""
-
-    array = np.asarray(values)
-    if array.ndim != 1:
-        return None
-
-    kind = array.dtype.kind
-    dtype = _SCALAR_DTYPES[scalar_type]
-    if array.dtype == dtype:
-        return array
-
-    if scalar_type == "bool":
-        if kind not in "biuf":
-            return None
-        if array.size:
-            minimum = array.min()
-            maximum = array.max()
-            if not bool(minimum >= 0 and maximum <= 1):
-                raise TypeError("bad number for type bool")
-    elif kind in "biu" and scalar_type not in ("float32", "float64"):
-        target_limits = np.iinfo(dtype)
-        if kind == "b":
-            source_minimum, source_maximum = 0, 1
-        else:
-            source_limits = np.iinfo(array.dtype)
-            source_minimum = source_limits.min
-            source_maximum = source_limits.max
-        # Preserve NumPy's bool-to-uint64 comparison overflow.
-        force_bool_uint64_check = scalar_type == "uint64" and kind == "b"
-        requires_value_check = (
-            source_minimum < target_limits.min
-            or source_maximum > target_limits.max
-            or force_bool_uint64_check
-        )
-        if requires_value_check and array.size:
-            minimum = array.min()
-            maximum = array.max()
-            if bool(
-                minimum < target_limits.min or maximum > target_limits.max
-            ):
-                raise TypeError(f"bad number for type {scalar_type}")
-    elif scalar_type in ("float32", "float64"):
-        if kind not in "biuf":
-            return None
-        if scalar_type == "float32" and kind in "biu":
-            if array.dtype.itemsize > _FLOAT32.size:
-                # Match struct.pack's integer-to-float64-to-float32 rounding.
-                return array.astype(_SCALAR_DTYPES["float64"], copy=False).astype(
-                    dtype
-                )
-            return array.astype(dtype, copy=False)
-        if (
-            scalar_type == "float32"
-            and kind == "f"
-            and array.dtype.itemsize > dtype.itemsize
-            and array.size
-        ):
-            finite = np.isfinite(array)
-            if bool(np.any(np.abs(array[finite]) > np.finfo(dtype).max)):
-                raise OverflowError("float too large to pack with f format")
-    else:
-        return None
-
-    return array.astype(dtype, copy=False)
-
-
-def build_offset_vector(
-    builder: flatbuffers.Builder,
-    offsets: Sequence[int],
-) -> int:
-    """Build a vector of previously constructed FlatBuffers offsets."""
-
-    builder.StartVector(_UINT32.size, len(offsets), _UINT32.size)
-    prepend = builder.PrependUOffsetTRelative
-    for offset in reversed(offsets):
-        prepend(offset)
-    return builder.EndVector()
-
-
-def build_byte_vector(
-    builder: flatbuffers.Builder,
-    value: Buffer,
-) -> int:
-    """Build a byte vector from any contiguous buffer without an input copy."""
-
-    view = _readonly_bytes(value)
-    length = len(view)
-    builder.StartVector(1, length, 1)
-    head = builder.Head() - length
-    builder.head = head
-    builder.Bytes[head : head + length] = view
-    return builder.EndVector()
-
-
-def build_string_vector(
-    builder: flatbuffers.Builder,
-    values: Sequence[str],
-) -> int:
-    """Build a vector of UTF-8 strings."""
-
-    return build_offset_vector(
-        builder,
-        [builder.CreateString(value) for value in values],
-    )
 
 
 class CachedVector(Sequence[_T], Generic[_T]):
@@ -1297,24 +1148,6 @@ class TableView(_CachedView):
             raise InvalidBufferError("root table offset is null")
         return cls(buffer_view, root_offset + relative_offset)
 
-    @classmethod
-    def from_root(
-        cls,
-        buffer: Buffer,
-        *,
-        offset: int = 0,
-        size_prefixed: bool = False,
-        check_identifier: bool = True,
-    ) -> Self:
-        """Compatibility alias for :meth:`from_buffer`."""
-
-        return cls.from_buffer(
-            buffer,
-            offset=offset,
-            size_prefixed=size_prefixed,
-            check_identifier=check_identifier,
-        )
-
     def _field_position(self, vtable_field: int, size: int) -> int | None:
         if vtable_field < 4 or vtable_field % 2:
             raise ValueError("vtable field offsets must be even and at least 4")
@@ -1552,8 +1385,4 @@ __all__ = [
     "TableView",
     "UnionDispatch",
     "UnionVector",
-    "build_byte_vector",
-    "build_offset_vector",
-    "build_scalar_vector",
-    "build_string_vector",
 ]
