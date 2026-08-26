@@ -104,7 +104,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Build wheel
-        uses: PyO3/maturin-action@12dee64e4a21f3a4a4fd4d34e05cc55f0eda098a # v1.49.4
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
         with:
           maturin-version: v1.11.5
           target: ${{ matrix.target }}
@@ -151,7 +151,7 @@ jobs:
           persist-credentials: false
 
       - name: Build source distribution
-        uses: PyO3/maturin-action@12dee64e4a21f3a4a4fd4d34e05cc55f0eda098a # v1.49.4
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
         with:
           maturin-version: v1.11.5
           command: sdist
@@ -178,7 +178,7 @@ jobs:
 
     steps:
       - name: Download distributions
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           path: dist
@@ -204,11 +204,11 @@ jobs:
 
     steps:
       - name: Download distributions
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
 
       - name: Publish distributions
-        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
