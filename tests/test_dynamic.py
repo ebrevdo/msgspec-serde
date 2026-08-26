@@ -20,6 +20,7 @@ import pytest
 
 import msgspec_flatbuffers._dynamic as dynamic_module
 from msgspec_flatbuffers import (
+    DynamicModelOverrides,
     DynamicView,
     GenerationError,
     InvalidBufferError,
@@ -143,6 +144,106 @@ def test_known_dynamic_value_round_trips_msgspec_formats(
             disallowed,
             type=envelope.Envelope,
             dec_hook=dec_hook,
+        )
+
+
+def test_dynamic_model_subclass_overrides_apply_to_all_decoders(
+    generated_modules: tuple[ModuleType, ModuleType],
+) -> None:
+    payload, envelope = generated_modules
+    namespace = {"Metric": payload.Metric}
+    exec(
+        """
+class ValidatedMetric(Metric, dict=True):
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("empty metric name")
+        self.was_validated = True
+
+class OtherMetric(Metric, dict=True):
+    def __post_init__(self):
+        self.was_validated = "other"
+
+class InvalidMetric(Metric):
+    application_note: str = ""
+""",
+        namespace,
+    )
+    validated_metric = namespace["ValidatedMetric"]
+    other_metric = namespace["OtherMetric"]
+    invalid_metric = namespace["InvalidMetric"]
+    overrides = DynamicModelOverrides({payload.Metric: validated_metric})
+
+    decorated = DynamicModelOverrides()
+
+    @decorated.override(payload.Metric)
+    class DecoratedMetric(payload.Metric):
+        pass
+
+    assert decorated[payload.Metric] is DecoratedMetric
+
+    merged = DynamicModelOverrides() | overrides
+    assert isinstance(merged, DynamicModelOverrides)
+    assert merged[payload.Metric] is validated_metric
+    merged |= {payload.Metric: other_metric}
+    assert merged[payload.Metric] is other_metric
+    reversed_merge = {payload.Metric: other_metric} | overrides
+    assert isinstance(reversed_merge, DynamicModelOverrides)
+    assert reversed_merge[payload.Metric] is validated_metric
+
+    model = envelope.Envelope(
+        payload=envelope.EnvelopePayload(
+            validated_metric(
+                name="latency",
+                values=np.array([1.25, 2.5], dtype=np.float32),
+            )
+        )
+    )
+    flatbuffer = model.to_flatbuffer()
+    decoded = envelope.Envelope.from_flatbuffer(
+        flatbuffer,
+        dynamic_overrides=overrides,
+    )
+    from_view = envelope.EnvelopeView.from_buffer(flatbuffer).to_model(
+        dynamic_overrides=overrides,
+    )
+    for restored in (decoded, from_view):
+        assert restored.payload is not None
+        assert type(restored.payload.value) is validated_metric
+        assert restored.payload.value.was_validated
+
+    payload_view = envelope.EnvelopeView.from_buffer(flatbuffer).payload
+    assert payload_view is not None
+    payload_model = payload_view.to_model(dynamic_overrides=overrides)
+    assert type(payload_model.value) is validated_metric
+
+    encoded = msgspec.json.encode(model, enc_hook=enc_hook)
+    assert b"was_validated" not in encoded
+    json_decoded = msgspec.json.decode(
+        encoded,
+        type=envelope.Envelope,
+        dec_hook=overrides.dec_hook,
+    )
+    assert json_decoded.payload is not None
+    assert type(json_decoded.payload.value) is validated_metric
+    assert json_decoded.payload.value.was_validated
+
+    default_decoded = msgspec.json.decode(
+        encoded,
+        type=envelope.Envelope,
+        dec_hook=dec_hook,
+    )
+    assert default_decoded.payload is not None
+    assert type(default_decoded.payload.value) is payload.Metric
+
+    with pytest.raises(TypeError, match="serialized msgspec fields"):
+        DynamicModelOverrides({payload.Metric: invalid_metric})
+    with pytest.raises(TypeError, match="serialized msgspec fields"):
+        envelope.EnvelopePayload(
+            invalid_metric(
+                name="invalid",
+                values=np.array([], dtype=np.float32),
+            )
         )
 
 

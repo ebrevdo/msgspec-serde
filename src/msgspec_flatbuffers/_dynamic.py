@@ -6,11 +6,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
 from threading import Lock
-from typing import Any, ClassVar, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 import msgspec
 
+from ._models import validate_model_subclass
 from ._runtime import TableView
+
+if TYPE_CHECKING:
+    from ._overrides import DynamicModelOverrides
 
 _MSGSPEC_TAG_FIELD = "__msgspec_flatbuffers_type__"
 _DYNAMIC_VALUE_FIELD = "value"
@@ -105,19 +109,32 @@ class _DynamicTypeRegistry:
             return self._load_or_cache_tag(tag)
 
     def lookup_model(self, model_type: type[object]) -> DynamicType | None:
-        """Return the entry for an exact msgspec model type, if registered."""
+        """Return the entry for a registered model or unambiguous subclass."""
 
         try:
-            return self._by_model[model_type]
+            entry = self._by_model[model_type]
         except KeyError:
             with self._lock:
                 entry = self._by_model.get(model_type, _ABSENT)
-                if entry is not _ABSENT:
-                    return entry
-                if self._negative_model_count < _MAX_NEGATIVE_ENTRIES_PER_INDEX:
-                    self._by_model[model_type] = None
-                    self._negative_model_count += 1
-            return None
+                if entry is _ABSENT:
+                    if self._negative_model_count < _MAX_NEGATIVE_ENTRIES_PER_INDEX:
+                        self._by_model[model_type] = None
+                        self._negative_model_count += 1
+                    entry = None
+        if entry is not None:
+            return entry
+
+        matches: set[DynamicType] = set()
+        for base in getattr(model_type, "__mro__", ())[1:]:
+            candidate = self._by_model.get(base)
+            if candidate is not None:
+                matches.add(candidate)
+        if len(matches) > 1:
+            raise TypeError(
+                f"dynamic FlatBuffer model {model_type.__qualname__} has "
+                "multiple registered bases"
+            )
+        return next(iter(matches), None)
 
     def _discard_cached_tag_miss(self, tag: str) -> None:
         if self._by_tag.get(tag, _ABSENT) is None:
@@ -160,6 +177,8 @@ class DynamicValue:
             raise TypeError(
                 f"unregistered dynamic FlatBuffer model {model_type.__qualname__}"
             )
+        if model_type is not entry.model_type:
+            validate_model_subclass(entry.model_type, model_type)
         self._tag = entry.tag
         self._entry: DynamicType | None = entry
         self._value: msgspec.Struct | None = value
@@ -267,17 +286,29 @@ class DynamicView:
     def is_known(self) -> bool:
         return self._resolve_entry() is not None
 
-    def to_model(self) -> DynamicValue:
+    def to_model(
+        self,
+        *,
+        dynamic_overrides: DynamicModelOverrides | None = None,
+    ) -> DynamicValue:
         resolved = self._resolve_view()
         if resolved is None:
             return self._value_type.opaque(self._tag, self._data)
         entry, view = resolved
-        model = cast(Any, view).to_model()
+        target_type = _dynamic_model_type(entry, dynamic_overrides)
+        materialize = cast(Any, view).to_model
+        if dynamic_overrides is None:
+            model = materialize()
+        else:
+            model = materialize(
+                target_type,
+                dynamic_overrides=dynamic_overrides,
+            )
         model_type = type(model)
-        if model_type is not entry.model_type:
+        if model_type is not target_type:
             raise TypeError(
                 f"{entry.view_type.__qualname__}.to_model() returned "
-                f"{model_type.__qualname__}, expected {entry.model_type.__qualname__}"
+                f"{model_type.__qualname__}, expected {target_type.__qualname__}"
             )
         return self._value_type._known(entry, model)
 
@@ -421,6 +452,7 @@ def dynamic_from_builtins(
     value: object,
     *,
     dec_hook: Callable[[Any, Any], Any],
+    dynamic_overrides: DynamicModelOverrides | None = None,
 ) -> DynamicValue:
     """Resolve a tagged builtin object through the global registry."""
 
@@ -448,10 +480,19 @@ def dynamic_from_builtins(
         raise ValueError(f"unregistered dynamic FlatBuffer tag {tag!r}")
     model = msgspec.convert(
         value[_DYNAMIC_VALUE_FIELD],
-        type=entry.model_type,
+        type=_dynamic_model_type(entry, dynamic_overrides),
         dec_hook=dec_hook,
     )
     return value_type._known(entry, model)
+
+
+def _dynamic_model_type(
+    entry: DynamicType,
+    dynamic_overrides: DynamicModelOverrides | None,
+) -> type[msgspec.Struct]:
+    if dynamic_overrides is None:
+        return entry.model_type
+    return dynamic_overrides.get(entry.model_type, entry.model_type)
 
 
 dynamic_types = _DynamicTypeRegistry()

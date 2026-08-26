@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -174,8 +175,8 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     assert untouched_view.to_model() == model
     assert untouched_weapons.cached_count == 0
 
-    with pytest.raises(AttributeError):
-        model.hp = 1
+    model.hp = 1
+    assert model.hp == 1
     with pytest.raises(AttributeError):
         view.extra_state = "not allowed"
 
@@ -184,13 +185,12 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
         size_prefixed,
         size_prefixed=True,
     )
-    assert size_prefixed_view.hp == 80
+    assert size_prefixed_view.hp == 1
     assert bytes(size_prefixed_view.buffer) == size_prefixed[4:]
     assert generated.Monster.from_flatbuffer(
         size_prefixed,
         size_prefixed=True,
     ) == model
-
     undersized_identifier = bytearray(size_prefixed)
     struct.pack_into("<I", undersized_identifier, 0, 4)
     with pytest.raises(BufferBoundsError, match="file identifier"):
@@ -299,6 +299,85 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
         assert reference_view.TagsLength() == 2
         assert reference_view.PathLength() == 2
         assert reference_view.OptionalEnergy() == 123
+
+
+def test_model_subclasses_drive_native_materialization(tmp_path: Path) -> None:
+    module_path = generate(FIXTURE, tmp_path / "generated")
+    generated = _load_module("test_generated_subclasses", module_path)
+    namespace: dict[str, Any] = {
+        "ClassVar": ClassVar,
+        "Monster": generated.Monster,
+        "Vec3": generated.Vec3,
+        "Weapon": generated.Weapon,
+    }
+    exec(
+        compile(
+            """
+class ValidatedWeapon(Weapon, dict=True):
+    validation_kind: ClassVar[str] = "weapon"
+
+    def __post_init__(self):
+        if self.damage < 0:
+            raise ValueError("negative damage")
+        self.was_validated = True
+
+class ValidatedVec3(Vec3, dict=True):
+    def __post_init__(self):
+        self.was_validated = True
+
+class ValidatedMonster(Monster, dict=True):
+    pos: ValidatedVec3 | None
+    weapons: list[ValidatedWeapon] | None
+    path: list[ValidatedVec3] | None
+    validation_kind: ClassVar[str] = "monster"
+
+    def __post_init__(self):
+        self.was_validated = True
+
+class InvalidMonster(Monster):
+    application_note: str = ""
+""",
+            "<model-subclasses>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    validated_weapon = namespace["ValidatedWeapon"]
+    validated_vec3 = namespace["ValidatedVec3"]
+    validated_monster = namespace["ValidatedMonster"]
+    invalid_monster = namespace["InvalidMonster"]
+
+    model = generated.Monster(
+        pos=generated.Vec3(x=1.0, y=2.0, z=3.0),
+        name="subclasses",
+        weapons=[generated.Weapon(name="Axe", damage=5)],
+        path=[generated.Vec3(x=4.0, y=5.0, z=6.0)],
+    )
+    buffer = model.to_flatbuffer()
+
+    direct = validated_monster.from_flatbuffer(buffer)
+    from_view = generated.MonsterView.from_buffer(buffer).to_model(validated_monster)
+    for restored in (direct, from_view):
+        assert type(restored) is validated_monster
+        assert restored.was_validated
+        assert restored.weapons is not None
+        assert type(restored.weapons[0]) is validated_weapon
+        assert restored.weapons[0].was_validated
+        assert type(restored.pos) is validated_vec3
+        assert restored.pos.was_validated
+        assert restored.path is not None
+        assert type(restored.path[0]) is validated_vec3
+        assert restored.path[0].was_validated
+        assert restored.to_flatbuffer().readonly
+
+    assert set(validated_monster.__struct_fields__) == set(
+        generated.Monster.__struct_fields__
+    )
+    with pytest.raises(TypeError, match="serialized msgspec fields"):
+        invalid_monster.from_flatbuffer(buffer)
+    with pytest.raises(TypeError, match="serialized msgspec fields"):
+        invalid_monster(name="invalid").to_flatbuffer()
 
 
 def test_generate_resolves_types_from_another_fbs_module(tmp_path: Path) -> None:
@@ -460,7 +539,7 @@ def test_native_builder_samples_variable_size_vectors(tmp_path: Path) -> None:
     assert "import flatbuffers" not in source
     assert "def _build_" not in source
     assert "def _estimate_" not in source
-    assert source.count("_FB_NATIVE_MODULE.unpack_view(") == 3
+    assert source.count("_FB_NATIVE_MODULE.unpack_view(") == 6
     assert "_FB_UNPACK_" not in source
     generated = _load_module("test_generated_sampled_presizing", module_path)
     weapons = [

@@ -1,0 +1,15 @@
+namespace Tutorial;
+
+attribute "dynamic_flatbuffer";
+attribute "dynamic_allow";
+
+table DynamicEnvelope {
+  payload_type:string;
+  payload:[ubyte] (
+    dynamic_flatbuffer: "payload_type",
+    dynamic_allow: "Tutorial.*"
+  );
+}
+
+root_type DynamicEnvelope;
+file_identifier "DYNE";

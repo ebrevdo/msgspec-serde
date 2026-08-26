@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_int, c_void};
 use std::mem::size_of;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use flatbuffers::{
@@ -30,6 +30,8 @@ struct ModuleWire {
 #[derive(Deserialize)]
 struct ObjectWire {
     name: String,
+    #[serde(skip)]
+    index: usize,
     is_struct: bool,
     byte_size: usize,
     min_alignment: usize,
@@ -151,6 +153,21 @@ struct BoundTypes {
     by_name: HashMap<String, Py<PyType>>,
 }
 
+struct BoundModelSubclass {
+    _type_owner: Py<PyType>,
+    object_index: usize,
+}
+
+type ChildTypeKey = (usize, u16, usize);
+
+#[pyclass(module = "msgspec_flatbuffers._native", frozen)]
+pub struct NativeModelTypes {
+    plan_identity: Arc<()>,
+    root_index: usize,
+    root_type: Py<PyType>,
+    child_types: HashMap<ChildTypeKey, Py<PyType>>,
+}
+
 #[derive(Clone, Copy)]
 struct TableInfo {
     table_offset: usize,
@@ -165,6 +182,12 @@ struct RootDecode<'a> {
     size_prefixed: bool,
     identifier: Option<&'a str>,
     check_identifier: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DecodeContext<'a, 'py> {
+    model_types: Option<&'a NativeModelTypes>,
+    dynamic_overrides: Option<&'a Bound<'py, PyAny>>,
 }
 
 #[pyclass(module = "msgspec_flatbuffers._native", frozen)]
@@ -863,9 +886,11 @@ fn write_struct_scalar(
 
 #[pyclass(module = "msgspec_flatbuffers._native", frozen)]
 pub struct NativePlan {
+    identity: Arc<()>,
     objects: Vec<ObjectWire>,
     by_name: HashMap<String, usize>,
     bound_types: OnceLock<BoundTypes>,
+    model_subclass_cache: Mutex<HashMap<usize, BoundModelSubclass>>,
     dynamic_encoder: Option<Py<PyAny>>,
     dynamic_registry: Py<PyAny>,
     numpy_empty: Py<PyAny>,
@@ -894,6 +919,139 @@ impl NativePlan {
             .and_then(|types| types.by_name.get(name))
             .map(|value| value.bind(py).clone())
             .ok_or_else(|| PyRuntimeError::new_err(format!("native type {name:?} is not bound")))
+    }
+
+    fn prepare_decode<'a, 'py>(
+        &self,
+        py: Python<'py>,
+        object: &ObjectWire,
+        model_types: Option<&'a NativeModelTypes>,
+        dynamic_overrides: Option<&'a Bound<'py, PyAny>>,
+        mismatch_message: &'static str,
+    ) -> PyResult<(Bound<'py, PyType>, DecodeContext<'a, 'py>)> {
+        if let Some(model_types) = model_types
+            && (!Arc::ptr_eq(&self.identity, &model_types.plan_identity)
+                || model_types.root_index != object.index)
+        {
+            return Err(PyTypeError::new_err(mismatch_message));
+        }
+        let model_type = match model_types {
+            Some(types) => types.root_type.bind(py).clone(),
+            None => self.bound_type(py, &object.name)?,
+        };
+        Ok((
+            model_type,
+            DecodeContext {
+                model_types,
+                dynamic_overrides,
+            },
+        ))
+    }
+
+    fn child_decode_type<'py>(
+        &self,
+        py: Python<'py>,
+        parent_type: &Bound<'py, PyType>,
+        field: &FieldWire,
+        target: &ObjectWire,
+        model_types: Option<&NativeModelTypes>,
+    ) -> PyResult<Bound<'py, PyType>> {
+        if let Some(model_types) = model_types
+            && let Some(model_type) = model_types.child_types.get(&(
+                parent_type.as_ptr() as usize,
+                field.slot,
+                target.index,
+            ))
+        {
+            return Ok(model_type.bind(py).clone());
+        }
+        self.bound_type(py, &target.name)
+    }
+
+    fn model_object_index(&self, model: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let bound_types = self
+            .bound_types
+            .get()
+            .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
+        let model_type = model.get_type();
+        let pointer = model_type.as_ptr() as usize;
+        if let Some(index) = bound_types.by_pointer.get(&pointer) {
+            return Ok(*index);
+        }
+        if let Some(entry) = self
+            .model_subclass_cache
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("native model subclass cache is poisoned"))?
+            .get(&pointer)
+        {
+            return Ok(entry.object_index);
+        }
+
+        let mut matches = Vec::new();
+        for base in model_type
+            .getattr("__mro__")?
+            .cast::<PyTuple>()?
+            .iter()
+            .skip(1)
+        {
+            if let Some(index) = bound_types.by_pointer.get(&(base.as_ptr() as usize))
+                && !matches.contains(index)
+            {
+                matches.push(*index);
+            }
+        }
+        let [object_index] = matches.as_slice() else {
+            return Err(PyTypeError::new_err(format!(
+                "{} does not have exactly one generated FlatBuffer model base",
+                model_type.name()?,
+            )));
+        };
+        let generated_type = self.bound_type(model.py(), &self.objects[*object_index].name)?;
+        let model_fields = model_type
+            .getattr("__struct_fields__")?
+            .cast_into::<PyTuple>()?;
+        let generated_fields = generated_type
+            .getattr("__struct_fields__")?
+            .cast_into::<PyTuple>()?;
+        if model_fields.len() != generated_fields.len()
+            || generated_fields
+                .iter()
+                .any(|field| !model_fields.contains(&field).unwrap_or(false))
+        {
+            return Err(PyTypeError::new_err(format!(
+                "{} changes the serialized msgspec fields of {}",
+                model_type.name()?,
+                generated_type.name()?,
+            )));
+        }
+        self.model_subclass_cache
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("native model subclass cache is poisoned"))?
+            .insert(
+                pointer,
+                BoundModelSubclass {
+                    _type_owner: model_type.unbind(),
+                    object_index: *object_index,
+                },
+            );
+        Ok(*object_index)
+    }
+
+    fn require_model_type(&self, object: &ObjectWire, model: &Bound<'_, PyAny>) -> PyResult<()> {
+        let actual = self.model_object_index(model)?;
+        if actual == object.index {
+            return Ok(());
+        }
+        let model_name = model.get_type().name()?.to_str()?.to_owned();
+        let expected_name = self
+            .bound_type(model.py(), &object.name)?
+            .name()?
+            .to_str()?
+            .to_owned();
+        Err(PyTypeError::new_err(format!(
+            "{} must subclass {}",
+            model_name, expected_name,
+        )))
     }
 
     fn bounds_error(&self, py: Python<'_>, message: impl Into<String>) -> PyErr {
@@ -1160,10 +1318,12 @@ impl NativePlan {
         Ok(py.None())
     }
 
-    fn decode_struct_at(
+    fn decode_struct_at<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         object: &ObjectWire,
+        model_type: &Bound<'py, PyType>,
+        context: DecodeContext<'_, 'py>,
         data: &[u8],
         offset: usize,
     ) -> PyResult<Py<PyAny>> {
@@ -1182,7 +1342,16 @@ impl NativePlan {
                 }
                 FieldKind::Struct => {
                     let target = self.target_object(field)?;
-                    self.decode_struct_at(py, target, data, offset + field.offset)?
+                    let target_type =
+                        self.child_decode_type(py, model_type, field, target, context.model_types)?;
+                    self.decode_struct_at(
+                        py,
+                        target,
+                        &target_type,
+                        context,
+                        data,
+                        offset + field.offset,
+                    )?
                 }
                 _ => {
                     return Err(PyNotImplementedError::new_err(
@@ -1192,16 +1361,15 @@ impl NativePlan {
             };
             kwargs.set_item(field.name.as_str(), value)?;
         }
-        Ok(self
-            .bound_type(py, &object.name)?
-            .call((), Some(&kwargs))?
-            .unbind())
+        Ok(model_type.call((), Some(&kwargs))?.unbind())
     }
 
-    fn decode_table_at(
+    fn decode_table_at<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         object: &ObjectWire,
+        model_type: &Bound<'py, PyType>,
+        context: DecodeContext<'_, 'py>,
         data: &[u8],
         table_offset: usize,
     ) -> PyResult<Py<PyAny>> {
@@ -1214,19 +1382,18 @@ impl NativePlan {
         let table = self.table_info(py, data, table_offset)?;
         let kwargs = PyDict::new(py);
         for field in &object.fields {
-            let value = self.decode_field(py, field, data, table)?;
+            let value = self.decode_field(py, model_type, field, context, data, table)?;
             kwargs.set_item(field.name.as_str(), value)?;
         }
-        Ok(self
-            .bound_type(py, &object.name)?
-            .call((), Some(&kwargs))?
-            .unbind())
+        Ok(model_type.call((), Some(&kwargs))?.unbind())
     }
 
-    fn decode_union(
+    fn decode_union<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
+        parent_type: &Bound<'py, PyType>,
         field: &FieldWire,
+        context: DecodeContext<'_, 'py>,
         data: &[u8],
         table: TableInfo,
     ) -> PyResult<Py<PyAny>> {
@@ -1265,13 +1432,18 @@ impl NativePlan {
             .find(|arm| arm.tag == tag)
             .ok_or_else(|| self.invalid_error(py, format!("unknown union discriminator {tag}")))?;
         let target = self.offset_target(py, data, position, "union field offset")?;
-        self.decode_table_at(py, &self.objects[arm.target_index], data, target)
+        let target_object = &self.objects[arm.target_index];
+        let target_type =
+            self.child_decode_type(py, parent_type, field, target_object, context.model_types)?;
+        self.decode_table_at(py, target_object, &target_type, context, data, target)
     }
 
-    fn decode_union_vector(
+    fn decode_union_vector<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
+        parent_type: &Bound<'py, PyType>,
         field: &FieldWire,
+        context: DecodeContext<'_, 'py>,
         data: &[u8],
         table: TableInfo,
     ) -> PyResult<Py<PyAny>> {
@@ -1325,9 +1497,14 @@ impl NativePlan {
                 })?;
             let position = value_start + index * 4;
             let target = self.offset_target(py, data, position, "union vector offset")?;
+            let target_object = &self.objects[arm.target_index];
+            let target_type =
+                self.child_decode_type(py, parent_type, field, target_object, context.model_types)?;
             decoded.push(self.decode_table_at(
                 py,
-                &self.objects[arm.target_index],
+                target_object,
+                &target_type,
+                context,
                 data,
                 target,
             )?);
@@ -1335,10 +1512,11 @@ impl NativePlan {
         Ok(PyList::new(py, decoded)?.into_any().unbind())
     }
 
-    fn decode_dynamic(
+    fn decode_dynamic<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         field: &FieldWire,
+        dynamic_overrides: Option<&Bound<'py, PyAny>>,
         data: &[u8],
         table: TableInfo,
     ) -> PyResult<Py<PyAny>> {
@@ -1392,15 +1570,26 @@ impl NativePlan {
         if entry.is_none() {
             return Ok(wrapper.call_method1("opaque", (tag, bytes))?.unbind());
         }
-        let model_type = entry.getattr("model_type")?;
-        let model = model_type.call_method1("from_flatbuffer", (bytes,))?;
+        let generated_type = entry.getattr("model_type")?;
+        let model = match dynamic_overrides {
+            Some(overrides) => {
+                let model_type =
+                    overrides.call_method1("get", (generated_type.clone(), generated_type))?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("dynamic_overrides", overrides)?;
+                model_type.call_method("from_flatbuffer", (bytes,), Some(&kwargs))?
+            }
+            None => generated_type.call_method1("from_flatbuffer", (bytes,))?,
+        };
         Ok(wrapper.call1((model,))?.unbind())
     }
 
-    fn decode_field(
+    fn decode_field<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
+        parent_type: &Bound<'py, PyType>,
         field: &FieldWire,
+        context: DecodeContext<'_, 'py>,
         data: &[u8],
         table: TableInfo,
     ) -> PyResult<Py<PyAny>> {
@@ -1429,7 +1618,15 @@ impl NativePlan {
                     return self.missing_field(py, field);
                 };
                 let target = self.offset_target(py, data, position, "table field offset")?;
-                self.decode_table_at(py, self.target_object(field)?, data, target)
+                let target_object = self.target_object(field)?;
+                let target_type = self.child_decode_type(
+                    py,
+                    parent_type,
+                    field,
+                    target_object,
+                    context.model_types,
+                )?;
+                self.decode_table_at(py, target_object, &target_type, context, data, target)
             }
             FieldKind::Struct => {
                 let target = self.target_object(field)?;
@@ -1438,7 +1635,9 @@ impl NativePlan {
                 else {
                     return self.missing_field(py, field);
                 };
-                self.decode_struct_at(py, target, data, position)
+                let target_type =
+                    self.child_decode_type(py, parent_type, field, target, context.model_types)?;
+                self.decode_struct_at(py, target, &target_type, context, data, position)
             }
             FieldKind::VectorByte => {
                 let Some((start, length)) = self.vector_info(py, data, table, field.offset, 1)?
@@ -1488,16 +1687,32 @@ impl NativePlan {
                     return self.missing_field(py, field);
                 };
                 let target_object = self.target_object(field)?;
+                let target_type = self.child_decode_type(
+                    py,
+                    parent_type,
+                    field,
+                    target_object,
+                    context.model_types,
+                )?;
                 let mut values = Vec::with_capacity(length);
                 for index in 0..length {
                     let position = start + index * 4;
                     let target = self.offset_target(py, data, position, "table vector offset")?;
-                    values.push(self.decode_table_at(py, target_object, data, target)?);
+                    values.push(self.decode_table_at(
+                        py,
+                        target_object,
+                        &target_type,
+                        context,
+                        data,
+                        target,
+                    )?);
                 }
                 Ok(PyList::new(py, values)?.into_any().unbind())
             }
             FieldKind::VectorStruct => {
                 let target = self.target_object(field)?;
+                let target_type =
+                    self.child_decode_type(py, parent_type, field, target, context.model_types)?;
                 let Some((start, length)) =
                     self.vector_info(py, data, table, field.offset, target.byte_size)?
                 else {
@@ -1508,6 +1723,8 @@ impl NativePlan {
                     values.push(self.decode_struct_at(
                         py,
                         target,
+                        &target_type,
+                        context,
                         data,
                         start + index * target.byte_size,
                     )?);
@@ -1520,22 +1737,38 @@ impl NativePlan {
                     return self.missing_field(py, field);
                 };
                 let target = self.target_object(field)?;
+                let target_type =
+                    self.child_decode_type(py, parent_type, field, target, context.model_types)?;
                 let bytes = PyBytes::new(py, &data[start..start + length]);
-                Ok(self
-                    .bound_type(py, &target.name)?
-                    .call_method1("from_flatbuffer", (bytes,))?
-                    .unbind())
+                match context.dynamic_overrides {
+                    Some(overrides) => {
+                        let kwargs = PyDict::new(py);
+                        kwargs.set_item("dynamic_overrides", overrides)?;
+                        Ok(target_type
+                            .call_method("from_flatbuffer", (bytes,), Some(&kwargs))?
+                            .unbind())
+                    }
+                    None => Ok(target_type
+                        .call_method1("from_flatbuffer", (bytes,))?
+                        .unbind()),
+                }
             }
-            FieldKind::Dynamic => self.decode_dynamic(py, field, data, table),
-            FieldKind::Union => self.decode_union(py, field, data, table),
-            FieldKind::UnionVector => self.decode_union_vector(py, field, data, table),
+            FieldKind::Dynamic => {
+                self.decode_dynamic(py, field, context.dynamic_overrides, data, table)
+            }
+            FieldKind::Union => self.decode_union(py, parent_type, field, context, data, table),
+            FieldKind::UnionVector => {
+                self.decode_union_vector(py, parent_type, field, context, data, table)
+            }
         }
     }
 
-    fn decode_root(
+    fn decode_root<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         object: &ObjectWire,
+        model_type: &Bound<'py, PyType>,
+        context: DecodeContext<'_, 'py>,
         input: &[u8],
         options: RootDecode<'_>,
     ) -> PyResult<Py<PyAny>> {
@@ -1574,7 +1807,7 @@ impl NativePlan {
         let table_offset = root_offset
             .checked_add(relative)
             .ok_or_else(|| self.bounds_error(py, "root table offset overflows"))?;
-        self.decode_table_at(py, object, data, table_offset)
+        self.decode_table_at(py, object, model_type, context, data, table_offset)
     }
 
     fn encode_dynamic_value<'py>(
@@ -1599,15 +1832,15 @@ impl NativePlan {
         field: &'a FieldWire,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<&'a ArmWire> {
-        let bound_types = self
-            .bound_types
-            .get()
-            .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
         let value_type = value.get_type();
-        let target = bound_types.by_pointer.get(&(value_type.as_ptr() as usize));
-        let arm =
-            target.and_then(|target| field.arms.iter().find(|arm| arm.target_index == *target));
         let type_name = value_type.name()?.to_str()?.to_owned();
+        let target = self.model_object_index(value).map_err(|_| {
+            PyTypeError::new_err(format!(
+                "union field {:?} does not accept model type {}",
+                field.name, type_name,
+            ))
+        })?;
+        let arm = field.arms.iter().find(|arm| arm.target_index == target);
         arm.ok_or_else(|| {
             PyTypeError::new_err(format!(
                 "union field {:?} does not accept model type {}",
@@ -1628,6 +1861,7 @@ impl NativePlan {
                 object.name
             )));
         }
+        self.require_model_type(object, model)?;
         buffer.fill(0);
         for field in &object.fields {
             if field.kind != FieldKind::Scalar {
@@ -1672,6 +1906,7 @@ impl NativePlan {
         object: &ObjectWire,
         model: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<FieldState<'py>>> {
+        self.require_model_type(object, model)?;
         object
             .fields
             .iter()
@@ -2143,7 +2378,8 @@ impl NativePlan {
             .enumerate()
             .map(|(index, object)| (object.name.clone(), index))
             .collect();
-        for object in &mut wire.objects {
+        for (object_index, object) in wire.objects.iter_mut().enumerate() {
+            object.index = object_index;
             for field in &mut object.fields {
                 if let Some(target) = field.target.take() {
                     field.target_index = Some(*by_name.get(&target).ok_or_else(|| {
@@ -2186,9 +2422,11 @@ impl NativePlan {
             .cast_into::<PyType>()?
             .unbind();
         Ok(Self {
+            identity: Arc::new(()),
             objects: wire.objects,
             by_name,
             bound_types: OnceLock::new(),
+            model_subclass_cache: Mutex::new(HashMap::new()),
             dynamic_encoder,
             dynamic_registry,
             numpy_empty,
@@ -2216,8 +2454,93 @@ impl NativePlan {
             .map_err(|_| PyRuntimeError::new_err("native model types are already bound"))
     }
 
+    fn model_types(
+        &self,
+        generated: &Bound<'_, PyType>,
+        requested: &Bound<'_, PyType>,
+        bindings: &Bound<'_, PyAny>,
+    ) -> PyResult<NativeModelTypes> {
+        let bound_types = self
+            .bound_types
+            .get()
+            .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
+        let bound_index = |model_type: &Bound<'_, PyType>, role: &str| {
+            bound_types
+                .by_pointer
+                .get(&(model_type.as_ptr() as usize))
+                .copied()
+                .ok_or_else(|| PyTypeError::new_err(format!("{role} type is not bound")))
+        };
+        let root_index = bound_index(generated, "generated root")?;
+        if !requested.is_subclass(generated)? {
+            return Err(PyTypeError::new_err(format!(
+                "{} must subclass {}",
+                requested.name()?,
+                generated.name()?,
+            )));
+        }
+
+        let mut child_types = HashMap::new();
+        for binding in bindings.try_iter()? {
+            let binding = binding?.cast_into::<PyTuple>()?;
+            if binding.len() != 5 {
+                return Err(PyValueError::new_err(
+                    "native model type bindings must contain five values",
+                ));
+            }
+            let generated_parent = binding.get_item(0)?.cast_into::<PyType>()?;
+            let requested_parent = binding.get_item(1)?.cast_into::<PyType>()?;
+            let field_name = binding.get_item(2)?.extract::<String>()?;
+            let generated_child = binding.get_item(3)?.cast_into::<PyType>()?;
+            let requested_child = binding.get_item(4)?.cast_into::<PyType>()?;
+
+            let parent_index = bound_index(&generated_parent, "generated parent")?;
+            let child_index = bound_index(&generated_child, "generated child")?;
+            if !requested_parent.is_subclass(&generated_parent)?
+                || !requested_child.is_subclass(&generated_child)?
+            {
+                return Err(PyTypeError::new_err(
+                    "native model type binding is not a subclass",
+                ));
+            }
+            let parent = &self.objects[parent_index];
+            let field = parent
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "native model field {:?}.{:?} does not exist",
+                        parent.name, field_name,
+                    ))
+                })?;
+            let accepts_child = field.target_index == Some(child_index)
+                || field.arms.iter().any(|arm| arm.target_index == child_index);
+            if !accepts_child {
+                return Err(PyTypeError::new_err(format!(
+                    "native model field {:?}.{:?} does not contain {}",
+                    parent.name, field_name, self.objects[child_index].name,
+                )));
+            }
+            let key = (requested_parent.as_ptr() as usize, field.slot, child_index);
+            if let Some(existing) = child_types.insert(key, requested_child.clone().unbind())
+                && existing.bind(requested.py()).as_ptr() != requested_child.as_ptr()
+            {
+                return Err(PyTypeError::new_err(
+                    "native model field has conflicting subclass bindings",
+                ));
+            }
+        }
+        Ok(NativeModelTypes {
+            plan_identity: Arc::clone(&self.identity),
+            root_index,
+            root_type: requested.clone().unbind(),
+            child_types,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (root, buffer, *, identifier=None, offset=0, size_prefixed=false, check_identifier=true))]
+    #[pyo3(signature = (root, buffer, *, identifier=None, offset=0, size_prefixed=false, check_identifier=true, model_types=None, dynamic_overrides=None))]
     fn unpack(
         &self,
         py: Python<'_>,
@@ -2227,33 +2550,56 @@ impl NativePlan {
         offset: isize,
         size_prefixed: bool,
         check_identifier: bool,
+        model_types: Option<PyRef<'_, NativeModelTypes>>,
+        dynamic_overrides: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let offset = nonnegative_usize(offset, "offset")?;
         validate_identifier(identifier)?;
         let root = self.object(root)?;
+        let model_types = model_types.as_deref();
+        let (model_type, context) = self.prepare_decode(
+            py,
+            root,
+            model_types,
+            dynamic_overrides,
+            "native model types belong to a different root",
+        )?;
         let options = RootDecode {
             offset,
             size_prefixed,
             identifier,
             check_identifier,
         };
-        with_input_bytes(buffer, |data| self.decode_root(py, root, data, options))
+        with_input_bytes(buffer, |data| {
+            self.decode_root(py, root, &model_type, context, data, options)
+        })
     }
 
+    #[pyo3(signature = (object, buffer, offset, *, model_types=None, dynamic_overrides=None))]
     fn unpack_view(
         &self,
         py: Python<'_>,
         object: &str,
         buffer: &Bound<'_, PyAny>,
         offset: isize,
+        model_types: Option<PyRef<'_, NativeModelTypes>>,
+        dynamic_overrides: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let offset = nonnegative_usize(offset, "offset")?;
         let object = self.object(object)?;
+        let model_types = model_types.as_deref();
+        let (model_type, context) = self.prepare_decode(
+            py,
+            object,
+            model_types,
+            dynamic_overrides,
+            "native model types belong to a different view type",
+        )?;
         with_input_bytes(buffer, |data| {
             if object.is_struct {
-                self.decode_struct_at(py, object, data, offset)
+                self.decode_struct_at(py, object, &model_type, context, data, offset)
             } else {
-                self.decode_table_at(py, object, data, offset)
+                self.decode_table_at(py, object, &model_type, context, data, offset)
             }
         })
     }
@@ -2318,6 +2664,7 @@ impl NativePlan {
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeBuffer>()?;
+    module.add_class::<NativeModelTypes>()?;
     module.add_class::<NativePlan>()?;
     Ok(())
 }

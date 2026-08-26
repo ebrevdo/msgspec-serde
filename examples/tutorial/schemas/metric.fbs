@@ -1,0 +1,11 @@
+namespace Tutorial;
+
+attribute "dynamic_extension";
+
+table Metric (dynamic_extension) {
+  name:string (required);
+  values:[float];
+}
+
+root_type Metric;
+file_identifier "METR";

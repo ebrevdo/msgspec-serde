@@ -141,7 +141,7 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
         label = None
         optional_count = None
 
-    with pytest.raises(TypeError, match="required field.*label"):
+    with pytest.raises(TypeError, match="generated FlatBuffer model base"):
         generated._FB_NATIVE_MODULE.pack("Native.Basic", MissingLabel())
     with pytest.raises(ValueError, match="initial_size"):
         generated._FB_NATIVE_MODULE.pack(

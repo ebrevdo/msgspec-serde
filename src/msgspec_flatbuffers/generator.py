@@ -781,10 +781,9 @@ def _render_model_equality(
     item: ObjectDefinition,
     fields: Sequence[FieldDefinition],
 ) -> list[str]:
-    name = _short_name(item.name)
     lines = [
         "    def __eq__(self, other: object) -> bool:",
-        f"        if type(other) is not {name}:",
+        "        if type(other) is not type(self):",
         "            return False",
         "        return (",
     ]
@@ -846,7 +845,7 @@ def _render_model(
     has_numeric_vectors = any(
         _is_numeric_model_vector(context, field) for field in model_fields
     )
-    options = ["frozen=True", "kw_only=True"]
+    options = ["kw_only=True"]
     if not item.is_struct:
         field_names = [_identifier(field.name) for field in fields]
         reserved_fields = {
@@ -919,7 +918,20 @@ def _render_model(
                 "        offset: int = 0,",
                 "        size_prefixed: bool = False,",
                 "        check_identifier: bool = True,",
-                f"    ) -> {name}:",
+                "        dynamic_overrides: DynamicModelOverrides | None = None,",
+                "    ) -> Self:",
+                f"        if cls is {name} and dynamic_overrides is None:",
+                "            return _FB_NATIVE_MODULE.unpack(",
+                f"                {item.name!r},",
+                "                buffer,",
+                f"                identifier={identifier},",
+                "                offset=offset,",
+                "                size_prefixed=size_prefixed,",
+                "                check_identifier=check_identifier,",
+                "            )",
+                f"        model_types = None if cls is {name} else _resolve_model_types(",
+                f"            _FB_NATIVE_MODULE, {name}, cls",
+                "        )",
                 "        return _FB_NATIVE_MODULE.unpack(",
                 f"            {item.name!r},",
                 "            buffer,",
@@ -927,6 +939,8 @@ def _render_model(
                 "            offset=offset,",
                 "            size_prefixed=size_prefixed,",
                 "            check_identifier=check_identifier,",
+                "            model_types=model_types,",
+                "            dynamic_overrides=dynamic_overrides,",
                 "        )",
                 "",
                 "    def to_flatbuffer(",
@@ -1595,11 +1609,42 @@ def _render_view(context: _Context, item: ObjectDefinition, root: bool) -> list[
     lines.extend(
         (
             "",
-            f"    def to_model(self) -> {name}:",
+            "    @overload",
+            "    def to_model(",
+            "        self,",
+            "        *,",
+            "        dynamic_overrides: DynamicModelOverrides | None = None,",
+            f"    ) -> {name}: ...",
+            "",
+            "    @overload",
+            f"    def to_model[_ModelT: {name}](",
+            "        self,",
+            "        model_type: type[_ModelT],",
+            "        *,",
+            "        dynamic_overrides: DynamicModelOverrides | None = None,",
+            "    ) -> _ModelT: ...",
+            "",
+            "    def to_model(",
+            "        self,",
+            f"        model_type: type[{name}] = {name},",
+            "        *,",
+            "        dynamic_overrides: DynamicModelOverrides | None = None,",
+            f"    ) -> {name}:",
+            f"        if model_type is {name} and dynamic_overrides is None:",
+            "            return _FB_NATIVE_MODULE.unpack_view(",
+            f"                {item.name!r},",
+            "                self._buffer,",
+            f"                self.{model_offset},",
+            "            )",
+            f"        native_types = None if model_type is {name} else _resolve_model_types(",
+            f"            _FB_NATIVE_MODULE, {name}, model_type",
+            "        )",
             "        return _FB_NATIVE_MODULE.unpack_view(",
             f"            {item.name!r},",
             "            self._buffer,",
             f"            self.{model_offset},",
+            "            model_types=native_types,",
+            "            dynamic_overrides=dynamic_overrides,",
             "        )",
         )
     )
@@ -1800,7 +1845,7 @@ def render_module(
     has_unions = any(item.is_union for item in local_enums) or any(
         context.union_pairs(item) for item in local_objects
     )
-    typing_imports: list[str] = []
+    typing_imports: list[str] = ["Self", "overload"]
     if has_byte_vector_helpers:
         typing_imports.extend(("Any", "TypeVar"))
     if has_unions:
@@ -1904,6 +1949,7 @@ def render_module(
         "import numpy.typing as npt",
         "",
         "from msgspec_flatbuffers import (",
+        "    DynamicModelOverrides,",
         "    InvalidBufferError,",
         "    OpenIntEnum,",
         "    StringVector,",
@@ -1919,6 +1965,7 @@ def render_module(
         *(["    register_dynamic_type,"] if dynamic_extension else []),
         *(["    UnionDispatch,", "    UnionVector,"] if has_unions else []),
         ")",
+        "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types",
         "from msgspec_flatbuffers._native import NativePlan as _NativePlan",
     ]
     for module in sorted(import_modules):

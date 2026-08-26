@@ -178,6 +178,57 @@ def test_union_serialization_requires_the_declared_model_types(
         model.to_flatbuffer()
 
 
+def test_union_annotations_select_path_specific_model_subclasses(
+    generated_modules: tuple[ModuleType, ModuleType],
+) -> None:
+    generated, _ = generated_modules
+    namespace = {
+        "Cat": generated.Cat,
+        "Dog": generated.Dog,
+        "Payload": generated.Payload,
+    }
+    exec(
+        compile(
+            """
+class FavoriteCat(Cat, dict=True):
+    def __post_init__(self):
+        self.role = "favorite"
+
+class ResidentCat(Cat, dict=True):
+    def __post_init__(self):
+        self.role = "resident"
+
+class ValidatedPayload(Payload, dict=True):
+    favorite: FavoriteCat | Dog | None
+    residents: list[ResidentCat | Dog] | None
+""",
+            "<union-model-subclasses>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    favorite_cat = namespace["FavoriteCat"]
+    resident_cat = namespace["ResidentCat"]
+    validated_payload = namespace["ValidatedPayload"]
+    model = generated.Payload(
+        favorite=generated.Cat(name="Miso"),
+        residents=[generated.Cat(name="Nori"), generated.Dog(name="Pip")],
+    )
+    buffer = model.to_flatbuffer()
+
+    direct = validated_payload.from_flatbuffer(buffer)
+    from_view = generated.PayloadView.from_buffer(buffer).to_model(validated_payload)
+    for restored in (direct, from_view):
+        assert type(restored) is validated_payload
+        assert type(restored.favorite) is favorite_cat
+        assert restored.favorite.role == "favorite"
+        assert restored.residents is not None
+        assert type(restored.residents[0]) is resident_cat
+        assert restored.residents[0].role == "resident"
+        assert restored.to_flatbuffer().readonly
+
+
 def test_absent_union_stays_none(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
@@ -219,6 +270,45 @@ def test_annotated_nested_flatbuffer_is_typed_cached_and_zero_copy(
     assert outer.to_model() == model
     rebuilt = envelope.EnvelopeView.from_buffer(outer.to_model().to_flatbuffer())
     assert rebuilt.to_model() == model
+
+
+def test_nested_flatbuffer_annotations_select_model_subclasses(
+    generated_modules: tuple[ModuleType, ModuleType],
+) -> None:
+    payload, envelope = generated_modules
+    namespace: dict[str, Any] = {
+        "Envelope": envelope.Envelope,
+        "Payload": payload.Payload,
+    }
+    exec(
+        compile(
+            """
+class ValidatedPayload(Payload, dict=True):
+    def __post_init__(self):
+        self.was_validated = True
+
+class ValidatedEnvelope(Envelope, dict=True):
+    payload: ValidatedPayload | None
+""",
+            "<nested-model-subclasses>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    validated_payload = namespace["ValidatedPayload"]
+    validated_envelope = namespace["ValidatedEnvelope"]
+    model = envelope.Envelope(payload=_payload_model(payload), note="outer")
+    buffer = model.to_flatbuffer()
+
+    direct = validated_envelope.from_flatbuffer(buffer)
+    from_view = envelope.EnvelopeView.from_buffer(buffer).to_model(
+        validated_envelope
+    )
+    for restored in (direct, from_view):
+        assert type(restored) is validated_envelope
+        assert type(restored.payload) is validated_payload
+        assert restored.payload.was_validated
 
 
 def test_nested_flatbuffer_target_does_not_need_to_be_the_file_root(

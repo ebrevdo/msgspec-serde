@@ -12,6 +12,7 @@ from ._dynamic import (
     register_dynamic_module,
     register_dynamic_type,
 )
+from ._overrides import DynamicModelOverrides
 from ._runtime import (
     BufferBoundsError,
     CachedVector,
@@ -64,6 +65,7 @@ __all__ = [
     "BaseType",
     "BufferBoundsError",
     "CachedVector",
+    "DynamicModelOverrides",
     "DynamicType",
     "DynamicValue",
     "DynamicView",

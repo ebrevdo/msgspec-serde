@@ -1,0 +1,11 @@
+include "pets.fbs";
+
+namespace Tutorial;
+
+table NestedEnvelope {
+  snapshot:[ubyte] (nested_flatbuffer: "Tutorial.PetList");
+  note:string;
+}
+
+root_type NestedEnvelope;
+file_identifier "SNAP";

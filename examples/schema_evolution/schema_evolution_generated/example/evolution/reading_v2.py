@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import struct
+from typing import Self, overload
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 
 from msgspec_flatbuffers import (
+    DynamicModelOverrides,
     InvalidBufferError,
     OpenIntEnum,
     StringVector,
@@ -17,6 +19,7 @@ from msgspec_flatbuffers import (
     TableVector,
     TableView,
 )
+from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types
 from msgspec_flatbuffers._native import NativePlan as _NativePlan
 
 _UINT16 = struct.Struct('<H')
@@ -26,7 +29,7 @@ _UINT8 = struct.Struct('<B')
 _FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x01\xa7objects\x91\x85\xa4name\xb9Example.Evolution.Reading\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x95\x88\xa4name\xa2id\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\x00\xa4kind\xa6scalar\xa6scalar\xa6uint64\x87\xa4name\xa5label\xa4slot\x01\xa6offset\x06\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string\x88\xa4name\xa7samples\xa4slot\x02\xa6offset\x08\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa7float32\x88\xa4name\xa7quality\xa4slot\x03\xa6offset\n\xa8optional\xc2\xa8required\xc2\xa7defaultd\xa4kind\xa6scalar\xa6scalar\xa5uint8\x87\xa4name\xa4note\xa4slot\x04\xa6offset\x0c\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string')
 
 
-class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
+class Reading(msgspec.Struct, kw_only=True, eq=False):
     id: int = 0
     label: str | None = None
     samples: npt.NDArray[np.float32] | None = None
@@ -34,7 +37,7 @@ class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
     note: str | None = None
 
     def __eq__(self, other: object) -> bool:
-        if type(other) is not Reading:
+        if type(other) is not type(self):
             return False
         return (
             (self.id == other.id)
@@ -55,7 +58,20 @@ class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
         offset: int = 0,
         size_prefixed: bool = False,
         check_identifier: bool = True,
-    ) -> Reading:
+        dynamic_overrides: DynamicModelOverrides | None = None,
+    ) -> Self:
+        if cls is Reading and dynamic_overrides is None:
+            return _FB_NATIVE_MODULE.unpack(
+                'Example.Evolution.Reading',
+                buffer,
+                identifier='EVOL',
+                offset=offset,
+                size_prefixed=size_prefixed,
+                check_identifier=check_identifier,
+            )
+        model_types = None if cls is Reading else _resolve_model_types(
+            _FB_NATIVE_MODULE, Reading, cls
+        )
         return _FB_NATIVE_MODULE.unpack(
             'Example.Evolution.Reading',
             buffer,
@@ -63,6 +79,8 @@ class Reading(msgspec.Struct, frozen=True, kw_only=True, eq=False):
             offset=offset,
             size_prefixed=size_prefixed,
             check_identifier=check_identifier,
+            model_types=model_types,
+            dynamic_overrides=dynamic_overrides,
         )
 
     def to_flatbuffer(
@@ -144,11 +162,42 @@ class ReadingView(TableView):
             self._fb_cached_note = value
         return value
 
-    def to_model(self) -> Reading:
+    @overload
+    def to_model(
+        self,
+        *,
+        dynamic_overrides: DynamicModelOverrides | None = None,
+    ) -> Reading: ...
+
+    @overload
+    def to_model[_ModelT: Reading](
+        self,
+        model_type: type[_ModelT],
+        *,
+        dynamic_overrides: DynamicModelOverrides | None = None,
+    ) -> _ModelT: ...
+
+    def to_model(
+        self,
+        model_type: type[Reading] = Reading,
+        *,
+        dynamic_overrides: DynamicModelOverrides | None = None,
+    ) -> Reading:
+        if model_type is Reading and dynamic_overrides is None:
+            return _FB_NATIVE_MODULE.unpack_view(
+                'Example.Evolution.Reading',
+                self._buffer,
+                self._table_offset,
+            )
+        native_types = None if model_type is Reading else _resolve_model_types(
+            _FB_NATIVE_MODULE, Reading, model_type
+        )
         return _FB_NATIVE_MODULE.unpack_view(
             'Example.Evolution.Reading',
             self._buffer,
             self._table_offset,
+            model_types=native_types,
+            dynamic_overrides=dynamic_overrides,
         )
 
 

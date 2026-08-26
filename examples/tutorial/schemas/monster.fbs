@@ -1,0 +1,32 @@
+namespace Tutorial;
+
+enum Color : byte {
+  Red = 1,
+  Green,
+  Blue,
+}
+
+struct Vec3 {
+  x:float;
+  y:float;
+  z:float;
+}
+
+table Weapon {
+  name:string (required);
+  damage:short = 0;
+}
+
+table Monster {
+  pos:Vec3;
+  name:string (required);
+  inventory:[ubyte];
+  color:Color = Blue;
+  weapons:[Weapon];
+  scores:[float];
+  tags:[string];
+  optional_energy:int = null;
+}
+
+root_type Monster;
+file_identifier "MNST";

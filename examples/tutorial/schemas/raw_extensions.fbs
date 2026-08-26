@@ -1,0 +1,13 @@
+namespace Tutorial;
+
+table Extension {
+  type_id:ulong;
+  data:[ubyte];
+}
+
+table ExtensionList {
+  extensions:[Extension];
+}
+
+root_type ExtensionList;
+file_identifier "EXTS";
