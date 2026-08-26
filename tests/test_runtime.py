@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
+from threading import Barrier
 from typing import Any
 
 import flatbuffers
@@ -52,6 +54,16 @@ class FailingVector(CachedVector[int]):
         if self.attempts == 1:
             raise RuntimeError("load failed")
         return index
+
+
+class ConcurrentLoadVector(CachedVector[object]):
+    def __init__(self) -> None:
+        super().__init__(1)
+        self.barrier = Barrier(2)
+
+    def _load(self, index: int) -> object:
+        self.barrier.wait()
+        return object()
 
 
 _SCALAR_BUILDERS = {
@@ -228,8 +240,9 @@ def test_view_rejects_noncontiguous_input() -> None:
         ExampleView(buffer, 0)
 
 
-def test_cached_vector_promotes_without_changing_identity_or_order() -> None:
+def test_full_iteration_materializes_without_changing_identity_or_order() -> None:
     vector = ObjectVector(128)
+    assert isinstance(vector._cache, dict)
     accessed = list(range(127, 63, -1))
     first_values = {index: vector[index] for index in accessed}
 
@@ -238,11 +251,29 @@ def test_cached_vector_promotes_without_changing_identity_or_order() -> None:
     assert vector[64:68] == tuple(first_values[index] for index in range(64, 68))
 
     all_values = tuple(vector)
+    assert isinstance(vector._cache, tuple)
     assert vector.cached_count == 128
     assert tuple(vector) == all_values
     assert vector[:] == all_values
     assert all(all_values[index] is value for index, value in first_values.items())
     assert vector.loaded.count(127) == 1
+
+
+def test_cached_vector_uses_dense_storage_only_through_eight_items() -> None:
+    assert isinstance(ObjectVector(8)._cache, list)
+    assert isinstance(ObjectVector(9)._cache, dict)
+
+
+def test_concurrent_dense_cache_misses_leave_one_cached_value() -> None:
+    vector = ConcurrentLoadVector()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        values = list(executor.map(vector.__getitem__, (0, 0)))
+
+    cached = vector[0]
+    assert vector.cached_count == 1
+    assert cached in values
+    assert vector[0] is cached
 
 
 def test_cached_vector_does_not_cache_loader_exceptions() -> None:

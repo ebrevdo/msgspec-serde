@@ -252,6 +252,11 @@ assert weapons[0].damage == 12
 assert weapons[0] is weapons[0]
 ```
 
+Views can be read concurrently when their backing buffer is not modified.
+Concurrent first access may construct the same deterministic cached value more
+than once. After publication, later accesses reuse the cached value. Completing
+a vector iteration publishes the complete vector cache at once.
+
 Views accept contiguous buffer objects, including `bytes`, `bytearray`,
 `memoryview`, and memory-mapped files. A view exposes its buffer through a
 read-only `memoryview`. Another reference can still change a mutable backing

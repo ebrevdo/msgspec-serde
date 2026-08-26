@@ -81,9 +81,7 @@ _VECTOR_DTYPES: dict[str, np.dtype[Any]] = {
 }
 
 _MISSING: Any = object()
-_CACHE_PROMOTION_MIN = 64
-_CACHE_PROMOTION_FACTOR = 8
-_DENSE_CACHE_MAX = 1024
+_DENSE_CACHE_LIMIT = 8
 _NUMPY_VECTOR_MIN = 32
 _INTEGER_UNPACKER_FORMATS = {
     ("i", 1): "<b",
@@ -246,6 +244,14 @@ def _string_from_offset(buffer: memoryview, offset: int) -> str:
     return bytes(buffer[start : start + length]).decode("utf-8")
 
 
+def _cache_materialized_prefix(
+    cache: dict[int, _T],
+    values: list[_T],
+) -> None:
+    for index, value in enumerate(values):
+        cache.setdefault(index, value)
+
+
 def build_scalar_vector(
     builder: flatbuffers.Builder,
     values: Sequence[Any] | npt.NDArray[Any],
@@ -382,7 +388,7 @@ def build_string_vector(
 class CachedVector(Sequence[_T], Generic[_T]):
     """A fixed-length vector that strongly caches every accessed element."""
 
-    __slots__ = ("_cache", "_cached_count", "_length")
+    __slots__ = ("_cache", "_length")
 
     def __init__(self, length: int) -> None:
         if length < 0:
@@ -390,12 +396,11 @@ class CachedVector(Sequence[_T], Generic[_T]):
         self._length = length
         if length == 0:
             cache: dict[int, _T] | list[Any] | tuple[_T, ...] = ()
-        elif length <= _DENSE_CACHE_MAX:
+        elif length <= _DENSE_CACHE_LIMIT:
             cache = [_MISSING] * length
         else:
             cache = {}
         self._cache = cache
-        self._cached_count = 0
 
     def __len__(self) -> int:
         return self._length
@@ -411,19 +416,14 @@ class CachedVector(Sequence[_T], Generic[_T]):
 
     def __getitem__(self, index: int | slice) -> _T | tuple[_T, ...]:
         cache = self._cache
-        if self._cached_count == self._length:
+        if type(cache) is tuple:
             if isinstance(index, slice):
-                if isinstance(cache, list):
-                    cache = tuple(cache)
-                    self._cache = cache
                 return cache[index]
             return cache[index]
 
-        mutable_cache: dict[int, _T] | list[Any] = (  # ty: ignore[invalid-assignment]
-            cache
-        )
-        cache = mutable_cache
         if isinstance(index, slice):
+            if index == slice(None):
+                return tuple(self)
             return tuple(self[item] for item in range(*index.indices(self._length)))
 
         length = self._length
@@ -432,87 +432,81 @@ class CachedVector(Sequence[_T], Generic[_T]):
         if index < 0 or index >= length:
             raise IndexError("FlatBuffers vector index out of range")
 
-        if isinstance(cache, list):
+        if type(cache) is list:
             value = cache[index]
             if value is not _MISSING:
                 return value
         else:
-            value = cache.get(index, _MISSING)
+            sparse_cache: dict[int, _T] = cache  # ty: ignore[invalid-assignment]
+            value = sparse_cache.get(index, _MISSING)
             if value is not _MISSING:
                 return value
 
         value = self._load(index)
-        cache[index] = value
-        cached_count = self._cached_count + 1
-        self._cached_count = cached_count
-        if cached_count == length:
-            if not isinstance(cache, list):
-                self._cache = [cache[item] for item in range(length)]
-        elif not isinstance(cache, list) and (
-            cached_count >= _CACHE_PROMOTION_MIN
-            and cached_count * _CACHE_PROMOTION_FACTOR >= length
-        ):
-            self._promote_cache(cache)
-        return value
+        if type(cache) is list:
+            cache[index] = value
+            return value
+        return sparse_cache.setdefault(index, value)
 
     def __iter__(self) -> Iterator[_T]:
         cache = self._cache
-        if self._cached_count == self._length:
+        if type(cache) is tuple:
             return iter(cache)
-        if isinstance(cache, list):
-            return self._iter_dense(cache, 0)
-        sparse_cache: dict[int, _T] = cache  # ty: ignore[invalid-assignment]
-        return self._iter_sparse(sparse_cache)
+        mutable_cache: dict[int, _T] | list[Any] = (  # ty: ignore[invalid-assignment]
+            cache
+        )
+        return self._iter_materializing(mutable_cache)
 
-    def _promote_cache(self, cache: dict[int, _T]) -> list[Any]:
-        dense_cache = [_MISSING] * self._length
-        for index, value in cache.items():
-            dense_cache[index] = value
-        self._cache = dense_cache
-        return dense_cache
-
-    def _iter_sparse(self, cache: dict[int, _T]) -> Iterator[_T]:
+    def _iter_materializing(
+        self,
+        cache: dict[int, _T] | list[Any],
+    ) -> Iterator[_T]:
         load = self._load
-        get = cache.get
-        cached_count = self._cached_count
-        length = self._length
-        for index in range(length):
+        materialized: list[_T] = []
+        if type(cache) is list:
+            for index in range(self._length):
+                value = cache[index]
+                if value is _MISSING:
+                    value = load(index)
+                    cache[index] = value
+                materialized.append(value)
+                yield value
+            self._cache = tuple(materialized)
+            return
+
+        sparse_cache: dict[int, _T] = cache  # ty: ignore[invalid-assignment]
+        if not sparse_cache:
+            published = False
+            try:
+                for index in range(self._length):
+                    value = load(index)
+                    materialized.append(value)
+                    yield value
+                self._cache = tuple(materialized)
+                published = True
+            finally:
+                if not published:
+                    _cache_materialized_prefix(sparse_cache, materialized)
+            return
+
+        get = sparse_cache.get
+        for index in range(self._length):
             value = get(index, _MISSING)
             if value is _MISSING:
                 value = load(index)
-                cache[index] = value
-                cached_count += 1
-                self._cached_count = cached_count
-                if (
-                    cached_count == length
-                    or (
-                        cached_count >= _CACHE_PROMOTION_MIN
-                        and cached_count * _CACHE_PROMOTION_FACTOR >= length
-                    )
-                ):
-                    dense_cache = self._promote_cache(cache)
-                    yield value
-                    yield from self._iter_dense(dense_cache, index + 1)
-                    return
+                sparse_cache[index] = value
+            materialized.append(value)
             yield value
-
-    def _iter_dense(self, cache: list[Any], start: int) -> Iterator[_T]:
-        load = self._load
-        cached_count = self._cached_count
-        for index in range(start, self._length):
-            value = cache[index]
-            if value is _MISSING:
-                value = load(index)
-                cache[index] = value
-                cached_count += 1
-                self._cached_count = cached_count
-            yield value
+        self._cache = tuple(materialized)
 
     @property
     def cached_count(self) -> int:
         """Number of vector elements materialized so far."""
 
-        return self._cached_count
+        cache = self._cache
+        if type(cache) is list:
+            return len(cache) - cache.count(_MISSING)
+        return len(cache)
 
 
 class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
@@ -662,7 +656,10 @@ class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
                     f"vtable at offset {vtable_offset} with size {vtable_size} "
                     f"exceeds a {buffer_size}-byte buffer"
                 )
-            self._vtable_cache[vtable_offset] = (vtable_size, object_size)
+            vtable_size, object_size = self._vtable_cache.setdefault(
+                vtable_offset,
+                (vtable_size, object_size),
+            )
         else:
             vtable_size, object_size = metadata
         if target > buffer_size - object_size:
@@ -692,9 +689,7 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
 
     __slots__ = (
         "_buffer",
-        "_last_object_size",
-        "_last_vtable_offset",
-        "_last_vtable_size",
+        "_last_vtable",
         "_start",
         "_trusted_construction",
         "_view_type",
@@ -724,9 +719,7 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
             view_type,
             TableView,
         )
-        self._last_vtable_offset: int | None = None
-        self._last_vtable_size = 0
-        self._last_object_size = 0
+        self._last_vtable: tuple[int, int, int] | None = None
 
     def _load(self, index: int) -> _ViewT:
         offset = self._start + index * _UINT32.size
@@ -751,9 +744,9 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
             )
         vtable_distance = _INT32.unpack_from(buffer, target)[0]
         vtable_offset = target - vtable_distance
-        if vtable_offset == self._last_vtable_offset:
-            vtable_size = self._last_vtable_size
-            object_size = self._last_object_size
+        last_vtable = self._last_vtable
+        if last_vtable is not None and vtable_offset == last_vtable[0]:
+            _, vtable_size, object_size = last_vtable
         else:
             if (
                 vtable_offset < 0
@@ -776,9 +769,7 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
                     f"vtable at offset {vtable_offset} with size {vtable_size} "
                     f"exceeds a {buffer_size}-byte buffer"
                 )
-            self._last_vtable_offset = vtable_offset
-            self._last_vtable_size = vtable_size
-            self._last_object_size = object_size
+            self._last_vtable = (vtable_offset, vtable_size, object_size)
 
         if target > buffer_size - object_size:
             raise BufferBoundsError(
@@ -795,11 +786,18 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
         view._object_size = object_size
         return view
 
-    def _iter_dense(self, cache: list[Any], start: int) -> Iterator[_ViewT]:
+    def _iter_materializing(
+        self,
+        cache: dict[int, _ViewT] | list[Any],
+    ) -> Iterator[_ViewT]:
         if not self._trusted_construction:
-            yield from super()._iter_dense(cache, start)
+            yield from super()._iter_materializing(cache)
             return
 
+        sparse = type(cache) is dict
+        cold_sparse = sparse and not cache
+        published = False
+        materialized: list[_ViewT] = []
         buffer = self._buffer
         buffer_size = len(buffer)
         vector_start = self._start
@@ -810,82 +808,85 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
         uint16_size = _UINT16.size
         uint32_size = _UINT32.size
         int32_size = _INT32.size
-        last_vtable_offset = self._last_vtable_offset
-        last_vtable_size = self._last_vtable_size
-        last_object_size = self._last_object_size
-        cached_count = self._cached_count
-        for index in range(start, self._length):
-            value = cache[index]
-            if value is _MISSING:
-                offset = vector_start + index * uint32_size
-                relative = uint32_unpack(buffer, offset)[0]
-                if relative == 0:
-                    raise InvalidBufferError(
-                        "table vector element contains a null offset"
-                    )
-                target = offset + relative
-                if target >= buffer_size:
-                    raise BufferBoundsError(
-                        f"table vector element target at offset {target} "
-                        f"with size 1 exceeds a {buffer_size}-byte buffer"
-                    )
-                if target > buffer_size - int32_size:
-                    raise BufferBoundsError(
-                        f"table header at offset {target} with size "
-                        f"{int32_size} exceeds a {buffer_size}-byte buffer"
-                    )
-                vtable_distance = int32_unpack(buffer, target)[0]
-                vtable_offset = target - vtable_distance
-                if vtable_offset == last_vtable_offset:
-                    vtable_size = last_vtable_size
-                    object_size = last_object_size
+        last_vtable = self._last_vtable
+        try:
+            for index in range(self._length):
+                if cold_sparse:
+                    value = _MISSING
+                elif sparse:
+                    value = cache.get(index, _MISSING)
                 else:
-                    if (
-                        vtable_offset < 0
-                        or vtable_offset > buffer_size - _VTABLE_HEADER_SIZE
-                    ):
-                        raise BufferBoundsError(
-                            f"vtable header at offset {vtable_offset} with size "
-                            f"{_VTABLE_HEADER_SIZE} exceeds a "
-                            f"{buffer_size}-byte buffer"
-                        )
-                    vtable_size = uint16_unpack(buffer, vtable_offset)[0]
-                    object_size = uint16_unpack(
-                        buffer,
-                        vtable_offset + uint16_size,
-                    )[0]
-                    if vtable_size < 4 or vtable_size % 2 or object_size < 4:
+                    value = cache[index]
+                if value is _MISSING:
+                    offset = vector_start + index * uint32_size
+                    relative = uint32_unpack(buffer, offset)[0]
+                    if relative == 0:
                         raise InvalidBufferError(
-                            "invalid FlatBuffers table metadata"
+                            "table vector element contains a null offset"
                         )
-                    if vtable_offset > buffer_size - vtable_size:
+                    target = offset + relative
+                    if target >= buffer_size:
                         raise BufferBoundsError(
-                            f"vtable at offset {vtable_offset} with size "
-                            f"{vtable_size} exceeds a {buffer_size}-byte buffer"
+                            f"table vector element target at offset {target} "
+                            f"with size 1 exceeds a {buffer_size}-byte buffer"
                         )
-                    last_vtable_offset = vtable_offset
-                    last_vtable_size = vtable_size
-                    last_object_size = object_size
-                    self._last_vtable_offset = vtable_offset
-                    self._last_vtable_size = vtable_size
-                    self._last_object_size = object_size
-                if target > buffer_size - object_size:
-                    raise BufferBoundsError(
-                        f"table at offset {target} with size {object_size} "
-                        f"exceeds a {buffer_size}-byte buffer"
-                    )
-                view: Any = view_type.__new__(view_type)
-                view._cache_storage = None
-                view._buffer = buffer
-                view._table_offset = target
-                view._vtable_offset = vtable_offset
-                view._vtable_size = vtable_size
-                view._object_size = object_size
-                value = view
-                cache[index] = value
-                cached_count += 1
-                self._cached_count = cached_count
-            yield value
+                    if target > buffer_size - int32_size:
+                        raise BufferBoundsError(
+                            f"table header at offset {target} with size "
+                            f"{int32_size} exceeds a {buffer_size}-byte buffer"
+                        )
+                    vtable_distance = int32_unpack(buffer, target)[0]
+                    vtable_offset = target - vtable_distance
+                    if last_vtable is not None and vtable_offset == last_vtable[0]:
+                        _, vtable_size, object_size = last_vtable
+                    else:
+                        if (
+                            vtable_offset < 0
+                            or vtable_offset > buffer_size - _VTABLE_HEADER_SIZE
+                        ):
+                            raise BufferBoundsError(
+                                f"vtable header at offset {vtable_offset} with size "
+                                f"{_VTABLE_HEADER_SIZE} exceeds a "
+                                f"{buffer_size}-byte buffer"
+                            )
+                        vtable_size = uint16_unpack(buffer, vtable_offset)[0]
+                        object_size = uint16_unpack(
+                            buffer,
+                            vtable_offset + uint16_size,
+                        )[0]
+                        if vtable_size < 4 or vtable_size % 2 or object_size < 4:
+                            raise InvalidBufferError(
+                                "invalid FlatBuffers table metadata"
+                            )
+                        if vtable_offset > buffer_size - vtable_size:
+                            raise BufferBoundsError(
+                                f"vtable at offset {vtable_offset} with size "
+                                f"{vtable_size} exceeds a {buffer_size}-byte buffer"
+                            )
+                        last_vtable = (vtable_offset, vtable_size, object_size)
+                        self._last_vtable = last_vtable
+                    if target > buffer_size - object_size:
+                        raise BufferBoundsError(
+                            f"table at offset {target} with size {object_size} "
+                            f"exceeds a {buffer_size}-byte buffer"
+                        )
+                    view: Any = view_type.__new__(view_type)
+                    view._cache_storage = None
+                    view._buffer = buffer
+                    view._table_offset = target
+                    view._vtable_offset = vtable_offset
+                    view._vtable_size = vtable_size
+                    view._object_size = object_size
+                    value = view
+                    if not cold_sparse:
+                        cache[index] = value
+                materialized.append(value)
+                yield value
+            self._cache = tuple(materialized)
+            published = True
+        finally:
+            if cold_sparse and not published:
+                _cache_materialized_prefix(cache, materialized)
 
 
 class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
@@ -944,28 +945,45 @@ class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
         view._struct_offset = offset
         return view
 
-    def _iter_dense(self, cache: list[Any], start: int) -> Iterator[_ViewT]:
+    def _iter_materializing(
+        self,
+        cache: dict[int, _ViewT] | list[Any],
+    ) -> Iterator[_ViewT]:
         if not self._trusted_construction:
-            yield from super()._iter_dense(cache, start)
+            yield from super()._iter_materializing(cache)
             return
 
+        sparse = type(cache) is dict
+        cold_sparse = sparse and not cache
+        published = False
+        materialized: list[_ViewT] = []
         view_type = self._view_type
         buffer = self._buffer
         vector_start = self._start
         stride = self._stride
-        cached_count = self._cached_count
-        for index in range(start, self._length):
-            value = cache[index]
-            if value is _MISSING:
-                view: Any = view_type.__new__(view_type)
-                view._cache_storage = None
-                view._buffer = buffer
-                view._struct_offset = vector_start + index * stride
-                value = view
-                cache[index] = value
-                cached_count += 1
-                self._cached_count = cached_count
-            yield value
+        try:
+            for index in range(self._length):
+                if cold_sparse:
+                    value = _MISSING
+                elif sparse:
+                    value = cache.get(index, _MISSING)
+                else:
+                    value = cache[index]
+                if value is _MISSING:
+                    view: Any = view_type.__new__(view_type)
+                    view._cache_storage = None
+                    view._buffer = buffer
+                    view._struct_offset = vector_start + index * stride
+                    value = view
+                    if not cold_sparse:
+                        cache[index] = value
+                materialized.append(value)
+                yield value
+            self._cache = tuple(materialized)
+            published = True
+        finally:
+            if cold_sparse and not published:
+                _cache_materialized_prefix(cache, materialized)
 
 
 class StringVector(CachedVector[str]):

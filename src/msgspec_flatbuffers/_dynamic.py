@@ -22,7 +22,7 @@ _OPAQUE_DATA_FIELD = "__msgspec_flatbuffers_data__"
 _KNOWN_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _DYNAMIC_VALUE_FIELD))
 _OPAQUE_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _OPAQUE_DATA_FIELD))
 _ABSENT: Any = object()
-_MAX_NEGATIVE_ENTRIES_PER_INDEX = 1024
+_MODEL_RESOLUTION_CACHE_LIMIT = 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,18 +41,21 @@ class _DynamicTypeRegistry:
         "_by_model",
         "_by_tag",
         "_lock",
+        "_model_resolution_cache",
         "_modules",
-        "_negative_model_count",
-        "_negative_tag_count",
+        "_registration_version",
     )
 
     def __init__(self) -> None:
-        self._by_model: dict[type[object], DynamicType | None] = {}
-        self._by_tag: dict[str, DynamicType | None] = {}
+        self._by_model: dict[type[object], DynamicType] = {}
+        self._by_tag: dict[str, DynamicType] = {}
         self._lock = Lock()
         self._modules: dict[str, str] = {}
-        self._negative_model_count = 0
-        self._negative_tag_count = 0
+        self._model_resolution_cache: dict[
+            type[object],
+            tuple[int, DynamicType | None],
+        ] = {}
+        self._registration_version = 0
 
     def register(
         self,
@@ -77,11 +80,9 @@ class _DynamicTypeRegistry:
                 return tag_entry
             if model_entry is not None:
                 return model_entry
-            self._discard_cached_tag_miss(entry.tag)
-            if self._by_model.get(entry.model_type, _ABSENT) is None:
-                self._negative_model_count -= 1
             self._by_tag[entry.tag] = entry
             self._by_model[entry.model_type] = entry
+            self._registration_version += 1
         return entry
 
     def register_module(self, tag: str, module: str) -> str:
@@ -97,71 +98,60 @@ class _DynamicTypeRegistry:
                     f"dynamic FlatBuffer tag {tag!r} already maps to {existing!r}"
                 )
             self._modules[tag] = module
-            self._discard_cached_tag_miss(tag)
         return module
 
     def lookup_tag(self, tag: str) -> DynamicType | None:
         """Return the entry for a tag, importing its trusted module if needed."""
 
-        try:
-            return self._by_tag[tag]
-        except KeyError:
-            return self._load_or_cache_tag(tag)
+        entry = self._by_tag.get(tag)
+        if entry is not None:
+            return entry
+        return self._load_tag(tag)
 
     def lookup_model(self, model_type: type[object]) -> DynamicType | None:
         """Return the entry for a registered model or unambiguous subclass."""
 
-        try:
-            entry = self._by_model[model_type]
-        except KeyError:
-            with self._lock:
-                entry = self._by_model.get(model_type, _ABSENT)
-                if entry is _ABSENT:
-                    if self._negative_model_count < _MAX_NEGATIVE_ENTRIES_PER_INDEX:
-                        self._by_model[model_type] = None
-                        self._negative_model_count += 1
-                    entry = None
+        entry = self._by_model.get(model_type)
         if entry is not None:
             return entry
 
-        matches: set[DynamicType] = set()
+        version = self._registration_version
+        cached = self._model_resolution_cache.get(model_type)
+        if cached is not None:
+            cached_version, cached_resolution = cached
+            if cached_version == version:
+                return cached_resolution
+
+        resolved: DynamicType | None = None
         for base in getattr(model_type, "__mro__", ())[1:]:
             candidate = self._by_model.get(base)
-            if candidate is not None:
-                matches.add(candidate)
-        if len(matches) > 1:
-            raise TypeError(
-                f"dynamic FlatBuffer model {model_type.__qualname__} has "
-                "multiple registered bases"
-            )
-        return next(iter(matches), None)
+            if candidate is None:
+                continue
+            if resolved is not None and candidate != resolved:
+                raise TypeError(
+                    f"dynamic FlatBuffer model {model_type.__qualname__} has "
+                    "multiple registered bases"
+                )
+            resolved = candidate
 
-    def _discard_cached_tag_miss(self, tag: str) -> None:
-        if self._by_tag.get(tag, _ABSENT) is None:
-            del self._by_tag[tag]
-            self._negative_tag_count -= 1
+        cache = self._model_resolution_cache
+        if model_type in cache or len(cache) < _MODEL_RESOLUTION_CACHE_LIMIT:
+            cache[model_type] = (version, resolved)
+        return resolved
 
-    def _load_or_cache_tag(self, tag: str) -> DynamicType | None:
-        with self._lock:
-            entry = self._by_tag.get(tag, _ABSENT)
-            if entry is not _ABSENT:
-                return entry
-            module = self._modules.get(tag)
-            if module is None:
-                if self._negative_tag_count < _MAX_NEGATIVE_ENTRIES_PER_INDEX:
-                    self._by_tag[tag] = None
-                    self._negative_tag_count += 1
-                return None
+    def _load_tag(self, tag: str) -> DynamicType | None:
+        module = self._modules.get(tag)
+        if module is None:
+            return None
 
         import_module(module)
 
-        with self._lock:
-            entry = self._by_tag.get(tag, _ABSENT)
-            if entry is _ABSENT or entry is None:
-                raise RuntimeError(
-                    f"dynamic FlatBuffer module {module!r} did not register {tag!r}"
-                )
-            return entry
+        entry = self._by_tag.get(tag)
+        if entry is None:
+            raise RuntimeError(
+                f"dynamic FlatBuffer module {module!r} did not register {tag!r}"
+            )
+        return entry
 
 
 class DynamicValue:

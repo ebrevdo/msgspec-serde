@@ -477,7 +477,7 @@ def test_dynamic_field_rejects_inconsistent_wire_values(
         _ = inconsistent.payload
 
 
-def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
+def test_dynamic_registry_supports_concurrent_registration() -> None:
     class Model(msgspec.Struct):
         value: int
 
@@ -491,39 +491,63 @@ def test_dynamic_registry_replaces_negative_cache_atomically() -> None:
     class OtherView(View):
         pass
 
+    tag = "Registry.Model"
     registry = type(dynamic_types)()
-    assert registry.lookup_tag("Registry.Model") is None
+    assert registry.lookup_tag(tag) is None
     assert registry.lookup_model(Model) is None
 
     with ThreadPoolExecutor(max_workers=8) as executor:
-        misses = list(executor.map(registry.lookup_tag, ["Registry.Model"] * 32))
+        misses = list(executor.map(registry.lookup_tag, [tag] * 32))
     assert misses == [None] * 32
 
-    entry = registry.register("Registry.Model", Model, View)
-    assert registry.register("Registry.Model", Model, View) is entry
-    assert registry.lookup_tag("Registry.Model") is entry
+    entry = registry.register(tag, Model, View)
+    assert registry.register(tag, Model, View) is entry
+    assert registry.lookup_tag(tag) is entry
     assert registry.lookup_model(Model) is entry
 
     racing = type(dynamic_types)()
     barrier = Barrier(9)
 
-    def lookup() -> object:
+    def lookup_tag() -> object:
         barrier.wait()
-        return racing.lookup_tag("Registry.Model")
+        return racing.lookup_tag(tag)
 
-    def register() -> object:
+    def register_type() -> object:
         barrier.wait()
-        return racing.register("Registry.Model", Model, View)
+        return racing.register(tag, Model, View)
 
     with ThreadPoolExecutor(max_workers=9) as executor:
-        readers = [executor.submit(lookup) for _ in range(8)]
-        writer = executor.submit(register)
+        readers = [executor.submit(lookup_tag) for _ in range(8)]
+        writer = executor.submit(register_type)
     registered = writer.result()
-    assert all(result.result() in (None, registered) for result in readers)
-    assert racing.lookup_tag("Registry.Model") is registered
+    observed = [reader.result() for reader in readers]
+    assert all(result in (None, registered) for result in observed)
+    assert racing.lookup_tag(tag) is registered
 
     with pytest.raises(ValueError, match="conflicts"):
-        registry.register("Registry.Model", Model, OtherView)
+        registry.register(tag, Model, OtherView)
+
+
+def test_dynamic_registry_invalidates_cached_subclass_resolution() -> None:
+    class Model(msgspec.Struct):
+        value: int
+
+        def to_flatbuffer(self) -> bytes:
+            return b"buffer"
+
+    class Child(Model):
+        pass
+
+    class View(TableView):
+        def to_model(self) -> Model:
+            return Model(1)
+
+    registry = type(dynamic_types)()
+    assert registry.lookup_model(Child) is None
+
+    entry = registry.register("Registry.Model", Model, View)
+
+    assert registry.lookup_model(Child) is entry
 
 
 def test_lazy_dynamic_module_imports_outside_registry_lock(

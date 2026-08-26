@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_int, c_void};
 use std::mem::size_of;
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use flatbuffers::{
@@ -17,6 +17,7 @@ use pyo3::exceptions::{
 };
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList, PyMemoryView, PyModule, PyString, PyTuple, PyType};
 use rmpv::Value;
 use serde::Deserialize;
@@ -1134,7 +1135,17 @@ impl NativePlan {
         self.bound_type(py, &target.name)
     }
 
+    fn lock_model_subclass_cache(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<MutexGuard<'_, HashMap<usize, BoundModelSubclass>>> {
+        self.model_subclass_cache
+            .lock_py_attached(py)
+            .map_err(|_| PyRuntimeError::new_err("native model subclass cache is poisoned"))
+    }
+
     fn model_object_index(&self, model: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let py = model.py();
         let bound_types = self
             .bound_types
             .get()
@@ -1144,12 +1155,7 @@ impl NativePlan {
         if let Some(index) = bound_types.by_pointer.get(&pointer) {
             return Ok(*index);
         }
-        if let Some(entry) = self
-            .model_subclass_cache
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("native model subclass cache is poisoned"))?
-            .get(&pointer)
-        {
+        if let Some(entry) = self.lock_model_subclass_cache(py)?.get(&pointer) {
             return Ok(entry.object_index);
         }
 
@@ -1172,7 +1178,7 @@ impl NativePlan {
                 model_type.name()?,
             )));
         };
-        let generated_type = self.bound_type(model.py(), &self.objects[*object_index].name)?;
+        let generated_type = self.bound_type(py, &self.objects[*object_index].name)?;
         let model_fields = model_type
             .getattr("__struct_fields__")?
             .cast_into::<PyTuple>()?;
@@ -1190,16 +1196,13 @@ impl NativePlan {
                 generated_type.name()?,
             )));
         }
-        self.model_subclass_cache
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("native model subclass cache is poisoned"))?
-            .insert(
-                pointer,
-                BoundModelSubclass {
-                    _type_owner: model_type.unbind(),
-                    object_index: *object_index,
-                },
-            );
+        self.lock_model_subclass_cache(py)?.insert(
+            pointer,
+            BoundModelSubclass {
+                _type_owner: model_type.unbind(),
+                object_index: *object_index,
+            },
+        );
         Ok(*object_index)
     }
 

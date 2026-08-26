@@ -274,6 +274,7 @@ def test_fully_cached_vector_preserves_dense_index_and_slice_semantics() -> None
     values = tuple(vector)
 
     assert vector.cached_count == len(vector)
+    assert isinstance(vector._cache, tuple)
     assert tuple(value.index for value in values) == tuple(range(128))
     assert all(values[index] is value for index, value in seeded.items())
     assert vector[-1] is values[-1]

@@ -23,15 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, macos-15]
+        python: ["3.14", "3.14t"]
         include:
           - os: ubuntu-24.04
             python: "3.12"
           - os: ubuntu-24.04
             python: "3.13"
-          - os: ubuntu-24.04
-            python: "3.14"
-          - os: macos-15
-            python: "3.14"
           - os: windows-2025
             python: "3.14"
 
@@ -96,6 +94,12 @@ jobs:
 
       - name: Run tests
         run: uv run --locked pytest -q
+
+      - name: Verify free-threaded execution remains enabled
+        if: endsWith(matrix.python, 't')
+        run: >-
+          uv run --locked python -c "import sys; import msgspec_flatbuffers;
+          assert not sys._is_gil_enabled()"
 
       - name: Minimize uv cache
         if: always()
