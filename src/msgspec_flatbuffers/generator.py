@@ -18,6 +18,7 @@ from ._dynamic import (
     _OPAQUE_DATA_FIELD,
     dynamic_allow_prefix,
 )
+from ._version import __version__ as _GENERATOR_VERSION
 from .compiler import StrPath, compile_schema
 from .schema import (
     BaseType,
@@ -2214,10 +2215,14 @@ def render_module(
         "import numpy.typing as npt",
         "",
         "from msgspec_flatbuffers import (",
+        "    _check_generated_code_version,",
         *(f"    {name}," for name in runtime_imports),
         ")",
         "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types",
         "from msgspec_flatbuffers._native import NativePlan as _NativePlan",
+        "",
+        f"__msgspec_flatbuffers_generated_version__ = {_GENERATOR_VERSION!r}",
+        "_check_generated_code_version(__msgspec_flatbuffers_generated_version__)",
     ]
     if enum_dependency_modules:
         lines.append("")

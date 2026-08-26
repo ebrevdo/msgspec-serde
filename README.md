@@ -1,18 +1,21 @@
 # msgspec-flatbuffers
 
+## Tutorial
+
 `msgspec-flatbuffers` generates Python modules from FlatBuffers IDL (`.fbs`)
-files. Each generated table or struct has two representations:
+files. Every generated table and struct provides two Python interfaces:
 
-- Read-only views borrow a FlatBuffer and decode fields when you access them.
-- Mutable [`msgspec.Struct`](https://jcristharif.com/msgspec/) models own their
-  data and can build new FlatBuffers.
+- A read-only view borrows a FlatBuffer and decodes each field when you access
+  it.
+- A mutable [`msgspec.Struct`](https://jcristharif.com/msgspec/) model owns its
+  data and can build a new FlatBuffer.
 
-This tutorial starts with a model and a lazy view for one table. It then covers
-mutable snapshots, validation through subclasses, JSON, unions, typed nested
-FlatBuffers, and dynamic payloads. The complete example is checked in at
+The tutorial starts with a model and a view for one table. Later sections add
+owned snapshots, validation through subclasses, JSON, unions, typed nested
+FlatBuffers, and dynamic payloads. You can also run the complete example in
 [`examples/tutorial`](https://github.com/ebrevdo/msgspec_flatbuffers/tree/main/examples/tutorial).
 
-## Run the finished tutorial
+### Run the finished tutorial
 
 From the repository root:
 
@@ -34,9 +37,9 @@ Cat nightly snapshot
 Tutorial.Metric
 ```
 
-The fourth line is the complete JSON representation of the `Monster` model.
+The fourth line contains the complete `Monster` model as JSON.
 
-## 1. Install the tools
+### 1. Install the tools
 
 Install the Python package:
 
@@ -59,10 +62,10 @@ FlatBuffers compiler, `flatc`:
 flatc --version
 ```
 
-`flatc` is needed during generation. Programs that import an already generated
-module do not run `flatc`.
+Only generation requires `flatc`. Importing and using a generated module does
+not run it.
 
-## 2. Write a schema
+### 2. Write a schema
 
 Create a project directory:
 
@@ -108,7 +111,7 @@ root_type Monster;
 file_identifier "MNST";
 ```
 
-## 3. Generate the Python module
+### 3. Generate the Python module
 
 Generate into a new `generated/` directory:
 
@@ -120,14 +123,14 @@ msgspec-flatbuffers generate \
 ```
 
 This command writes `generated/tutorial/monster.py`. The `Tutorial` namespace
-maps to the `tutorial/` package directory, and the `Monster` root table maps to
-the `monster.py` module.
+becomes the `tutorial/` package directory. The `Monster` root table becomes the
+`monster.py` module.
 
-By default, each definition gets a module under its namespace package, matching
-`flatc --python`. For example, `Tutorial.Weapon` is written to
-`generated/tutorial/weapon.py`. The root module re-exports dependency names
-when they are unambiguous, so the tutorial can import `Weapon` from
-`tutorial.monster`. The command prints the path to the root table's module.
+By default, the generator writes each definition to its own module under the
+namespace package, matching `flatc --python`. For example, `Tutorial.Weapon`
+becomes `generated/tutorial/weapon.py`. The root module re-exports dependency
+names when they are unambiguous, so the tutorial can import `Weapon` from
+`tutorial.monster`. The command prints the path of the root table's module.
 
 Use `--gen-onefile` to place every definition from a schema in one module:
 
@@ -139,17 +142,17 @@ msgspec-flatbuffers generate \
   --gen-onefile
 ```
 
-This writes `generated/monster.py` without a namespace directory. If two
-definitions have the same short name, one-file generation rejects the schema.
-The default definition-per-module layout keeps those definitions separate.
+This writes all definitions to `generated/monster.py`, without a namespace
+directory. One-file generation rejects a schema when two definitions have the
+same short name. The default layout places those definitions in separate
+modules.
 
 You may pass several schema paths in one command. Use `-I` to add directories
-for FlatBuffers `include` statements. Generate included schemas with the same
-one-file setting as the schemas that import them.
+for FlatBuffers `include` statements. The included schemas and the schemas that
+import them must use the same one-file setting.
 
-The examples below add `generated/` to `PYTHONPATH`. An application can instead
-generate modules directly into its source tree. Use `--package` to add a package
-prefix:
+The examples below add `generated/` to `PYTHONPATH`. To generate modules inside
+an application's source tree, use `--package` to add a package prefix:
 
 ```shell
 msgspec-flatbuffers generate \
@@ -159,12 +162,12 @@ msgspec-flatbuffers generate \
   --package my_application.generated
 ```
 
-The generated root module can then be imported as
+You can then import the generated root module as
 `my_application.generated.tutorial.monster`.
 
-## 4. Build a FlatBuffer from a model
+### 4. Build a FlatBuffer from a model
 
-The generated module contains a model and a view for each table and struct.
+The generated module contains a model and a view for every table and struct.
 Create `demo.py`:
 
 ```python
@@ -196,15 +199,15 @@ PYTHONPATH=generated python demo.py
 
 Later snippets extend the same `demo.py`.
 
-`to_flatbuffer()` returns a read-only `memoryview`. Convert it only when another
-API specifically requires `bytes`:
+`to_flatbuffer()` returns a read-only `memoryview`. Convert the result only when
+another API requires `bytes`:
 
 ```python
 owned_bytes = bytes(buffer)
 ```
 
-The default `initial_size=0` uses an automatic estimate. Pass a positive value
-to set a minimum initial allocation:
+With the default `initial_size=0`, `to_flatbuffer()` estimates the initial
+allocation. Pass a positive value to set a minimum initial allocation:
 
 ```python
 buffer = monster.to_flatbuffer(initial_size=4096)
@@ -212,9 +215,9 @@ buffer = monster.to_flatbuffer(initial_size=4096)
 
 `to_flatbuffer()` grows the allocation if the estimate is too small.
 
-## 5. Read fields without materializing the object
+### 5. Read fields without materializing the object
 
-A view reads directly from the FlatBuffer:
+A view borrows the FlatBuffer and decodes fields as you access them:
 
 ```python
 from tutorial.monster import MonsterView
@@ -230,8 +233,8 @@ assert view.inventory is not None
 assert view.inventory.readonly
 ```
 
-The view does not copy numeric or byte vectors. Numeric vectors are read-only
-NumPy arrays over the FlatBuffer:
+Views return numeric and byte vectors without copying them. A numeric vector is
+a read-only NumPy array over the FlatBuffer:
 
 ```python
 assert view.scores is not None
@@ -250,13 +253,14 @@ assert weapons[0] is weapons[0]
 ```
 
 Views accept contiguous buffer objects, including `bytes`, `bytearray`,
-`memoryview`, and memory-mapped files. A view exposes a read-only `memoryview`,
-but it cannot prevent another reference from changing a mutable backing object.
-Do not mutate that backing object while the view is in use.
+`memoryview`, and memory-mapped files. A view exposes its buffer through a
+read-only `memoryview`. Another reference can still change a mutable backing
+object such as a `bytearray`, so do not mutate the backing object while a view
+uses it.
 
-## 6. Materialize independent Python data
+### 6. Materialize independent Python data
 
-Call `to_model()` when you want an owned snapshot:
+Call `to_model()` to copy the data into an owned model:
 
 ```python
 restored = view.to_model()
@@ -268,15 +272,15 @@ assert restored.scores.flags.owndata
 assert restored.scores.flags.writeable
 ```
 
-You can skip the view when the model is the only result you need:
+When you only need the model, decode it directly:
 
 ```python
 restored = Monster.from_flatbuffer(buffer)
 ```
 
-Both calls copy the complete object graph. Numeric vectors become writable,
-owning NumPy arrays. Other non-byte vectors become Python lists. Separate calls
-return separate snapshots.
+Both decoding methods copy the complete object graph. Numeric vectors become
+writable NumPy arrays that own their storage. Other non-byte vectors become
+Python lists. Each call returns an independent model.
 
 Generated models, their arrays, and their lists are mutable:
 
@@ -288,10 +292,11 @@ restored.scores[0] = 99.0
 restored.weapons.append(Weapon(name="Bow", damage=5))
 ```
 
-## 7. Add application validation
+### 7. Add application validation
 
-Subclass a generated model to add validation, methods, or Python-only state.
-Redeclare an inherited field when decoded values should use a model subclass:
+Subclass a generated model to add validation, methods, or Python-only state. To
+decode a nested field as a model subclass, redeclare the inherited field with
+the subclass type:
 
 ```python
 from typing import ClassVar
@@ -325,19 +330,20 @@ assert isinstance(validated.weapons[0], ValidatedWeapon)
 assert validated_from_view.was_validated
 ```
 
-`__post_init__()` runs for the requested root class and for nested subclasses
-selected by its annotations. An annotation may select a subclass inside an
-optional field, list, union, struct, or typed nested FlatBuffer.
+FlatBuffer decoding calls `__post_init__()` on the requested root class and on
+nested subclasses selected by its annotations. An annotation may select a
+subclass inside an optional field, list, union, struct, or typed nested
+FlatBuffer.
 
 `ClassVar` values and attributes stored in an instance's `__dict__` are
 Python-only state. The `dict=True` class option enables the instance dictionary.
-msgspec and FlatBuffers serialization both omit this state. Any other
-annotation creates a msgspec field. The generated FlatBuffer APIs reject the
-subclass if that field has no matching FlatBuffers field.
+Neither msgspec nor FlatBuffers serializes this state. Any other annotation
+creates a msgspec field. The generated FlatBuffer APIs reject a subclass when
+that field has no matching FlatBuffers field.
 
-## 8. Use msgspec conversion and JSON
+### 8. Use msgspec conversion and JSON
 
-Pass the package's conversion hooks to msgspec when a model contains numeric
+Pass the package's conversion hooks to msgspec when a model contains NumPy
 arrays:
 
 ```python
@@ -362,7 +368,7 @@ assert from_json == monster
 `dec_hook` restores every generated NumPy dtype, including arrays nested inside
 tables and lists. The restored arrays own their storage and are writable.
 
-## 9. Add a FlatBuffers union
+### 9. Add a FlatBuffers union
 
 Save the following schema as `schemas/pets.fbs`:
 
@@ -410,8 +416,8 @@ pets = PetList(
 )
 ```
 
-`to_flatbuffer()` selects each FlatBuffers discriminator from the concrete
-Python type. Views expose both the selected value and its discriminator:
+`to_flatbuffer()` chooses each FlatBuffers discriminator from the concrete
+Python type. A view exposes both the selected value and its discriminator:
 
 ```python
 from tutorial.pet_list import CatView, Pet, PetListView
@@ -427,12 +433,12 @@ assert pets_view.residents is not None
 `residents_type` is a read-only NumPy array. `residents` is a cached sequence of
 `CatView`, `DogView`, and `None` values. A `None` entry uses a `NONE`
 discriminator and a null payload offset. A non-`NONE` discriminator with a null
-payload remains invalid.
+payload is invalid.
 
 Union alternatives receive msgspec tags based on their fully qualified IDL
 names. Other generated tables remain untagged.
 
-## 10. Put a typed FlatBuffer inside a byte vector
+### 10. Put a typed FlatBuffer inside a byte vector
 
 Use `nested_flatbuffer` when a byte vector always contains one known root type.
 Save this as `schemas/nested_envelope.fbs`:
@@ -488,10 +494,10 @@ open it:
 snapshot = envelope_view.snapshot_view(size_prefixed=True)
 ```
 
-## 11. Add open-ended dynamic payloads
+### 11. Add open-ended dynamic payloads
 
-A union lists every permitted type in one IDL. A dynamic field instead stores a
-string type name next to a byte vector. New generated modules can register new
+A union lists every permitted type in the IDL. A dynamic field stores a string
+type name beside a byte vector. Generated extension modules can register new
 types without changing the envelope schema.
 
 Save the first extension as `schemas/metric.fbs`:
@@ -541,7 +547,8 @@ msgspec-flatbuffers generate \
 ```
 
 Importing the extension module registers `Tutorial.Metric`. The envelope module
-exports a wrapper class for its dynamic field:
+exports `DynamicEnvelopePayload`, a wrapper for the dynamic value and its type
+name:
 
 ```python
 from tutorial.dynamic_envelope import (
@@ -568,10 +575,9 @@ assert payload_raw is not None
 assert payload_raw.readonly
 ```
 
-`payload_type_raw` and `payload_raw` expose the stored tag and byte vector.
-`DynamicEnvelopePayload` carries the dynamic type name. `Metric` remains an
-ordinary, untagged msgspec model. Encode and decode the wrapper with the same
-JSON hooks:
+`payload_type_raw` and `payload_raw` expose the stored type name and byte vector.
+`Metric` remains an ordinary, untagged msgspec model. Encode and decode the
+wrapper with the same JSON hooks:
 
 ```python
 encoded = msgspec.json.encode(dynamic, enc_hook=enc_hook)
@@ -584,9 +590,10 @@ decoded = msgspec.json.decode(
 assert decoded == dynamic
 ```
 
-The `Tutorial.Metric` wire tag resolves to the generated `Metric` class. The tag
-cannot choose an application subclass such as `ValidatedMetric`. Supply a
-`DynamicModelOverrides` mapping when decoding should construct that subclass:
+The `Tutorial.Metric` wire tag resolves to the generated `Metric` class. It
+cannot select an application subclass such as `ValidatedMetric`. To construct
+that subclass while decoding, map `Metric` to `ValidatedMetric` with
+`DynamicModelOverrides`:
 
 ```python
 from msgspec_flatbuffers import DynamicModelOverrides
@@ -621,13 +628,15 @@ assert isinstance(validated_buffer_model.payload.value, ValidatedMetric)
 assert isinstance(validated_json_model.payload.value, ValidatedMetric)
 ```
 
-`DynamicModelOverrides` is a mutable mapping. The `|` operator returns a new
-mapping; `|=` updates the mapping on its left. If both mappings contain the same
-generated model, the value on the right wins. Decoding uses the generated model
-when no override exists.
+`DynamicModelOverrides` is a mutable mapping from generated models to
+application subclasses. The `|` operator returns a new mapping, and `|=` updates
+the mapping on its left. If both mappings contain the same generated model, the
+value on the right wins. Decoding uses the generated model when no override
+exists.
 
-An unknown type inside the allowed `Tutorial.*` namespace remains opaque. Its
-tag and bytes survive model, JSON, and FlatBuffer round trips:
+An unknown type inside the allowed `Tutorial.*` namespace remains opaque. The
+library preserves its type name and bytes across model, JSON, and FlatBuffer
+round trips:
 
 ```python
 opaque = DynamicEnvelope(
@@ -644,9 +653,9 @@ assert not forwarded_payload.is_known
 assert forwarded_payload.data == b"payload from a newer plugin"
 ```
 
-Tags outside `Tutorial.*` are rejected. Wire tags are never treated as Python
-import paths. If an application wants lazy imports for known tags, it can map a
-trusted tag to a module explicitly:
+Tags outside `Tutorial.*` are rejected. The runtime never treats a wire tag as
+a Python import path. For lazy imports, map each trusted tag to its module
+explicitly:
 
 ```python
 from msgspec_flatbuffers import register_dynamic_module
@@ -654,10 +663,10 @@ from msgspec_flatbuffers import register_dynamic_module
 register_dynamic_module("Tutorial.Metric", "tutorial.metric")
 ```
 
-## 12. Interpret an unannotated byte vector manually
+### 12. Interpret an unannotated byte vector manually
 
-Use an ordinary `[ubyte]` when the application chooses the payload type. Save
-this as `schemas/raw_extensions.fbs`:
+Use an ordinary `[ubyte]` vector when the schema does not declare the payload
+type. Save this as `schemas/raw_extensions.fbs`:
 
 ```fbs
 namespace Tutorial;
@@ -684,8 +693,8 @@ msgspec-flatbuffers generate \
   --project-root schemas
 ```
 
-`Extension.data` is `bytes` in the model. The generated `data_as()` view helper
-opens those bytes as a chosen view type without copying them:
+`Extension.data` is `bytes` in the model. The generated `data_as()` helper reads
+the vector through a chosen view type without copying it:
 
 ```python
 from tutorial.extension_list import Extension, ExtensionList, ExtensionListView
@@ -713,13 +722,13 @@ assert metric_view.name == "latency"
 assert extension_view.data_as(MetricView) is metric_view
 ```
 
-The application assigns and interprets `type_id`. Repeated `data_as()` calls
+The application defines the meaning of `type_id`. Repeated `data_as()` calls
 with the same view type and `size_prefixed` setting return the same cached view.
 
-Use `nested_flatbuffer` when the payload type belongs in the IDL. Use a dynamic
-field when generated extension modules register an open-ended set of type names.
+Use `nested_flatbuffer` when the IDL declares the payload type. Use a dynamic
+field when extension modules register an open-ended set of type names.
 
-## 13. Use size prefixes and file identifiers
+### 13. Use size prefixes and file identifiers
 
 Every tutorial schema declares a four-byte file identifier. The
 `MonsterView.from_buffer()` and `Monster.from_flatbuffer()` calls in steps 5 and
@@ -740,11 +749,10 @@ framed_view = MonsterView.from_buffer(framed, size_prefixed=True)
 framed_model = Monster.from_flatbuffer(framed, size_prefixed=True)
 ```
 
-A size-prefixed reader is restricted to the payload length declared by the
-prefix. Trailing bytes and subsequent concatenated frames are outside that
-view.
+A size-prefixed reader stops at the payload length declared by the prefix. The
+view excludes trailing bytes and any frames concatenated after the payload.
 
-## Field representations
+### Field representations
 
 | FlatBuffers field | View value | Materialized model value |
 |---|---|---|
@@ -769,13 +777,13 @@ view.
 A view exposes numeric vectors with the FlatBuffers little-endian dtype.
 Materialized arrays use the platform's native NumPy dtype.
 
-## Supported schemas and limitations
+### Supported schemas and limitations
 
 Generated modules support tables, nested structs, fixed arrays, enums, optional
 scalars, strings, nested tables, unions, and typed or dynamic nested
 FlatBuffers. Vectors may contain scalars, bytes, strings, tables, structs, or
-unions. One `.fbs` file may contain multiple declarations and namespaces, and
-schemas may include other schemas.
+unions. A single `.fbs` file may declare several types in several namespaces.
+Schemas may include other schemas.
 
 Current limitations:
 
@@ -787,3 +795,35 @@ Current limitations:
 
 Unsupported schema features fail generation instead of producing a partial
 Python API.
+
+## Backward compatibility
+
+Within one major SemVer version, we try to keep Python code generated by an
+earlier release working with later `msgspec-flatbuffers` runtimes. This project
+is young, so backward compatibility is a goal rather than a guarantee.
+
+Forward compatibility is not guaranteed. Code generated by a later release may
+not work with an earlier runtime.
+
+Every generated module records the generator version and checks the installed
+runtime during import:
+
+- If the major versions differ in either direction, import raises
+  `GeneratedCodeVersionError`.
+- If the major versions match but the runtime minor version is older, import
+  emits `GeneratedCodeVersionWarning` once for that generator/runtime version
+  pair.
+- Otherwise, import continues without a version warning. Patch-version
+  differences do not produce a warning.
+
+To suppress the older-runtime warning, set the process-wide flag before
+importing generated modules:
+
+```python
+import msgspec_flatbuffers
+
+msgspec_flatbuffers.warn_on_older_runtime = False
+```
+
+The flag does not suppress `GeneratedCodeVersionError` for a major-version
+mismatch.

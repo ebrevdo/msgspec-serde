@@ -58,6 +58,9 @@ jobs:
           print(f"Building msgspec-flatbuffers {package_version}")
           PY
 
+      - name: Validate generated compatibility snapshot
+        run: python tools/freeze_generated_compatibility.py --check
+
   wheels:
     name: Wheel (${{ matrix.target }})
     needs: validate
@@ -111,6 +114,11 @@ jobs:
 
       - name: Import native extension
         run: python -c "import msgspec_flatbuffers; import msgspec_flatbuffers._native"
+
+      - name: Test generated compatibility snapshots
+        run: |
+          python -m pip install "pytest>=8"
+          python -m pytest -q tests/test_generated_compatibility.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
