@@ -1,9 +1,0 @@
-{
-  "flatc_version": "flatc version 23.5.26",
-  "generated_files": {
-    "core.py": "60ac2a5951a26089de39a064628e550189b2c41f234922d9f0dc9917ce83cb45"
-  },
-  "msgspec_flatbuffers_version": "0.1.0",
-  "schema": "tests/generated_compatibility/core.fbs",
-  "schema_sha256": "504ff2105d6afb56b4c27f7609a98ba010b30176d44f06ce055a281fbffe819b"
-}
