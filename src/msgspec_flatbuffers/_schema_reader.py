@@ -279,6 +279,11 @@ def _parse_schema(root: ReflectedSchema) -> Schema:
         raise InvalidSchemaError(
             f"binary schema uses unknown advanced feature bits 0x{unknown_features:x}"
         )
+    if raw_features & int(AdvancedFeature.DEFAULT_VECTORS_AND_STRINGS):
+        raise InvalidSchemaError(
+            "binary schemas using default vectors or strings are unsupported "
+            "because BFBS does not preserve their literal values"
+        )
 
     objects = _convert_required(
         root.ObjectsLength(),

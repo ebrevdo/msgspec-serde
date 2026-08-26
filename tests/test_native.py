@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
 
+import flatbuffers
 import msgspec
 import numpy as np
 import pytest
@@ -205,6 +206,38 @@ def test_native_module_plan_builds_nested_tables(tmp_path: Path) -> None:
     )
 
     assert generated.ParentView.from_buffer(buffer).to_model() == model
+
+
+def test_native_materialization_handles_deep_recursive_tables(
+    tmp_path: Path,
+) -> None:
+    generated = _generate_module(
+        tmp_path,
+        "recursive",
+        "namespace Native;",
+        "table Node { next:Node; value:int; }",
+        "root_type Node;",
+    )
+    depth = 20_000
+    builder = flatbuffers.Builder(300_000)
+    node = 0
+    for value in range(depth):
+        builder.StartObject(2)
+        builder.PrependInt32Slot(1, value, 0)
+        if node:
+            builder.PrependUOffsetTRelativeSlot(0, node, 0)
+        node = builder.EndObject()
+    builder.Finish(node)
+
+    current = generated.Node.from_flatbuffer(builder.Output())
+    count = 0
+    while current is not None:
+        following = current.next
+        current.next = None
+        current = following
+        count += 1
+
+    assert count == depth
 
 
 def test_nested_structs_and_fixed_arrays_round_trip(tmp_path: Path) -> None:

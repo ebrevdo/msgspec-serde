@@ -194,6 +194,69 @@ def _field_order(item: ObjectDefinition) -> tuple[FieldDefinition, ...]:
     return tuple(sorted(fields, key=key))
 
 
+def _find_identifier_collision(
+    names: Iterable[str],
+) -> tuple[str, str, str] | None:
+    generated: dict[str, str] = {}
+    for name in names:
+        identifier = _identifier(name)
+        previous = generated.get(identifier)
+        if previous is not None:
+            return previous, name, identifier
+        generated[identifier] = name
+    return None
+
+
+def _validate_member_names(
+    objects: Sequence[ObjectDefinition],
+    enums: Sequence[EnumDefinition],
+) -> None:
+    for item in objects:
+        collision = _find_identifier_collision(
+            field.name for field in item.fields if not field.deprecated
+        )
+        if collision is not None:
+            previous, name, identifier = collision
+            kind = "struct" if item.is_struct else "table"
+            raise GenerationError(
+                f"{kind} {item.name} fields {previous!r} and {name!r} "
+                f"both generate Python name {identifier!r}"
+            )
+
+    for item in enums:
+        collision = _find_identifier_collision(value.name for value in item.values)
+        if collision is not None:
+            previous, name, identifier = collision
+            raise GenerationError(
+                f"enum {item.name} values {previous!r} and {name!r} "
+                f"both generate Python name {identifier!r}"
+            )
+
+
+def _local_symbols(
+    objects: Sequence[ObjectDefinition],
+    enums: Sequence[EnumDefinition],
+) -> set[str]:
+    generated: dict[str, str] = {}
+    candidates = [
+        (symbol, item.name)
+        for item in objects
+        for symbol in (_short_name(item.name), f"{_short_name(item.name)}View")
+    ]
+    candidates.extend((_short_name(item.name), item.name) for item in enums)
+    for symbol, source in candidates:
+        previous = generated.get(symbol)
+        if previous is not None:
+            raise GenerationError(
+                f"definitions {previous!r} and {source!r} both generate "
+                f"Python symbol {symbol!r}"
+            )
+        generated[symbol] = source
+    return set(generated).union(
+        f"_FB_UNION_{_short_name(item.name)}" for item in enums if item.is_union
+    )
+
+
 class _Context:
     def __init__(
         self,
@@ -804,7 +867,7 @@ def _render_dynamic_value_type(
     pair: _DynamicPair,
 ) -> list[str]:
     return [
-        f"class {_dynamic_value_type_name(owner, pair)}(DynamicValue):",
+        f"class {_dynamic_value_type_name(owner, pair)}(_FbDynamicValue):",
         "    __slots__ = ()",
         f"    _allowed_prefix = {pair.allowed_prefix!r}",
     ]
@@ -847,7 +910,7 @@ def _render_enum(context: _Context, item: EnumDefinition) -> list[str]:
     if item.is_union:
         context.union_arms(item)
     name = _short_name(item.name)
-    lines = [f"class {name}(OpenIntEnum):"]
+    lines = [f"class {name}(_FbOpenIntEnum):"]
     lines.extend(_documentation(item.documentation))
     if not item.values:
         lines.append("    pass")
@@ -922,7 +985,7 @@ def _render_union_dispatch(context: _Context, item: EnumDefinition) -> list[str]
         and value.union_type.base_type is BaseType.NONE
     )
     lines = [
-        f"_FB_UNION_{_short_name(item.name)} = UnionDispatch(",
+        f"_FB_UNION_{_short_name(item.name)} = _FbUnionDispatch(",
         f"    {item.name!r},",
         f"    {none_value.value},",
         "    {",
@@ -1660,7 +1723,7 @@ def _render_view_field_property(
 
 def _render_view(context: _Context, item: ObjectDefinition, root: bool) -> list[str]:
     name = _short_name(item.name)
-    base = "StructView" if item.is_struct else "TableView"
+    base = "_FbStructView" if item.is_struct else "_FbTableView"
     fields = _field_order(item)
     union_pairs = context.union_pairs(item)
     union_pairs_by_value_id = {
@@ -1827,6 +1890,10 @@ def _native_field_plan(
     union_pair: _UnionPair | None,
     dynamic_pair: _DynamicPair | None,
 ) -> dict[str, object]:
+    if field.offset64:
+        raise GenerationError(
+            f"64-bit offset field {owner.name}.{field.name} is unsupported"
+        )
     type_ref = field.type
     plan: dict[str, object] = {
         "name": _identifier(field.name),
@@ -2017,20 +2084,8 @@ def render_module(
     local_definitions = [*local_objects, *local_enums]
     if not local_definitions:
         raise GenerationError(f"no definitions declared in {declaration_file!r}")
-    definitions_by_symbol: dict[str, list[str]] = defaultdict(list)
-    for item in local_definitions:
-        definitions_by_symbol[_short_name(item.name)].append(item.name)
-    collisions = {
-        symbol: names
-        for symbol, names in definitions_by_symbol.items()
-        if len(names) > 1
-    }
-    if collisions:
-        symbol, names = min(collisions.items())
-        raise GenerationError(
-            f"one-file generation cannot represent {symbol!r} from "
-            f"{', '.join(sorted(names))}"
-        )
+    _validate_member_names(local_objects, local_enums)
+    local_symbols = _local_symbols(local_objects, local_enums)
     local_names = frozenset(item.name for item in local_definitions)
     context = _Context(
         schema,
@@ -2085,15 +2140,6 @@ def render_module(
     )
     import_modules = set(object_imports) | set(enum_imports)
     enum_dependency_modules = set(enum_imports)
-    local_symbols: set[str] = set()
-    for item in local_objects:
-        name = _short_name(item.name)
-        local_symbols.update((name, f"{name}View"))
-    for item in local_enums:
-        enum_name = _short_name(item.name)
-        local_symbols.add(enum_name)
-        if item.is_union:
-            local_symbols.add(f"_FB_UNION_{enum_name}")
     dynamic_value_names = [
         _dynamic_value_type_name(item, pair)
         for item, pair in dynamic_field_pairs
@@ -2135,6 +2181,22 @@ def render_module(
         for item in local_objects
     ):
         scalar_readers.add(("_UINT16", "<H"))
+    runtime_imports = [
+        "DynamicModelOverrides",
+        "InvalidBufferError",
+        "OpenIntEnum as _FbOpenIntEnum",
+        "StringVector",
+        "StructVector",
+        "StructView as _FbStructView",
+        "TableVector",
+        "TableView as _FbTableView",
+    ]
+    if has_dynamic:
+        runtime_imports.extend(("DynamicValue as _FbDynamicValue", "DynamicView"))
+    if dynamic_extension:
+        runtime_imports.append("register_dynamic_type as _register_dynamic_type")
+    if has_unions:
+        runtime_imports.extend(("UnionDispatch as _FbUnionDispatch", "UnionVector"))
     lines = [
         _GENERATED_HEADER,
         f"# Source: {declaration_file}",
@@ -2152,21 +2214,7 @@ def render_module(
         "import numpy.typing as npt",
         "",
         "from msgspec_flatbuffers import (",
-        "    DynamicModelOverrides,",
-        "    InvalidBufferError,",
-        "    OpenIntEnum,",
-        "    StringVector,",
-        "    StructVector,",
-        "    StructView,",
-        "    TableVector,",
-        "    TableView,",
-        *(
-            ["    DynamicValue,", "    DynamicView,"]
-            if has_dynamic
-            else []
-        ),
-        *(["    register_dynamic_type,"] if dynamic_extension else []),
-        *(["    UnionDispatch,", "    UnionVector,"] if has_unions else []),
+        *(f"    {name}," for name in runtime_imports),
         ")",
         "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types",
         "from msgspec_flatbuffers._native import NativePlan as _NativePlan",
@@ -2178,7 +2226,9 @@ def render_module(
             for module in sorted(enum_dependency_modules)
         )
     if has_byte_vector_helpers:
-        lines.extend(("", '_NestedViewT = TypeVar("_NestedViewT", bound=TableView)'))
+        lines.extend(
+            ("", '_NestedViewT = TypeVar("_NestedViewT", bound=_FbTableView)')
+        )
     if scalar_readers:
         lines.append("")
     for reader, fmt in sorted(scalar_readers):
@@ -2238,7 +2288,7 @@ def render_module(
             (
                 "",
                 "",
-                f"register_dynamic_type({root.name!r}, {root_name}, {root_name}View)",
+                f"_register_dynamic_type({root.name!r}, {root_name}, {root_name}View)",
             )
         )
 
@@ -2314,6 +2364,7 @@ def generate(
             )
             for item in sorted(definitions, key=lambda item: item.name)
         ]
+    targets: dict[Path, str] = {}
     rendered_modules: list[tuple[str | None, Path, str]] = []
     for definition_name, namespace_parts, module_name in module_specs:
         package_parts = (
@@ -2321,6 +2372,14 @@ def generate(
             *(_snake_case(part) for part in namespace_parts),
         )
         target = output_root.joinpath(*package_parts, f"{module_name}.py")
+        source_name = definition_name or declaration_file
+        previous = targets.get(target)
+        if previous is not None:
+            raise GenerationError(
+                f"definitions {previous!r} and {source_name!r} both generate "
+                f"module {target.relative_to(output_root)}"
+            )
+        targets[target] = source_name
         selected_names = (
             None
             if definition_name is None

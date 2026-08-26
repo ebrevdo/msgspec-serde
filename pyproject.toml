@@ -3,6 +3,8 @@ name = "msgspec-flatbuffers"
 version = "0.1.0"
 description = "Generate lazy FlatBuffers views and msgspec models from FlatBuffers schemas"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "src/msgspec_flatbuffers/_reflection/LICENSE.txt"]
 requires-python = ">=3.12"
 dependencies = [
     "flatbuffers>=24.3.25",

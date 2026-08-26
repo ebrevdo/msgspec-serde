@@ -16,10 +16,16 @@ import numpy as np
 import pytest
 
 from msgspec_flatbuffers import (
+    BaseType,
     BufferBoundsError,
+    FieldDefinition,
     GenerationError,
     InvalidBufferError,
+    ObjectDefinition,
+    Schema,
+    TypeReference,
     generate,
+    render_module,
 )
 from msgspec_flatbuffers.cli import main
 
@@ -720,13 +726,91 @@ def test_gen_onefile_rejects_namespace_name_collisions(tmp_path: Path) -> None:
         "root_type Item;",
     )
 
-    with pytest.raises(GenerationError, match="cannot represent 'Item'"):
+    with pytest.raises(GenerationError, match="Python symbol 'Item'"):
         generate(
             source,
             tmp_path / "generated",
             project_root=tmp_path,
             gen_onefile=True,
         )
+
+
+def test_generation_rejects_colliding_module_names(tmp_path: Path) -> None:
+    source = tmp_path / "module_collision.fbs"
+    _write_schema(
+        source,
+        "namespace Collision;",
+        "table FooBar {}",
+        "table foo_bar {}",
+        "root_type FooBar;",
+    )
+    output = tmp_path / "generated"
+
+    with pytest.raises(GenerationError, match="both generate module"):
+        generate(source, output, project_root=tmp_path)
+
+    assert not output.exists()
+
+
+def test_generation_rejects_colliding_field_names(tmp_path: Path) -> None:
+    source = tmp_path / "field_collision.fbs"
+    _write_schema(
+        source,
+        "table Collision { class:int; class_:int; }",
+        "root_type Collision;",
+    )
+
+    with pytest.raises(GenerationError, match="both generate Python name 'class_'"):
+        generate(source, tmp_path / "generated", project_root=tmp_path)
+
+
+def test_generation_rejects_colliding_enum_value_names(tmp_path: Path) -> None:
+    source = tmp_path / "enum_collision.fbs"
+    _write_schema(
+        source,
+        "enum Collision:byte { class, class_ }",
+    )
+
+    with pytest.raises(GenerationError, match="both generate Python name 'class_'"):
+        generate(source, tmp_path / "generated", project_root=tmp_path)
+
+
+def test_runtime_support_names_can_be_schema_names(tmp_path: Path) -> None:
+    source = tmp_path / "support_name.fbs"
+    _write_schema(source, "table TableView {}", "root_type TableView;")
+    path = generate(source, tmp_path / "generated", project_root=tmp_path)
+    generated = _load_module("support_name_generated", path)
+
+    model = generated.TableView()
+    buffer = model.to_flatbuffer()
+
+    assert generated.TableView.from_flatbuffer(buffer) == model
+    assert generated.TableViewView.from_buffer(buffer).to_model() == model
+
+
+def test_generation_rejects_offset64_before_rendering() -> None:
+    schema = Schema(
+        objects=(
+            ObjectDefinition(
+                name="Offset64.Root",
+                fields=(
+                    FieldDefinition(
+                        name="value",
+                        type=TypeReference(base_type=BaseType.STRING),
+                        id=0,
+                        offset=4,
+                        offset64=True,
+                    ),
+                ),
+                declaration_file="//offset64.fbs",
+            ),
+        ),
+        enums=(),
+        root_table="Offset64.Root",
+    )
+
+    with pytest.raises(GenerationError, match="64-bit offset field"):
+        render_module(schema, "//offset64.fbs")
 
 
 def test_cli_gen_onefile_omits_namespace_directory(

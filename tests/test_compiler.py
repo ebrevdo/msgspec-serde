@@ -3,10 +3,12 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import flatbuffers
 import msgspec
 import pytest
 
 from msgspec_flatbuffers import (
+    AdvancedFeature,
     BaseType,
     FlatcError,
     FlatcNotFoundError,
@@ -15,6 +17,7 @@ from msgspec_flatbuffers import (
     compile_schema_to_bfbs,
     parse_bfbs,
 )
+from msgspec_flatbuffers._reflection import Schema as ReflectedSchema
 
 FIXTURE = Path(__file__).parent / "fixtures" / "monster.fbs"
 HAS_FLATC = shutil.which("flatc") is not None
@@ -75,6 +78,20 @@ def test_parse_bfbs_rejects_other_buffers() -> None:
 def test_parse_bfbs_wraps_malformed_reflection_data() -> None:
     with pytest.raises(InvalidSchemaError, match="malformed"):
         parse_bfbs(b"\x04\x00\x00\x00BFBS")
+
+
+def test_parse_bfbs_rejects_default_vector_and_string_features() -> None:
+    builder = flatbuffers.Builder(32)
+    ReflectedSchema.SchemaStart(builder)
+    ReflectedSchema.SchemaAddAdvancedFeatures(
+        builder,
+        int(AdvancedFeature.DEFAULT_VECTORS_AND_STRINGS),
+    )
+    schema = ReflectedSchema.SchemaEnd(builder)
+    builder.Finish(schema, file_identifier=b"BFBS")
+
+    with pytest.raises(InvalidSchemaError, match="does not preserve"):
+        parse_bfbs(builder.Output())
 
 
 def test_compile_schema_reports_missing_compiler() -> None:
