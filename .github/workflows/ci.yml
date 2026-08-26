@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.12"
+          - os: ubuntu-24.04
+            python: "3.13"
+          - os: ubuntu-24.04
+            python: "3.14"
+          - os: macos-15
+            python: "3.14"
+          - os: windows-2025
+            python: "3.14"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.6"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install flatc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes flatbuffers-compiler
+
+      - name: Install flatc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install flatbuffers
+
+      - name: Install flatc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "flatc.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "flatc"
+          $flatcUrl = "https://github.com/google/flatbuffers/releases/download/v25.12.19/Windows.flatc.binary.zip"
+          Invoke-WebRequest -Uri $flatcUrl -OutFile $archive
+          $actualHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = "fff9445c9db907227bc64b54cc98743084c4949282aa4e576cff6a955724ddc8"
+          if ($actualHash -ne $expectedHash) {
+            throw "Unexpected flatc archive hash: $actualHash"
+          }
+          Expand-Archive -Path $archive -DestinationPath $destination
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Show flatc version
+        run: flatc --version
+
+      - name: Install project
+        run: uv sync --locked --all-groups
+
+      - name: Run tests
+        run: uv run --locked pytest -q
+
+      - name: Minimize uv cache
+        if: always()
+        run: uv cache prune --ci
+
+  quality:
+    name: Lint, type-check, and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.6"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install project
+        run: uv sync --locked --all-groups
+
+      - name: Install Rust quality tools
+        run: rustup component add clippy rustfmt
+
+      - name: Run Ruff
+        run: uv run --locked ruff check .
+
+      - name: Run ty
+        run: uv run --locked ty check --no-progress
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml --locked
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Minimize uv cache
+        if: always()
+        run: uv cache prune --ci

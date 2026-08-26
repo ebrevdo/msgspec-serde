@@ -34,6 +34,11 @@ def _parser() -> argparse.ArgumentParser:
         "--package",
         help="optional Python package prefix before the FlatBuffers namespace",
     )
+    generate_parser.add_argument(
+        "--gen-onefile",
+        action="store_true",
+        help="place all definitions from each schema in one Python module",
+    )
     return parser
 
 
@@ -52,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flatc=args.flatc,
                 project_root=args.project_root,
                 package=args.package,
+                gen_onefile=args.gen_onefile,
             )
             print(path)
     except (FlatcError, GenerationError, OSError) as error:

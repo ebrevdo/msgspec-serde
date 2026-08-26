@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check package, crate, and tag versions
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          def load_toml(path: str):
+              with Path(path).open("rb") as file:
+                  return tomllib.load(file)
+
+          package_version = load_toml("pyproject.toml")["project"]["version"]
+          crate_version = load_toml("rust/Cargo.toml")["package"]["version"]
+          if package_version != crate_version:
+              raise SystemExit(
+                  f"Version mismatch: pyproject.toml={package_version}, rust/Cargo.toml={crate_version}"
+              )
+          if os.environ["EVENT_NAME"] == "release":
+              expected_tag = f"v{package_version}"
+              if os.environ["REF_NAME"] != expected_tag:
+                  raise SystemExit(
+                      f"Release tag must be {expected_tag}, got {os.environ['REF_NAME']}"
+                  )
+          print(f"Building msgspec-flatbuffers {package_version}")
+          PY
+
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_17"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_17"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: "off"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@12dee64e4a21f3a4a4fd4d34e05cc55f0eda098a # v1.49.4
+        with:
+          maturin-version: v1.11.5
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --compatibility pypi --out dist
+
+      - name: Smoke-test wheel
+        run: >-
+          python -c "import glob, subprocess, sys;
+          wheel, = glob.glob('dist/*.whl');
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install',
+          '--force-reinstall', wheel])"
+
+      - name: Import native extension
+        run: python -c "import msgspec_flatbuffers; import msgspec_flatbuffers._native"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  sdist:
+    name: Source distribution
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build source distribution
+        uses: PyO3/maturin-action@12dee64e4a21f3a4a4fd4d34e05cc55f0eda098a # v1.49.4
+        with:
+          maturin-version: v1.11.5
+          command: sdist
+          args: --locked --out dist
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  github-release:
+    name: Attach distributions to GitHub Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # Download artifacts built by this workflow.
+      contents: write # Attach distributions to the GitHub Release.
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload distributions to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+  pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/msgspec-flatbuffers
+    permissions:
+      actions: read # Download artifacts built by this workflow.
+      id-token: write # Authenticate to PyPI through Trusted Publishing.
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import importlib
-import importlib.util
 import shutil
 import struct
 import sys
@@ -49,9 +48,9 @@ def _temporary_sys_path(path: Path) -> Iterator[None]:
         sys.path.remove(value)
 
 
-def _clear_generated_modules() -> None:
+def _clear_generated_modules(package: str = "example") -> None:
     for name in tuple(sys.modules):
-        if name == "example" or name.startswith("example."):
+        if name == package or name.startswith(f"{package}."):
             sys.modules.pop(name, None)
 
 
@@ -67,7 +66,7 @@ def generated_modules(
 
     _clear_generated_modules()
     with _temporary_sys_path(output):
-        payload = importlib.import_module("example.dynamic.payload")
+        payload = importlib.import_module("example.dynamic.metric")
         envelope = importlib.import_module("example.dynamic.envelope")
         yield payload, envelope
     _clear_generated_modules()
@@ -432,32 +431,29 @@ def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> No
     )
     output = tmp_path / "generated"
 
-    def load(name: str, source: Path) -> ModuleType:
-        path = generate(source, output, project_root=tmp_path)
-        spec = importlib.util.spec_from_file_location(name, path)
-        assert spec is not None
-        assert spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+    generate(extension_source, output, project_root=tmp_path)
+    generate(envelope_source, output, project_root=tmp_path)
 
-    extension = load("dynamic_union_extension", extension_source)
-    envelope = load("dynamic_union_envelope", envelope_source)
-    payload = extension.UnionExtension(
-        favorite=extension.Cat(name="Miso"),
-        residents=[extension.Dog(name="Tess"), extension.Cat(name="Luna")],
-    )
-    model = envelope.Envelope(payload=envelope.EnvelopePayload(payload))
+    _clear_generated_modules("perf")
+    with _temporary_sys_path(output):
+        extension = importlib.import_module("perf.dynamic.union_extension")
+        envelope = importlib.import_module("perf.dynamic.envelope")
+        payload = extension.UnionExtension(
+            favorite=extension.Cat(name="Miso"),
+            residents=[extension.Dog(name="Tess"), extension.Cat(name="Luna")],
+        )
+        model = envelope.Envelope(payload=envelope.EnvelopePayload(payload))
 
-    view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
-    dynamic = view.payload
-    assert dynamic is not None
-    nested = dynamic.value
-    assert isinstance(nested, extension.UnionExtensionView)
-    assert nested.favorite.name == "Miso"
-    assert [resident.name for resident in nested.residents] == ["Tess", "Luna"]
-    assert view.to_model() == model
-    assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+        view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
+        dynamic = view.payload
+        assert dynamic is not None
+        nested = dynamic.value
+        assert isinstance(nested, extension.UnionExtensionView)
+        assert nested.favorite.name == "Miso"
+        assert [resident.name for resident in nested.residents] == ["Tess", "Luna"]
+        assert view.to_model() == model
+        assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+    _clear_generated_modules("perf")
 
 
 @pytest.mark.parametrize(
@@ -619,7 +615,7 @@ def test_generated_extension_root_registers_on_import(
 
 
 @pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
-def test_public_dynamic_wrapper_name_collisions_are_rejected(tmp_path: Path) -> None:
+def test_dynamic_wrapper_and_table_names_are_scoped_by_module(tmp_path: Path) -> None:
     source = tmp_path / "dynamic_name_collision.fbs"
     source.write_text(
         " ".join(
@@ -636,5 +632,16 @@ def test_public_dynamic_wrapper_name_collisions_are_rejected(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    with pytest.raises(GenerationError, match="dynamic value type.*conflicts"):
-        generate(source, tmp_path / "generated", project_root=tmp_path)
+    output = tmp_path / "generated"
+    generate(source, output, project_root=tmp_path)
+
+    _clear_generated_modules("collision")
+    with _temporary_sys_path(output):
+        envelope = importlib.import_module("collision.envelope")
+        payload = importlib.import_module("collision.envelope_payload")
+
+        assert envelope.EnvelopePayload is not payload.EnvelopePayload
+        assert envelope.Envelope.__annotations__["payload"] == (
+            "EnvelopePayload | None"
+        )
+    _clear_generated_modules("collision")

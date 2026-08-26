@@ -516,7 +516,7 @@ class CachedVector(Sequence[_T], Generic[_T]):
 
 
 class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
-    """Parallel discriminator/payload vectors with cached typed table views."""
+    """Parallel discriminator/payload vectors with cached typed views."""
 
     __slots__ = (
         "_buffer",
@@ -601,10 +601,11 @@ class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
         offset = self._value_start + index * _UINT32.size
         relative = _UINT32.unpack_from(self._buffer, offset)[0]
         if tag == dispatch.none_tag:
-            raise InvalidBufferError(
-                f"{dispatch.name} union vectors cannot contain NONE "
-                f"at index {index}"
-            )
+            if relative != 0:
+                raise InvalidBufferError(
+                    f"{dispatch.name} NONE at index {index} has a payload"
+                )
+            return None  # ty: ignore[invalid-return-type]
 
         view_type = dispatch._table_types.get(tag)
         if view_type is None:
@@ -1095,6 +1096,45 @@ class StructView(_CachedView):
         view_type: type[_ViewT],
     ) -> _ViewT:
         return view_type(self._buffer, self._struct_offset + relative_offset)
+
+    def _read_numpy_array(
+        self,
+        relative_offset: int,
+        length: int,
+        dtype: npt.DTypeLike,
+    ) -> npt.NDArray[Any]:
+        resolved_dtype = (
+            _VECTOR_DTYPES.get(dtype) if isinstance(dtype, str) else None
+        )
+        if resolved_dtype is None:
+            resolved_dtype = np.dtype(dtype)
+        start = self._struct_offset + relative_offset
+        _require_span(
+            self._buffer,
+            start,
+            length * resolved_dtype.itemsize,
+            description="struct array data",
+        )
+        return np.frombuffer(
+            self._buffer,
+            dtype=resolved_dtype,
+            count=length,
+            offset=start,
+        )
+
+    def _read_struct_array(
+        self,
+        relative_offset: int,
+        length: int,
+        view_type: type[_ViewT],
+    ) -> StructVector[_ViewT]:
+        return StructVector(
+            self._buffer,
+            self._struct_offset + relative_offset,
+            length,
+            view_type.__flatbuffer_size__,
+            view_type,
+        )
 
     @property
     def buffer(self) -> memoryview:

@@ -34,5 +34,6 @@ uv run msgspec-flatbuffers generate \
   examples/schema_evolution/schemas/reading_v2.fbs \
   -o examples/schema_evolution \
   --project-root examples/schema_evolution \
-  --package schema_evolution_generated
+  --package schema_evolution_generated.example.evolution \
+  --gen-onefile
 ```

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import shutil
 import struct
@@ -28,12 +29,35 @@ pytestmark = pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
+    generated_root = path.parent
+    while (generated_root / "__init__.py").is_file():
+        generated_root = generated_root.parent
+    root_string = str(generated_root)
+    generated_packages = {
+        child.name
+        for child in generated_root.iterdir()
+        if child.is_dir() and (child / "__init__.py").is_file()
+    }
+    generated_modules = {
+        child.stem for child in generated_root.glob("*.py")
+    }
+    for imported_name in tuple(sys.modules):
+        if (
+            imported_name.split(".", 1)[0] in generated_packages
+            or imported_name in generated_modules
+            or imported_name == name
+        ):
+            sys.modules.pop(imported_name, None)
+    sys.path.insert(0, root_string)
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(root_string)
     return module
 
 
@@ -63,10 +87,11 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     module_path = generate(FIXTURE, generated_root)
     generated_source = module_path.read_text(encoding="utf-8")
     assert "scores: npt.NDArray[np.float32] | None" in generated_source
-    assert "weapons: list[Weapon] | None" in generated_source
+    assert "weapons: list[" in generated_source
+    assert ".Weapon] | None" in generated_source
     assert "tags: list[str] | None" in generated_source
-    assert "path: list[Vec3] | None" in generated_source
-    assert "colors: list[Color] | None" in generated_source
+    assert ".Vec3] | None" in generated_source
+    assert ".Color] | None" in generated_source
 
     assert module_path.relative_to(generated_root) == Path("example/monster.py")
     assert generate(FIXTURE, generated_root) == module_path
@@ -539,7 +564,7 @@ def test_native_builder_samples_variable_size_vectors(tmp_path: Path) -> None:
     assert "import flatbuffers" not in source
     assert "def _build_" not in source
     assert "def _estimate_" not in source
-    assert source.count("_FB_NATIVE_MODULE.unpack_view(") == 6
+    assert source.count("_FB_NATIVE_MODULE.unpack_view(") == 2
     assert "_FB_UNPACK_" not in source
     generated = _load_module("test_generated_sampled_presizing", module_path)
     weapons = [
@@ -577,5 +602,143 @@ def test_cli_generates_a_module(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert main(["generate", str(FIXTURE), "-o", str(output)]) == 0
 
     generated = output / "example" / "monster.py"
+    assert generated.is_file()
+    assert str(generated) in capsys.readouterr().out
+
+
+def test_multiple_namespaces_generate_separate_modules(tmp_path: Path) -> None:
+    source = tmp_path / "multiple_namespaces.fbs"
+    _write_schema(
+        source,
+        "namespace MultipleAlpha;",
+        "table Item { value:int; }",
+        "namespace MultipleBeta;",
+        "table Item { alpha:MultipleAlpha.Item; }",
+        "root_type Item;",
+    )
+    output = tmp_path / "generated"
+
+    root_path = generate(source, output, project_root=tmp_path)
+
+    assert root_path == output / "multiple_beta" / "item.py"
+    assert (output / "multiple_alpha" / "item.py").is_file()
+    with _temporary_sys_path(output):
+        alpha = importlib.import_module("multiple_alpha.item")
+        beta = importlib.import_module("multiple_beta.item")
+        model = beta.Item(alpha=alpha.Item(value=42))
+
+        assert beta.Item.from_flatbuffer(model.to_flatbuffer()) == model
+
+
+def test_gen_onefile_flattens_unique_namespaces(tmp_path: Path) -> None:
+    source = tmp_path / "one_file.fbs"
+    _write_schema(
+        source,
+        "namespace OneFileAlpha;",
+        "table Child { value:int; }",
+        "namespace OneFileBeta;",
+        "table Root { child:OneFileAlpha.Child; }",
+        "root_type Root;",
+    )
+    output = tmp_path / "generated"
+
+    module_path = generate(
+        source,
+        output,
+        project_root=tmp_path,
+        gen_onefile=True,
+    )
+    generated = _load_module("one_file_generated", module_path)
+    model = generated.Root(child=generated.Child(value=42))
+
+    assert module_path == output / "one_file.py"
+    assert generated.Root.from_flatbuffer(model.to_flatbuffer()) == model
+
+
+def test_gen_onefile_resolves_included_onefile_modules(tmp_path: Path) -> None:
+    common = tmp_path / "onefile_common.fbs"
+    _write_schema(
+        common,
+        "namespace OneFileShared; table Child { value:int; }",
+    )
+    root = tmp_path / "onefile_root.fbs"
+    _write_schema(
+        root,
+        'include "onefile_common.fbs";',
+        "namespace OneFileRoot;",
+        "table Root { child:OneFileShared.Child; }",
+        "root_type Root;",
+    )
+    output = tmp_path / "generated"
+    generate(common, output, project_root=tmp_path, gen_onefile=True)
+    root_path = generate(
+        root,
+        output,
+        include_dirs=[tmp_path],
+        project_root=tmp_path,
+        gen_onefile=True,
+    )
+
+    with _temporary_sys_path(output):
+        common_module = importlib.import_module("onefile_common")
+        root_module = importlib.import_module("onefile_root")
+        model = root_module.Root(child=common_module.Child(value=42))
+
+        assert root_path == output / "onefile_root.py"
+        assert root_module.Root.from_flatbuffer(model.to_flatbuffer()) == model
+
+
+def test_multiple_namespace_modules_can_reference_each_other(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "namespace_cycle.fbs"
+    _write_schema(
+        source,
+        "namespace NamespaceCycleA;",
+        "table A { b:NamespaceCycleB.B; }",
+        "namespace NamespaceCycleB;",
+        "table B { a:NamespaceCycleA.A; }",
+        "root_type B;",
+    )
+    output = tmp_path / "generated"
+    generate(source, output, project_root=tmp_path)
+
+    with _temporary_sys_path(output):
+        cycle_a = importlib.import_module("namespace_cycle_a.a")
+        cycle_b = importlib.import_module("namespace_cycle_b.b")
+        model = cycle_b.B(a=cycle_a.A())
+
+        assert cycle_b.B.from_flatbuffer(model.to_flatbuffer()) == model
+
+
+def test_gen_onefile_rejects_namespace_name_collisions(tmp_path: Path) -> None:
+    source = tmp_path / "one_file_collision.fbs"
+    _write_schema(
+        source,
+        "namespace CollisionAlpha; table Item {}",
+        "namespace CollisionBeta; table Item {}",
+        "root_type Item;",
+    )
+
+    with pytest.raises(GenerationError, match="cannot represent 'Item'"):
+        generate(
+            source,
+            tmp_path / "generated",
+            project_root=tmp_path,
+            gen_onefile=True,
+        )
+
+
+def test_cli_gen_onefile_omits_namespace_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "output"
+
+    assert main(
+        ["generate", str(FIXTURE), "-o", str(output), "--gen-onefile"]
+    ) == 0
+
+    generated = output / "monster.py"
     assert generated.is_file()
     assert str(generated) in capsys.readouterr().out

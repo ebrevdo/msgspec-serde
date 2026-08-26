@@ -222,18 +222,18 @@ def test_union_vector_supports_all_integral_discriminator_widths(
     assert not vector.types.flags.writeable
 
 
-def test_union_vector_rejects_unknown_none_and_missing_payloads() -> None:
+def test_union_vector_accepts_none_and_rejects_invalid_payloads() -> None:
     unknown = _union_vector(_build_union_vector((999,), (True,)))
     none = _union_vector(_build_union_vector((0,), (False,)))
     missing = _union_vector(_build_union_vector((555,), (False,)))
 
     with pytest.raises(InvalidBufferError, match="unknown Example.Any"):
         _ = unknown[0]
-    with pytest.raises(InvalidBufferError, match="cannot contain NONE"):
-        _ = none[0]
+    assert none[0] is None
     with pytest.raises(InvalidBufferError, match="null offset"):
         _ = missing[0]
-    assert unknown.cached_count == none.cached_count == missing.cached_count == 0
+    assert none.cached_count == 1
+    assert unknown.cached_count == missing.cached_count == 0
 
 
 def test_union_vector_rejects_mismatched_lengths_and_widths() -> None:

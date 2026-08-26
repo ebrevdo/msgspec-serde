@@ -174,9 +174,16 @@ def _definition_module(
     qualified_name: str,
     declaration_file: str | None,
     package_prefix: tuple[str, ...],
+    *,
+    gen_onefile: bool = False,
 ) -> str:
-    namespace = tuple(_snake_case(part) for part in _namespace(qualified_name))
-    module = _snake_case(Path(_declaration_path(declaration_file)).stem)
+    if gen_onefile:
+        namespace = ()
+        module_name = Path(_declaration_path(declaration_file)).stem
+    else:
+        namespace = tuple(_snake_case(part) for part in _namespace(qualified_name))
+        module_name = _short_name(qualified_name)
+    module = _snake_case(module_name)
     return ".".join((*package_prefix, *namespace, module))
 
 
@@ -191,12 +198,14 @@ class _Context:
     def __init__(
         self,
         schema: Schema,
-        declaration_file: str,
         package_prefix: tuple[str, ...],
+        local_names: frozenset[str],
+        gen_onefile: bool,
     ) -> None:
         self.schema = schema
-        self.declaration_file = declaration_file
         self.package_prefix = package_prefix
+        self.local_names = local_names
+        self.gen_onefile = gen_onefile
         self._nested_targets: dict[
             tuple[str, int], ObjectDefinition | None
         ] = {}
@@ -204,6 +213,65 @@ class _Context:
         self._union_arm_names: frozenset[str] | None = None
         self._union_pairs: dict[str, tuple[_UnionPair, ...]] = {}
         self._dynamic_pairs: dict[str, tuple[_DynamicPair, ...]] = {}
+        self.reachable_object_names = local_names & {
+            item.name for item in schema.objects
+        }
+        self.reachable_enum_names = local_names & {
+            item.name for item in schema.enums
+        }
+
+    def module_alias(self, module: str) -> str:
+        encoded = "_".join(
+            f"{len(component)}_{component}" for component in module.split(".")
+        )
+        return f"_fb_import_{encoded}"
+
+    def definition_module(
+        self,
+        qualified_name: str,
+        declaration_file: str | None,
+    ) -> str:
+        return _definition_module(
+            qualified_name,
+            declaration_file,
+            self.package_prefix,
+            gen_onefile=self.gen_onefile,
+        )
+
+    def _symbol_name(
+        self,
+        qualified_name: str,
+        declaration_file: str | None,
+        symbol: str,
+    ) -> str:
+        if qualified_name in self.local_names:
+            return symbol
+        module = self.definition_module(qualified_name, declaration_file)
+        return f"{self.module_alias(module)}.{symbol}"
+
+    def model_name(self, item: ObjectDefinition) -> str:
+        return self._symbol_name(
+            item.name,
+            item.declaration_file,
+            _short_name(item.name),
+        )
+
+    def view_name(self, item: ObjectDefinition) -> str:
+        return f"{self.model_name(item)}View"
+
+    def enum_name(self, item: EnumDefinition) -> str:
+        return self._symbol_name(
+            item.name,
+            item.declaration_file,
+            _short_name(item.name),
+        )
+
+    def union_dispatch_name(self, item: EnumDefinition) -> str:
+        return self._symbol_name(
+            item.name,
+            item.declaration_file,
+            f"_FB_UNION_{_short_name(item.name)}",
+        )
 
     def object_for(self, type_ref: TypeReference) -> ObjectDefinition:
         if type_ref.index < 0 or type_ref.index >= len(self.schema.objects):
@@ -502,7 +570,7 @@ class _Context:
     def scalar_python_type(self, type_ref: TypeReference) -> str:
         enum = self.enum_for(type_ref)
         if enum is not None:
-            return _short_name(enum.name)
+            return self.enum_name(enum)
         return self.scalar_spec(type_ref.base_type).python_type
 
     def model_type(self, type_ref: TypeReference) -> str:
@@ -511,9 +579,11 @@ class _Context:
         if type_ref.base_type is BaseType.STRING:
             return "str"
         if type_ref.base_type is BaseType.OBJECT:
-            return _short_name(self.object_for(type_ref).name)
+            return self.model_name(self.object_for(type_ref))
         if type_ref.base_type is BaseType.VECTOR:
             return self.vector_model_type(type_ref)
+        if type_ref.base_type is BaseType.ARRAY:
+            return self.array_model_type(type_ref)
         raise GenerationError(f"unsupported model type {type_ref.base_type.name}")
 
     def vector_model_type(self, type_ref: TypeReference) -> str:
@@ -523,13 +593,24 @@ class _Context:
         if element in _SCALARS:
             enum = self.enum_for(type_ref)
             if enum is not None:
-                return f"list[{_short_name(enum.name)}]"
+                return f"list[{self.enum_name(enum)}]"
             return f"npt.NDArray[{self.scalar_spec(element).numpy_type}]"
         if element is BaseType.STRING:
             return "list[str]"
         if element is BaseType.OBJECT:
-            return f"list[{_short_name(self.object_for(type_ref).name)}]"
+            return f"list[{self.model_name(self.object_for(type_ref))}]"
         raise GenerationError(f"unsupported vector element type {element.name}")
+
+    def array_model_type(self, type_ref: TypeReference) -> str:
+        element = type_ref.element
+        if element in _SCALARS:
+            enum = self.enum_for(type_ref)
+            if enum is not None:
+                return f"list[{self.enum_name(enum)}]"
+            return f"npt.NDArray[{self.scalar_spec(element).numpy_type}]"
+        if element is BaseType.OBJECT:
+            return f"list[{self.model_name(self.object_for(type_ref))}]"
+        raise GenerationError(f"unsupported array element type {element.name}")
 
     def view_type(self, type_ref: TypeReference) -> str:
         if type_ref.base_type in _SCALARS:
@@ -537,9 +618,11 @@ class _Context:
         if type_ref.base_type is BaseType.STRING:
             return "str"
         if type_ref.base_type is BaseType.OBJECT:
-            return f"{_short_name(self.object_for(type_ref).name)}View"
+            return self.view_name(self.object_for(type_ref))
         if type_ref.base_type is BaseType.VECTOR:
             return self.vector_view_type(type_ref)
+        if type_ref.base_type is BaseType.ARRAY:
+            return self.array_view_type(type_ref)
         raise GenerationError(f"unsupported view type {type_ref.base_type.name}")
 
     def vector_view_type(self, type_ref: TypeReference) -> str:
@@ -554,15 +637,26 @@ class _Context:
         if element is BaseType.OBJECT:
             item = self.object_for(type_ref)
             wrapper = "StructVector" if item.is_struct else "TableVector"
-            return f"{wrapper}[{_short_name(item.name)}View]"
+            return f"{wrapper}[{self.view_name(item)}]"
         raise GenerationError(f"unsupported vector element type {element.name}")
+
+    def array_view_type(self, type_ref: TypeReference) -> str:
+        element = type_ref.element
+        if element in _SCALARS:
+            return f"npt.NDArray[{self.scalar_spec(element).numpy_type}]"
+        if element is BaseType.OBJECT:
+            item = self.object_for(type_ref)
+            if not item.is_struct:
+                raise GenerationError("FlatBuffers arrays may only contain structs")
+            return f"StructVector[{self.view_name(item)}]"
+        raise GenerationError(f"unsupported array element type {element.name}")
 
     def default_expression(self, field: FieldDefinition) -> str:
         if field.optional:
             return "None"
         enum = self.enum_for(field.type)
         if enum is not None:
-            return f"{_short_name(enum.name)}({field.default_integer})"
+            return f"{self.enum_name(enum)}({field.default_integer})"
         if field.type.base_type is BaseType.BOOL:
             return repr(bool(field.default_integer))
         if field.type.base_type in (BaseType.FLOAT, BaseType.DOUBLE):
@@ -576,34 +670,59 @@ class _Context:
     ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         objects: dict[str, set[str]] = defaultdict(set)
         enums: dict[str, set[str]] = defaultdict(set)
-        for item in local_objects:
-            self.dynamic_pairs(item)
-            for field in item.fields:
-                nested = self.nested_target(item, field)
-                if nested is not None:
-                    self._record_object(objects, nested)
-                type_ref = field.type
-                if type_ref.base_type is BaseType.OBJECT:
-                    self._record_object(objects, self.object_for(type_ref))
-                elif type_ref.base_type is BaseType.VECTOR:
-                    if type_ref.element is BaseType.OBJECT:
-                        self._record_object(objects, self.object_for(type_ref))
-                    elif type_ref.element in _SCALARS:
+        pending_objects = list(local_objects)
+        pending_enums = list(local_enums)
+        seen_objects: set[str] = set()
+        seen_enums: set[str] = set()
+        while pending_objects or pending_enums:
+            while pending_objects:
+                item = pending_objects.pop()
+                if item.name in seen_objects:
+                    continue
+                seen_objects.add(item.name)
+                self.dynamic_pairs(item)
+                for field in item.fields:
+                    nested = self.nested_target(item, field)
+                    if nested is not None:
+                        self._record_object(objects, nested)
+                        pending_objects.append(nested)
+                    type_ref = field.type
+                    if type_ref.base_type is BaseType.OBJECT:
+                        target = self.object_for(type_ref)
+                        self._record_object(objects, target)
+                        pending_objects.append(target)
+                    elif type_ref.base_type in (BaseType.VECTOR, BaseType.ARRAY):
+                        if type_ref.element is BaseType.OBJECT:
+                            target = self.object_for(type_ref)
+                            self._record_object(objects, target)
+                            pending_objects.append(target)
+                        elif type_ref.element in _SCALARS:
+                            enum = self.enum_for(type_ref)
+                            if enum is not None:
+                                self._record_enum(enums, enum)
+                                pending_enums.append(enum)
+                    elif type_ref.base_type in _SCALARS:
                         enum = self.enum_for(type_ref)
                         if enum is not None:
                             self._record_enum(enums, enum)
-                elif type_ref.base_type in _SCALARS:
-                    enum = self.enum_for(type_ref)
-                    if enum is not None:
-                        self._record_enum(enums, enum)
-            for pair in self.union_pairs(item):
-                self._record_enum(enums, pair.enum)
-                for arm in pair.arms:
-                    self._record_object(objects, arm.object)
-        for enum in local_enums:
-            if enum.is_union:
-                for arm in self.union_arms(enum):
-                    self._record_object(objects, arm.object)
+                            pending_enums.append(enum)
+                for pair in self.union_pairs(item):
+                    self._record_enum(enums, pair.enum)
+                    pending_enums.append(pair.enum)
+                    for arm in pair.arms:
+                        self._record_object(objects, arm.object)
+                        pending_objects.append(arm.object)
+            while pending_enums:
+                enum = pending_enums.pop()
+                if enum.name in seen_enums:
+                    continue
+                seen_enums.add(enum.name)
+                if enum.is_union:
+                    for arm in self.union_arms(enum):
+                        self._record_object(objects, arm.object)
+                        pending_objects.append(arm.object)
+        self.reachable_object_names = frozenset(seen_objects)
+        self.reachable_enum_names = frozenset(seen_enums)
         return objects, enums
 
     def _record_object(
@@ -611,13 +730,9 @@ class _Context:
         imports: dict[str, set[str]],
         item: ObjectDefinition,
     ) -> None:
-        if item.declaration_file == self.declaration_file:
+        if item.name in self.local_names:
             return
-        module = _definition_module(
-            item.name,
-            item.declaration_file,
-            self.package_prefix,
-        )
+        module = self.definition_module(item.name, item.declaration_file)
         name = _short_name(item.name)
         imports[module].update((name, f"{name}View"))
 
@@ -626,13 +741,9 @@ class _Context:
         imports: dict[str, set[str]],
         item: EnumDefinition,
     ) -> None:
-        if item.declaration_file == self.declaration_file:
+        if item.name in self.local_names:
             return
-        module = _definition_module(
-            item.name,
-            item.declaration_file,
-            self.package_prefix,
-        )
+        module = self.definition_module(item.name, item.declaration_file)
         imports[module].add(_short_name(item.name))
         if item.is_union:
             imports[module].add(f"_FB_UNION_{_short_name(item.name)}")
@@ -666,12 +777,12 @@ def _has_marker_attribute(item: ObjectDefinition, key: str) -> bool:
     return True
 
 
-def _union_model_type(pair: _UnionPair) -> str:
-    return " | ".join(_short_name(arm.object.name) for arm in pair.arms)
+def _union_model_type(context: _Context, pair: _UnionPair) -> str:
+    return " | ".join(context.model_name(arm.object) for arm in pair.arms)
 
 
-def _union_view_type(pair: _UnionPair) -> str:
-    return " | ".join(f"{_short_name(arm.object.name)}View" for arm in pair.arms)
+def _union_view_type(context: _Context, pair: _UnionPair) -> str:
+    return " | ".join(context.view_name(arm.object) for arm in pair.arms)
 
 
 def _dynamic_value_type_name(
@@ -711,13 +822,14 @@ def _model_field_line(
     if dynamic_pair is not None:
         annotation = _dynamic_value_type_name(owner, dynamic_pair)
     elif union_pair is not None:
+        union_type = _union_model_type(context, union_pair)
         annotation = (
-            f"list[{_union_model_type(union_pair)}]"
+            f"list[{union_type} | None]"
             if union_pair.vector
-            else _union_model_type(union_pair)
+            else union_type
         )
     elif nested is not None:
-        annotation = _short_name(nested.name)
+        annotation = context.model_name(nested)
     else:
         annotation = context.model_type(field.type)
     if owner.is_struct:
@@ -745,10 +857,10 @@ def _render_enum(context: _Context, item: EnumDefinition) -> list[str]:
     return lines
 
 
-def _is_numeric_model_vector(context: _Context, field: FieldDefinition) -> bool:
+def _is_numpy_model_field(context: _Context, field: FieldDefinition) -> bool:
     type_ref = field.type
     return (
-        type_ref.base_type is BaseType.VECTOR
+        type_ref.base_type in (BaseType.VECTOR, BaseType.ARRAY)
         and type_ref.element in _SCALARS
         and not _is_byte_vector(type_ref)
         and context.enum_for(type_ref) is None
@@ -760,7 +872,7 @@ def _model_field_comparison(
     field: FieldDefinition,
 ) -> str:
     name = _identifier(field.name)
-    if not _is_numeric_model_vector(context, field):
+    if not _is_numpy_model_field(context, field):
         return f"self.{name} == other.{name}"
 
     arrays_equal = (
@@ -817,7 +929,7 @@ def _render_union_dispatch(context: _Context, item: EnumDefinition) -> list[str]
     ]
     for arm in arms:
         lines.append(
-            f"        {arm.tag}: {_short_name(arm.object.name)}View,"
+            f"        {arm.tag}: {context.view_name(arm.object)},"
         )
     lines.extend(("    },", ")"))
     return lines
@@ -843,7 +955,7 @@ def _render_model(
         field for field in fields if field.id not in hidden_type_field_ids
     ]
     has_numeric_vectors = any(
-        _is_numeric_model_vector(context, field) for field in model_fields
+        _is_numpy_model_field(context, field) for field in model_fields
     )
     options = ["kw_only=True"]
     if not item.is_struct:
@@ -1000,7 +1112,7 @@ def _scalar_load_lines(
     enum = context.enum_for(field.type)
     present = f"{reader}.unpack_from({{buffer}}, {{position}})[0]"
     if enum is not None:
-        present = f"{_short_name(enum.name)}({present})"
+        present = f"{context.enum_name(enum)}({present})"
 
     if struct:
         return [
@@ -1056,7 +1168,7 @@ def _complex_view_loader(context: _Context, field: FieldDefinition) -> str:
     if type_ref.base_type is BaseType.OBJECT:
         item = context.object_for(type_ref)
         method = "_read_struct" if item.is_struct else "_read_table"
-        return f"self.{method}({field.offset}, {_short_name(item.name)}View)"
+        return f"self.{method}({field.offset}, {context.view_name(item)})"
     if type_ref.base_type is BaseType.VECTOR:
         element = type_ref.element
         if _is_byte_vector(type_ref):
@@ -1069,8 +1181,25 @@ def _complex_view_loader(context: _Context, field: FieldDefinition) -> str:
         if element is BaseType.OBJECT:
             item = context.object_for(type_ref)
             method = "_read_struct_vector" if item.is_struct else "_read_table_vector"
-            return f"self.{method}({field.offset}, {_short_name(item.name)}View)"
+            return f"self.{method}({field.offset}, {context.view_name(item)})"
         raise GenerationError(f"unsupported vector element type {element.name}")
+    if type_ref.base_type is BaseType.ARRAY:
+        element = type_ref.element
+        if element in _SCALARS:
+            dtype = _NUMPY_DTYPES[element]
+            return (
+                f"self._read_numpy_array({field.offset}, "
+                f"{type_ref.fixed_length}, {dtype!r})"
+            )
+        if element is BaseType.OBJECT:
+            item = context.object_for(type_ref)
+            if not item.is_struct:
+                raise GenerationError("FlatBuffers arrays may only contain structs")
+            return (
+                f"self._read_struct_array({field.offset}, "
+                f"{type_ref.fixed_length}, {context.view_name(item)})"
+            )
+        raise GenerationError(f"unsupported array element type {element.name}")
     raise GenerationError(f"unsupported field type {type_ref.base_type.name}")
 
 
@@ -1119,6 +1248,24 @@ def _complex_view_property(
     return [
         "    @property",
         f"    def {name}(self) -> {return_type}:",
+        *_complex_cache_load_lines(
+            context,
+            field,
+            target="value",
+            indent="        ",
+        ),
+        "        return value",
+    ]
+
+
+def _array_view_property(
+    context: _Context,
+    field: FieldDefinition,
+) -> list[str]:
+    name = _identifier(field.name)
+    return [
+        "    @property",
+        f"    def {name}(self) -> {context.view_type(field.type)}:",
         *_complex_cache_load_lines(
             context,
             field,
@@ -1266,6 +1413,7 @@ def _dynamic_view_property(
 
 
 def _nested_cache_load_lines(
+    context: _Context,
     field: FieldDefinition,
     nested: ObjectDefinition,
     *,
@@ -1273,7 +1421,7 @@ def _nested_cache_load_lines(
     indent: str,
     size_prefixed: bool,
 ) -> list[str]:
-    nested_name = _short_name(nested.name)
+    nested_name = context.view_name(nested)
     cache_slot = _nested_cache_slot(field, size_prefixed=size_prefixed)
     payload_property = _raw_property_name(field)
     lines = [
@@ -1293,7 +1441,7 @@ def _nested_cache_load_lines(
     load_indent = indent if field.required else f"{indent}    "
     lines.extend(
         [
-            f"{load_indent}    {target} = {nested_name}View.from_buffer(",
+            f"{load_indent}    {target} = {nested_name}.from_buffer(",
             f"{load_indent}        payload,",
             f"{load_indent}        size_prefixed={size_prefixed!r},",
             f"{load_indent}    )",
@@ -1304,16 +1452,18 @@ def _nested_cache_load_lines(
 
 
 def _nested_view_members(
+    context: _Context,
     field: FieldDefinition,
     nested: ObjectDefinition,
 ) -> list[str]:
     property_name = _identifier(field.name)
-    nested_name = _short_name(nested.name)
-    return_type = _view_return_type(f"{nested_name}View", field)
+    nested_name = context.view_name(nested)
+    return_type = _view_return_type(nested_name, field)
     return [
         "    @property",
         f"    def {property_name}(self) -> {return_type}:",
         *_nested_cache_load_lines(
+            context,
             field,
             nested,
             target="value",
@@ -1330,6 +1480,7 @@ def _nested_view_members(
         "        if not size_prefixed:",
         f"            return self.{property_name}",
         *_nested_cache_load_lines(
+            context,
             field,
             nested,
             target="value",
@@ -1341,6 +1492,7 @@ def _nested_view_members(
 
 
 def _union_cache_load_lines(
+    context: _Context,
     pair: _UnionPair,
     *,
     target: str,
@@ -1349,8 +1501,8 @@ def _union_cache_load_lines(
     field = pair.value_field
     slot = _cache_slot(field)
     property_name = _identifier(field.name)
-    dispatch = f"_FB_UNION_{_short_name(pair.enum.name)}"
-    annotation = _view_return_type(_union_view_type(pair), field)
+    dispatch = context.union_dispatch_name(pair.enum)
+    annotation = _view_return_type(_union_view_type(context, pair), field)
     lines = [
         f"{indent}try:",
         f"{indent}    {target} = self.{slot}",
@@ -1376,14 +1528,15 @@ def _union_cache_load_lines(
     return lines
 
 
-def _union_view_property(pair: _UnionPair) -> list[str]:
+def _union_view_property(context: _Context, pair: _UnionPair) -> list[str]:
     field = pair.value_field
     property_name = _identifier(field.name)
-    annotation = _view_return_type(_union_view_type(pair), field)
+    annotation = _view_return_type(_union_view_type(context, pair), field)
     return [
         "    @property",
         f"    def {property_name}(self) -> {annotation}:",
         *_union_cache_load_lines(
+            context,
             pair,
             target="value",
             indent="        ",
@@ -1393,6 +1546,7 @@ def _union_view_property(pair: _UnionPair) -> list[str]:
 
 
 def _union_vector_cache_load_lines(
+    context: _Context,
     pair: _UnionPair,
     *,
     target: str,
@@ -1402,7 +1556,7 @@ def _union_vector_cache_load_lines(
     type_field = pair.type_field
     slot = _cache_slot(field)
     type_property = _identifier(type_field.name)
-    dispatch = f"_FB_UNION_{_short_name(pair.enum.name)}"
+    dispatch = context.union_dispatch_name(pair.enum)
     reader, _ = _SCALAR_READERS[pair.enum.underlying_type.base_type]
     lines = [
         f"{indent}try:",
@@ -1437,17 +1591,18 @@ def _union_vector_cache_load_lines(
     return lines
 
 
-def _union_vector_property(pair: _UnionPair) -> list[str]:
+def _union_vector_property(context: _Context, pair: _UnionPair) -> list[str]:
     field = pair.value_field
     name = _identifier(field.name)
     annotation = _view_return_type(
-        f"UnionVector[{_union_view_type(pair)}]",
+        f"UnionVector[{_union_view_type(context, pair)} | None]",
         field,
     )
     return [
         "    @property",
         f"    def {name}(self) -> {annotation}:",
         *_union_vector_cache_load_lines(
+            context,
             pair,
             target="value",
             indent="        ",
@@ -1466,8 +1621,8 @@ def _render_view_field_property(
 ) -> list[str]:
     if union_pair is not None:
         if union_pair.vector:
-            return _union_vector_property(union_pair)
-        return _union_view_property(union_pair)
+            return _union_vector_property(context, union_pair)
+        return _union_view_property(context, union_pair)
     if raw:
         return _complex_view_property(
             context,
@@ -1478,6 +1633,8 @@ def _render_view_field_property(
         return _scalar_view_property(context, field, item.is_struct)
     if not item.is_struct:
         return _complex_view_property(context, field)
+    if field.type.base_type is BaseType.ARRAY:
+        return _array_view_property(context, field)
     if field.type.base_type is not BaseType.OBJECT:
         raise GenerationError(
             f"unsupported struct field type {field.type.base_type.name}"
@@ -1600,7 +1757,7 @@ def _render_view(context: _Context, item: ObjectDefinition, root: bool) -> list[
         target = nested_targets.get(field.id)
         if target is not None:
             lines.append("")
-            lines.extend(_nested_view_members(field, target))
+            lines.extend(_nested_view_members(context, field, target))
 
     for pair in dynamic_pairs:
         lines.append("")
@@ -1743,6 +1900,32 @@ def _native_field_plan(
             raise GenerationError(
                 f"unsupported native vector element {type_ref.element.name}"
             )
+    elif type_ref.base_type is BaseType.ARRAY:
+        plan.update(
+            fixed_length=type_ref.fixed_length,
+            element_size=type_ref.element_size,
+        )
+        if type_ref.element in _SCALARS:
+            plan.update(
+                kind="array_scalar",
+                scalar=context.scalar_spec(type_ref.element).runtime_name,
+            )
+            enum = context.enum_for(type_ref)
+            if enum is not None:
+                plan["enum_type"] = enum.name
+        elif type_ref.element is BaseType.OBJECT:
+            target = context.object_for(type_ref)
+            if not target.is_struct:
+                raise GenerationError("FlatBuffers arrays may only contain structs")
+            plan.update(
+                kind="array_struct",
+                target=target.name,
+                element_size=target.byte_size,
+            )
+        else:
+            raise GenerationError(
+                f"unsupported native array element {type_ref.element.name}"
+            )
     else:  # pragma: no cover - rejected by earlier generation checks
         raise GenerationError(f"unsupported native field type {type_ref.base_type.name}")
     return plan
@@ -1751,6 +1934,8 @@ def _native_field_plan(
 def _native_module_plan_bytes(context: _Context) -> bytes:
     objects: list[dict[str, object]] = []
     for item in context.schema.objects:
+        if item.name not in context.reachable_object_names:
+            continue
         union_pairs = context.union_pairs(item)
         dynamic_pairs = context.dynamic_pairs(item)
         union_by_value = {pair.value_field.id: pair for pair in union_pairs}
@@ -1812,19 +1997,47 @@ def render_module(
     declaration_file: str,
     *,
     package_prefix: Iterable[str] = (),
+    namespace: tuple[str, ...] | None = None,
+    definition_names: frozenset[str] | None = None,
+    gen_onefile: bool = False,
 ) -> str:
-    """Render one deterministic Python module for one declaring ``.fbs`` file."""
+    """Render definitions from one declaring file and optional namespace."""
 
     prefix = tuple(_snake_case(part) for part in package_prefix)
-    context = _Context(schema, declaration_file, prefix)
-    local_objects = [
-        item for item in schema.objects if item.declaration_file == declaration_file
-    ]
-    local_enums = [
-        item for item in schema.enums if item.declaration_file == declaration_file
-    ]
-    if not local_objects and not local_enums:
+
+    def is_local(item: ObjectDefinition | EnumDefinition) -> bool:
+        return (
+            item.declaration_file == declaration_file
+            and (namespace is None or _namespace(item.name) == namespace)
+            and (definition_names is None or item.name in definition_names)
+        )
+
+    local_objects = [item for item in schema.objects if is_local(item)]
+    local_enums = [item for item in schema.enums if is_local(item)]
+    local_definitions = [*local_objects, *local_enums]
+    if not local_definitions:
         raise GenerationError(f"no definitions declared in {declaration_file!r}")
+    definitions_by_symbol: dict[str, list[str]] = defaultdict(list)
+    for item in local_definitions:
+        definitions_by_symbol[_short_name(item.name)].append(item.name)
+    collisions = {
+        symbol: names
+        for symbol, names in definitions_by_symbol.items()
+        if len(names) > 1
+    }
+    if collisions:
+        symbol, names = min(collisions.items())
+        raise GenerationError(
+            f"one-file generation cannot represent {symbol!r} from "
+            f"{', '.join(sorted(names))}"
+        )
+    local_names = frozenset(item.name for item in local_definitions)
+    context = _Context(
+        schema,
+        prefix,
+        local_names,
+        gen_onefile,
+    )
     dynamic_field_pairs = [
         (item, pair)
         for item in local_objects
@@ -1851,18 +2064,10 @@ def render_module(
     if has_unions:
         typing_imports.append("cast")
 
-    namespaces = {
-        _namespace(item.name) for item in [*local_objects, *local_enums]
-    }
-    if len(namespaces) > 1:
-        raise GenerationError(
-            "one .fbs file declaring multiple namespaces is not supported yet"
-        )
-
     root = None
     if schema.root_table is not None:
         candidate = schema.object(schema.root_table)
-        if candidate.declaration_file == declaration_file:
+        if candidate.name in local_names:
             root = candidate
     dynamic_extension = False
     for item in local_objects:
@@ -1879,12 +2084,7 @@ def render_module(
         local_enums,
     )
     import_modules = set(object_imports) | set(enum_imports)
-    imported_origins: dict[str, set[str]] = defaultdict(set)
-    for module in import_modules:
-        for imported_name in (
-            object_imports.get(module, set()) | enum_imports.get(module, set())
-        ):
-            imported_origins[imported_name].add(module)
+    enum_dependency_modules = set(enum_imports)
     local_symbols: set[str] = set()
     for item in local_objects:
         name = _short_name(item.name)
@@ -1905,15 +2105,18 @@ def render_module(
                 "another generated symbol"
             )
         local_symbols.add(dynamic_name)
-    for imported_name, modules in sorted(
-        imported_origins.items(),
-        key=lambda item: (item[0].startswith("_"), item[0]),
-    ):
-        if len(modules) > 1 or imported_name in local_symbols:
-            origins = ", ".join(sorted(modules))
-            raise GenerationError(
-                f"generated symbol collision for {imported_name!r} from {origins}"
-            )
+    reexports: dict[str, str | None] = {}
+    for module in sorted(import_modules):
+        for name in object_imports.get(module, set()) | enum_imports.get(
+            module,
+            set(),
+        ):
+            if name in local_symbols:
+                continue
+            if name not in reexports:
+                reexports[name] = module
+            elif reexports[name] != module:
+                reexports[name] = None
     scalar_readers = {
         _SCALAR_READERS[field.type.base_type]
         for item in local_objects
@@ -1968,12 +2171,12 @@ def render_module(
         "from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types",
         "from msgspec_flatbuffers._native import NativePlan as _NativePlan",
     ]
-    for module in sorted(import_modules):
-        names = sorted(
-            object_imports.get(module, set()) | enum_imports.get(module, set())
+    if enum_dependency_modules:
+        lines.append("")
+        lines.extend(
+            f"import {module} as {context.module_alias(module)}"
+            for module in sorted(enum_dependency_modules)
         )
-        lines.append(f"from {module} import {', '.join(names)}")
-
     if has_byte_vector_helpers:
         lines.extend(("", '_NestedViewT = TypeVar("_NestedViewT", bound=TableView)'))
     if scalar_readers:
@@ -1990,30 +2193,32 @@ def render_module(
         lines.extend(("", "", *_render_dynamic_value_type(item, pair)))
     for item in local_objects:
         lines.extend(("", "", *_render_model(context, item, item is root)))
+    for item in local_objects:
+        lines.extend(("", "", *_render_view(context, item, item is root)))
+    object_dependency_modules = import_modules - enum_dependency_modules
+    if object_dependency_modules:
+        lines.extend(("", ""))
+        lines.extend(
+            f"import {module} as {context.module_alias(module)}"
+            for module in sorted(object_dependency_modules)
+        )
+    reexport_lines = [
+        f"{name} = {context.module_alias(module)}.{name}"
+        for name, module in sorted(reexports.items())
+        if module is not None
+    ]
+    if reexport_lines:
+        lines.extend(("", "", *reexport_lines))
+    for item in local_enums:
+        if item.is_union:
+            lines.extend(("", "", *_render_union_dispatch(context, item)))
     bound_types: dict[str, str] = {}
     for item in context.schema.objects:
-        if item.declaration_file == declaration_file:
-            bound_types[item.name] = _short_name(item.name)
-        else:
-            module = _definition_module(
-                item.name,
-                item.declaration_file,
-                context.package_prefix,
-            )
-            if _short_name(item.name) in object_imports.get(module, set()):
-                bound_types[item.name] = _short_name(item.name)
+        if item.name in context.reachable_object_names:
+            bound_types[item.name] = context.model_name(item)
     for enum in context.schema.enums:
-        enum_name = _short_name(enum.name)
-        if enum.declaration_file == declaration_file:
-            bound_types[enum.name] = enum_name
-            continue
-        module = _definition_module(
-            enum.name,
-            enum.declaration_file,
-            context.package_prefix,
-        )
-        if enum_name in enum_imports.get(module, set()):
-            bound_types[enum.name] = enum_name
+        if enum.name in context.reachable_enum_names:
+            bound_types[enum.name] = context.enum_name(enum)
     for item, pair in dynamic_field_pairs:
         bound_types[_dynamic_value_type_key(item, pair)] = (
             _dynamic_value_type_name(item, pair)
@@ -2025,11 +2230,6 @@ def render_module(
             for name, type_name in sorted(bound_types.items())
         )
         lines.append("})")
-    for item in local_objects:
-        lines.extend(("", "", *_render_view(context, item, item is root)))
-    for item in local_enums:
-        if item.is_union:
-            lines.extend(("", "", *_render_union_dispatch(context, item)))
     if root is not None:
         lines.extend(("", "", *_render_root_builder(context, root)))
     if dynamic_extension and root is not None:
@@ -2075,8 +2275,9 @@ def generate(
     flatc: StrPath = "flatc",
     project_root: StrPath | None = None,
     package: str | None = None,
+    gen_onefile: bool = False,
 ) -> Path:
-    """Generate one Python module for one FlatBuffers IDL file."""
+    """Generate Python modules and return the root definition's module path."""
 
     source = Path(schema_path).resolve()
     root = source.parent if project_root is None else Path(project_root).resolve()
@@ -2097,40 +2298,74 @@ def generate(
             f"compiled schema does not contain declarations for {declaration_file}"
         )
 
-    namespaces = {_namespace(item.name) for item in definitions}
-    if len(namespaces) != 1:
-        raise GenerationError(
-            "one .fbs file declaring multiple namespaces is not supported yet"
-        )
-    namespace = next(iter(namespaces))
     prefix = tuple(part for part in (package or "").split(".") if part)
-    package_parts = (
-        *(_snake_case(part) for part in prefix),
-        *(_snake_case(part) for part in namespace),
-    )
     output_root = Path(output_dir).resolve()
-    target_dir = output_root.joinpath(*package_parts)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    prefix_parts = tuple(_snake_case(part) for part in prefix)
+    if gen_onefile:
+        module_specs: list[tuple[str | None, tuple[str, ...], str]] = [
+            (None, (), _snake_case(source.stem))
+        ]
+    else:
+        module_specs = [
+            (
+                item.name,
+                _namespace(item.name),
+                _snake_case(_short_name(item.name)),
+            )
+            for item in sorted(definitions, key=lambda item: item.name)
+        ]
+    rendered_modules: list[tuple[str | None, Path, str]] = []
+    for definition_name, namespace_parts, module_name in module_specs:
+        package_parts = (
+            *prefix_parts,
+            *(_snake_case(part) for part in namespace_parts),
+        )
+        target = output_root.joinpath(*package_parts, f"{module_name}.py")
+        selected_names = (
+            None
+            if definition_name is None
+            else frozenset((definition_name,))
+        )
+        source_text = render_module(
+            schema,
+            declaration_file,
+            package_prefix=prefix,
+            definition_names=selected_names,
+            gen_onefile=gen_onefile,
+        )
+        rendered_modules.append((definition_name, target, source_text))
 
-    current = output_root
-    for part in package_parts:
-        current /= part
-        init = current / "__init__.py"
-        if not init.exists():
-            init.write_text("", encoding="utf-8")
+    expected_header = [_GENERATED_HEADER, f"# Source: {declaration_file}"]
+    for _, target, _ in rendered_modules:
+        if target.exists():
+            actual_header = target.read_text(encoding="utf-8").splitlines()[:2]
+            if actual_header != expected_header:
+                raise GenerationError(
+                    f"refusing to overwrite non-generated file: {target}"
+                )
 
-    target = target_dir / f"{_snake_case(source.stem)}.py"
-    if target.exists():
-        expected_header = [_GENERATED_HEADER, f"# Source: {declaration_file}"]
-        actual_header = target.read_text(encoding="utf-8").splitlines()[:2]
-        if actual_header != expected_header:
-            raise GenerationError(f"refusing to overwrite non-generated file: {target}")
+    initialized_packages: set[Path] = set()
+    for _, target, source_text in rendered_modules:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        relative_parent = target.parent.relative_to(output_root)
+        current = output_root
+        for part in relative_parent.parts:
+            current /= part
+            if current in initialized_packages:
+                continue
+            init = current / "__init__.py"
+            if not init.exists():
+                init.write_text("", encoding="utf-8")
+            initialized_packages.add(current)
+        target.write_text(source_text, encoding="utf-8")
 
-    target.write_text(
-        render_module(schema, declaration_file, package_prefix=prefix),
-        encoding="utf-8",
+    if gen_onefile or schema.root_table is None:
+        return rendered_modules[0][1]
+    return next(
+        target
+        for definition_name, target, _ in rendered_modules
+        if definition_name == schema.root_table
     )
-    return target
 
 
 __all__ = ["GenerationError", "generate", "render_module"]

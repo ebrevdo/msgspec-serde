@@ -118,9 +118,10 @@ def test_scalar_union_and_union_vector_round_trip_and_cache(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     generated, _ = generated_modules
-    assert generated.Payload.__annotations__["residents"] == (
-        "list[Cat | Dog] | None"
-    )
+    residents_annotation = generated.Payload.__annotations__["residents"]
+    assert residents_annotation.startswith("list[")
+    assert ".Cat" in residents_annotation and ".Dog" in residents_annotation
+    assert residents_annotation.endswith(" | None] | None")
     model = _payload_model(generated)
     buffer = model.to_flatbuffer()
     view = generated.PayloadView.from_buffer(buffer)
@@ -328,17 +329,16 @@ def test_nested_flatbuffer_target_does_not_need_to_be_the_file_root(
         encoding="utf-8",
     )
     module_path = generate(source, tmp_path / "generated", project_root=tmp_path)
-    spec = importlib.util.spec_from_file_location("non_root_nested_generated", module_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    model = module.Container(payload=module.Inner(value=42))
+    output = tmp_path / "generated"
+    with _temporary_sys_path(output):
+        module = importlib.import_module("example.non_root_nested.container")
+        model = module.Container(payload=module.Inner(value=42))
 
-    view = module.ContainerView.from_buffer(model.to_flatbuffer())
+        view = module.ContainerView.from_buffer(model.to_flatbuffer())
 
-    assert view.payload.value == 42
-    assert view.to_model() == model
+        assert module_path == output / "example" / "non_root_nested" / "container.py"
+        assert view.payload.value == 42
+        assert view.to_model() == model
 
 
 def test_msgspec_hooks_preserve_arrays_and_tagged_unions(
@@ -564,7 +564,7 @@ def test_union_vector_rejects_unknown_tags_null_offsets_and_length_mismatch(
     none_tag_buffer[type_start + 1] = int(generated.Pet.NONE)
     none_tag = generated.PayloadView.from_buffer(none_tag_buffer)
     assert none_tag.residents is not None
-    with pytest.raises(InvalidBufferError, match="cannot contain NONE"):
+    with pytest.raises(InvalidBufferError, match="NONE.*has a payload"):
         none_tag.residents[1]
 
     null_offset_buffer = bytearray(original)
@@ -636,7 +636,7 @@ def test_unsupported_union_arms_are_rejected_during_generation(
         generate(source, tmp_path / "generated")
 
 
-def test_union_alternative_short_name_collisions_are_rejected(
+def test_union_alternative_short_name_collisions_are_qualified(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "a.fbs").write_text(
@@ -662,19 +662,29 @@ def test_union_alternative_short_name_collisions_are_rejected(
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        GenerationError,
-        match=r"generated symbol collision.*Item",
-    ):
-        generate(
-            root,
-            tmp_path / "generated",
-            include_dirs=[tmp_path],
-            project_root=tmp_path,
-        )
+    output = tmp_path / "generated"
+    generate(tmp_path / "a.fbs", output, project_root=tmp_path)
+    generate(tmp_path / "b.fbs", output, project_root=tmp_path)
+    generate(
+        root,
+        output,
+        include_dirs=[tmp_path],
+        project_root=tmp_path,
+    )
+
+    with _temporary_sys_path(output):
+        a = importlib.import_module("a.item")
+        b = importlib.import_module("b.item")
+        generated = importlib.import_module("collision.root")
+
+        a_model = generated.Root(value=a.Item(a=1))
+        b_model = generated.Root(value=b.Item(b=2))
+
+        assert generated.Root.from_flatbuffer(a_model.to_flatbuffer()) == a_model
+        assert generated.Root.from_flatbuffer(b_model.to_flatbuffer()) == b_model
 
 
-def test_nested_target_short_name_collision_with_local_symbols_is_rejected(
+def test_nested_target_short_name_collision_uses_qualified_type(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "shared.fbs").write_text(
@@ -702,17 +712,25 @@ def test_nested_target_short_name_collision_with_local_symbols_is_rejected(
         ),
         encoding="utf-8",
     )
+    output = tmp_path / "generated"
+    generate(tmp_path / "shared.fbs", output, project_root=tmp_path)
+    generate(
+        outer,
+        output,
+        include_dirs=[tmp_path],
+        project_root=tmp_path,
+    )
 
-    with pytest.raises(
-        GenerationError,
-        match=r"generated symbol collision.*Item",
-    ):
-        generate(
-            outer,
-            tmp_path / "generated",
-            include_dirs=[tmp_path],
-            project_root=tmp_path,
-        )
+    _clear_generated_modules("shared")
+    _clear_generated_modules("outer")
+    with _temporary_sys_path(output):
+        shared = importlib.import_module("shared.item")
+        generated = importlib.import_module("outer.envelope")
+        model = generated.Envelope(payload=shared.Item(shared=42))
+
+        assert generated.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+    _clear_generated_modules("shared")
+    _clear_generated_modules("outer")
 
 
 def test_reserved_msgspec_tag_field_is_rejected(tmp_path: Path) -> None:
@@ -802,7 +820,7 @@ def required_modules(tmp_path: Path) -> Iterator[tuple[ModuleType, ModuleType]]:
     _clear_generated_modules()
     with _temporary_sys_path(output):
         payload = importlib.import_module("example.nested.payload")
-        required = importlib.import_module("example.required.required")
+        required = importlib.import_module("example.required.required_holder")
         yield payload, required
     _clear_generated_modules()
 
@@ -951,8 +969,20 @@ def test_union_schema_evolution_preserves_known_values_and_rejects_unknown_arms(
         encoding="utf-8",
     )
     output = tmp_path / "evolution-generated"
-    generate(v1_schema, output, project_root=tmp_path)
-    generate(v2_schema, output, project_root=tmp_path)
+    generate(
+        v1_schema,
+        output,
+        project_root=tmp_path,
+        package="evolution",
+        gen_onefile=True,
+    )
+    generate(
+        v2_schema,
+        output,
+        project_root=tmp_path,
+        package="evolution",
+        gen_onefile=True,
+    )
 
     _clear_generated_modules("evolution")
     with _temporary_sys_path(output):

@@ -8,22 +8,46 @@ from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
 
+import msgspec
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import BufferBoundsError, generate
+from msgspec_flatbuffers import BufferBoundsError, dec_hook, enc_hook, generate
 
 HAS_FLATC = shutil.which("flatc") is not None
 pytestmark = pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
+    generated_root = path.parent
+    while (generated_root / "__init__.py").is_file():
+        generated_root = generated_root.parent
+    root_string = str(generated_root)
+    generated_packages = {
+        child.name
+        for child in generated_root.iterdir()
+        if child.is_dir() and (child / "__init__.py").is_file()
+    }
+    generated_modules = {
+        child.stem for child in generated_root.glob("*.py")
+    }
+    for imported_name in tuple(sys.modules):
+        if (
+            imported_name.split(".", 1)[0] in generated_packages
+            or imported_name in generated_modules
+            or imported_name == name
+        ):
+            sys.modules.pop(imported_name, None)
+    sys.path.insert(0, root_string)
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(root_string)
     return module
 
 
@@ -49,6 +73,14 @@ def _assert_writable_owned_arrays(model: object, names: Iterable[str]) -> None:
         array = getattr(model, name)
         assert array.flags.owndata
         assert array.flags.writeable
+
+
+def _assert_json_round_trip(model: object) -> None:
+    assert msgspec.json.decode(
+        msgspec.json.encode(model, enc_hook=enc_hook),
+        type=type(model),
+        dec_hook=dec_hook,
+    ) == model
 
 
 def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
@@ -173,6 +205,130 @@ def test_native_module_plan_builds_nested_tables(tmp_path: Path) -> None:
     )
 
     assert generated.ParentView.from_buffer(buffer).to_model() == model
+
+
+def test_nested_structs_and_fixed_arrays_round_trip(tmp_path: Path) -> None:
+    generated = _generate_module(
+        tmp_path,
+        "fixed_arrays",
+        "namespace Native;",
+        "enum Mode : byte { Off = 0, On = 1 }",
+        "struct Point { x:int; y:int; }",
+        "struct Pair { first:Point; second:Point; }",
+        "struct FixedData {",
+        "  values:[int:4];",
+        "  modes:[Mode:2];",
+        "  points:[Point:2];",
+        "  pair:Pair;",
+        "}",
+        "table Root { data:FixedData; }",
+        "root_type Root;",
+    )
+    point_a = generated.Point(x=1, y=2)
+    point_b = generated.Point(x=3, y=4)
+    data = generated.FixedData(
+        values=np.array([10, 20, 30, 40], dtype=np.int32),
+        modes=[generated.Mode.Off, generated.Mode.On],
+        points=[point_a, point_b],
+        pair=generated.Pair(first=point_b, second=point_a),
+    )
+    model = generated.Root(data=data)
+
+    buffer = model.to_flatbuffer()
+    restored = generated.Root.from_flatbuffer(buffer)
+    view = generated.RootView.from_buffer(buffer)
+
+    assert restored == model
+    _assert_json_round_trip(model)
+    assert restored.data is not None
+    _assert_writable_owned_arrays(restored.data, ["values"])
+    assert view.data is not None
+    np.testing.assert_array_equal(view.data.values, [10, 20, 30, 40])
+    assert not view.data.values.flags.writeable
+    np.testing.assert_array_equal(view.data.modes, [0, 1])
+    assert view.data.points[0].x == 1
+    assert view.data.points[0] is view.data.points[0]
+    assert view.data.pair.first.y == 4
+    assert generated.FixedData.__annotations__["values"] == (
+        "npt.NDArray[np.int32]"
+    )
+    assert generated.FixedData.__annotations__["modes"].endswith(".Mode]")
+
+    data.values = np.array([1, 2, 3], dtype=np.int32)
+    with pytest.raises(ValueError, match="fixed array requires 4 items"):
+        model.to_flatbuffer()
+
+
+def test_union_vectors_round_trip_none_elements(tmp_path: Path) -> None:
+    generated = _generate_module(
+        tmp_path,
+        "nullable_union_vector",
+        "namespace Native;",
+        "table Cat { lives:int = 9; }",
+        "table Dog { good:bool = true; }",
+        "union Pet { Cat, Dog }",
+        "table Root { pets:[Pet]; }",
+        "root_type Root;",
+    )
+    model = generated.Root(
+        pets=[generated.Cat(lives=7), None, generated.Dog(good=False)]
+    )
+
+    buffer = model.to_flatbuffer()
+    restored = generated.Root.from_flatbuffer(buffer)
+    pets = generated.RootView.from_buffer(buffer).pets
+
+    assert restored == model
+    _assert_json_round_trip(model)
+    assert pets is not None
+    assert pets[0].lives == 7
+    assert pets[1] is None
+    assert not pets[2].good
+    model_annotation = generated.Root.__annotations__["pets"]
+    view_annotation = generated.RootView.pets.fget.__annotations__["return"]
+    assert model_annotation.startswith("list[")
+    assert ".Cat" in model_annotation and ".Dog" in model_annotation
+    assert model_annotation.endswith(" | None] | None")
+    assert view_annotation.startswith("UnionVector[")
+    assert ".CatView" in view_annotation and ".DogView" in view_annotation
+    assert view_annotation.endswith(" | None] | None")
+
+
+def test_fixed_arrays_round_trip_every_numpy_dtype(tmp_path: Path) -> None:
+    generated = _generate_module(
+        tmp_path,
+        "fixed_array_dtypes",
+        "namespace Native;",
+        "struct FixedArrays {",
+        "bools:[bool:3]; i8s:[byte:3]; u8s:[ubyte:3];",
+        "i16s:[short:3]; u16s:[ushort:3];",
+        "i32s:[int:3]; u32s:[uint:3];",
+        "i64s:[long:3]; u64s:[ulong:3];",
+        "f32s:[float:3]; f64s:[double:3];",
+        "}",
+        "table Root { values:FixedArrays; }",
+        "root_type Root;",
+    )
+    arrays = {
+        "bools": np.array([True, False, True], dtype=np.bool_),
+        "i8s": np.array([-2, 0, 3], dtype=np.int8),
+        "u8s": np.array([0, 3, 255], dtype=np.uint8),
+        "i16s": np.array([-300, 0, 400], dtype=np.int16),
+        "u16s": np.array([0, 400, 65_535], dtype=np.uint16),
+        "i32s": np.array([-100_000, 0, 200_000], dtype=np.int32),
+        "u32s": np.array([0, 200_000, 2**32 - 1], dtype=np.uint32),
+        "i64s": np.array([-(2**50), 0, 2**50], dtype=np.int64),
+        "u64s": np.array([0, 2**50, 2**63], dtype=np.uint64),
+        "f32s": np.array([-1.25, 0.0, 2.5], dtype=np.float32),
+        "f64s": np.array([-1.25, 0.0, 2.5], dtype=np.float64),
+    }
+    model = generated.Root(values=generated.FixedArrays(**arrays))
+
+    restored = generated.Root.from_flatbuffer(model.to_flatbuffer())
+
+    assert restored == model
+    assert restored.values is not None
+    _assert_writable_owned_arrays(restored.values, arrays)
 
 
 def test_native_plan_round_trips_every_numpy_vector_dtype(tmp_path: Path) -> None:

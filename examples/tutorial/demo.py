@@ -13,6 +13,11 @@ from tutorial.dynamic_envelope import (  # ty: ignore[unresolved-import]
     DynamicEnvelopePayload,
     DynamicEnvelopeView,
 )
+from tutorial.extension_list import (  # ty: ignore[unresolved-import]
+    Extension,
+    ExtensionList,
+    ExtensionListView,
+)
 from tutorial.metric import Metric, MetricView  # ty: ignore[unresolved-import]
 from tutorial.monster import (  # ty: ignore[unresolved-import]
     Color,
@@ -25,18 +30,13 @@ from tutorial.nested_envelope import (  # ty: ignore[unresolved-import]
     NestedEnvelope,
     NestedEnvelopeView,
 )
-from tutorial.pets import (  # ty: ignore[unresolved-import]
+from tutorial.pet_list import (  # ty: ignore[unresolved-import]
     Cat,
     CatView,
     Dog,
     Pet,
     PetList,
     PetListView,
-)
-from tutorial.raw_extensions import (  # ty: ignore[unresolved-import]
-    Extension,
-    ExtensionList,
-    ExtensionListView,
 )
 
 from msgspec_flatbuffers import DynamicModelOverrides, dec_hook, enc_hook

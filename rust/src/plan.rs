@@ -54,6 +54,8 @@ enum FieldKind {
     Dynamic,
     Union,
     UnionVector,
+    ArrayScalar,
+    ArrayStruct,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -114,6 +116,10 @@ struct FieldWire {
     dynamic_type: Option<String>,
     #[serde(default)]
     arms: Vec<ArmWire>,
+    #[serde(default)]
+    fixed_length: usize,
+    #[serde(default)]
+    element_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +131,19 @@ struct ArmWire {
 }
 
 type AnyOffset = WIPOffset<UnionWIPOffset>;
+
+struct NullableOffset(Option<u32>);
+
+impl Push for NullableOffset {
+    type Output = u32;
+
+    unsafe fn push(&self, dst: &mut [u8], written_len: usize) {
+        let value = self
+            .0
+            .map_or(0, |offset| (4 + written_len - offset as usize) as u32);
+        unsafe { value.push(dst, written_len) };
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Discriminator {
@@ -884,6 +903,83 @@ fn write_struct_scalar(
     Ok(())
 }
 
+fn require_fixed_array_length(expected: usize, actual: usize) -> PyResult<()> {
+    if actual != expected {
+        return Err(PyValueError::new_err(format!(
+            "fixed array requires {expected} items, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn write_struct_scalar_array(
+    buffer: &mut [u8],
+    offset: usize,
+    length: usize,
+    scalar: ScalarKind,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    macro_rules! write_array {
+        ($ty:ty) => {{
+            let values = if let Ok(raw) = PyUntypedBuffer::get(value) {
+                if raw.dimensions() != 1 || !buffer_matches_native_scalar(&raw, scalar) {
+                    return Err(PyTypeError::new_err(format!(
+                        "numeric array field requires one-dimensional native {:?} data",
+                        scalar,
+                    )));
+                }
+                raw.as_typed::<$ty>()?.to_vec(value.py())?
+            } else {
+                value.extract::<Vec<$ty>>()?
+            };
+            require_fixed_array_length(length, values.len())?;
+            let byte_length = length * size_of::<$ty>();
+            let output = buffer
+                .get_mut(offset..offset + byte_length)
+                .ok_or_else(|| PyValueError::new_err("fixed array lies outside its struct"))?;
+            if cfg!(target_endian = "little") {
+                output.copy_from_slice(cast_slice(&values));
+            } else {
+                for (chunk, item) in output.chunks_exact_mut(size_of::<$ty>()).zip(values) {
+                    chunk.copy_from_slice(&item.to_le_bytes());
+                }
+            }
+        }};
+    }
+
+    match scalar {
+        ScalarKind::Bool => {
+            if let Ok(raw) = PyUntypedBuffer::get(value) {
+                if raw.dimensions() != 1 || raw.format().to_bytes() != b"?" {
+                    return Err(PyTypeError::new_err(
+                        "numeric array field requires one-dimensional native Bool data",
+                    ));
+                }
+                let values = raw.as_typed::<BufferBool>()?.to_vec(value.py())?;
+                require_fixed_array_length(length, values.len())?;
+                buffer[offset..offset + length].copy_from_slice(cast_slice(&values));
+            } else {
+                let values = value.extract::<Vec<bool>>()?;
+                require_fixed_array_length(length, values.len())?;
+                for (output, item) in buffer[offset..offset + length].iter_mut().zip(values) {
+                    *output = u8::from(item);
+                }
+            }
+        }
+        ScalarKind::Int8 => write_array!(i8),
+        ScalarKind::Uint8 => write_array!(u8),
+        ScalarKind::Int16 => write_array!(i16),
+        ScalarKind::Uint16 => write_array!(u16),
+        ScalarKind::Int32 => write_array!(i32),
+        ScalarKind::Uint32 => write_array!(u32),
+        ScalarKind::Int64 => write_array!(i64),
+        ScalarKind::Uint64 => write_array!(u64),
+        ScalarKind::Float32 => write_array!(f32),
+        ScalarKind::Float64 => write_array!(f64),
+    }
+    Ok(())
+}
+
 #[pyclass(module = "msgspec_flatbuffers._native", frozen)]
 pub struct NativePlan {
     identity: Arc<()>,
@@ -1353,6 +1449,43 @@ impl NativePlan {
                         offset + field.offset,
                     )?
                 }
+                FieldKind::ArrayScalar => {
+                    let scalar = field.scalar.ok_or_else(|| {
+                        PyValueError::new_err("native scalar array has no scalar kind")
+                    })?;
+                    let width = scalar_size(Some(scalar))?;
+                    let start = offset + field.offset;
+                    if field.enum_type.is_none() {
+                        self.decode_numeric_vector(py, data, start, field.fixed_length, scalar)?
+                    } else {
+                        let mut values = Vec::with_capacity(field.fixed_length);
+                        for index in 0..field.fixed_length {
+                            let value = self
+                                .read_scalar_value(py, data, start + index * width, scalar)?
+                                .into_py(py)?;
+                            values.push(self.apply_enum(py, field, value)?);
+                        }
+                        PyList::new(py, values)?.into_any().unbind()
+                    }
+                }
+                FieldKind::ArrayStruct => {
+                    let target = self.target_object(field)?;
+                    let target_type =
+                        self.child_decode_type(py, model_type, field, target, context.model_types)?;
+                    let start = offset + field.offset;
+                    let mut values = Vec::with_capacity(field.fixed_length);
+                    for index in 0..field.fixed_length {
+                        values.push(self.decode_struct_at(
+                            py,
+                            target,
+                            &target_type,
+                            context,
+                            data,
+                            start + index * field.element_size,
+                        )?);
+                    }
+                    PyList::new(py, values)?.into_any().unbind()
+                }
                 _ => {
                     return Err(PyNotImplementedError::new_err(
                         "unsupported native struct field",
@@ -1485,8 +1618,13 @@ impl NativePlan {
             let tag = self
                 .read_scalar_value(py, data, type_start + index * width, type_scalar)?
                 .as_u64()?;
+            let position = value_start + index * 4;
             if tag == 0 {
-                return Err(self.invalid_error(py, "union vectors cannot contain NONE"));
+                if self.read_u32(py, data, position)? != 0 {
+                    return Err(self.invalid_error(py, "union vector NONE has a payload"));
+                }
+                decoded.push(py.None());
+                continue;
             }
             let arm = field
                 .arms
@@ -1495,7 +1633,6 @@ impl NativePlan {
                 .ok_or_else(|| {
                     self.invalid_error(py, format!("unknown union discriminator {tag}"))
                 })?;
-            let position = value_start + index * 4;
             let target = self.offset_target(py, data, position, "union vector offset")?;
             let target_object = &self.objects[arm.target_index];
             let target_type =
@@ -1760,6 +1897,9 @@ impl NativePlan {
             FieldKind::UnionVector => {
                 self.decode_union_vector(py, parent_type, field, context, data, table)
             }
+            FieldKind::ArrayScalar | FieldKind::ArrayStruct => Err(PyValueError::new_err(
+                "fixed arrays may only be fields of structs",
+            )),
         }
     }
 
@@ -1864,19 +2004,52 @@ impl NativePlan {
         self.require_model_type(object, model)?;
         buffer.fill(0);
         for field in &object.fields {
-            if field.kind != FieldKind::Scalar {
-                return Err(PyNotImplementedError::new_err(
-                    "nested native structs are not implemented",
-                ));
+            let value = model.getattr(field.name.as_str())?;
+            match field.kind {
+                FieldKind::Scalar => write_struct_scalar(
+                    buffer,
+                    field.offset,
+                    field.scalar.ok_or_else(|| {
+                        PyValueError::new_err("native struct field has no scalar kind")
+                    })?,
+                    &value,
+                )?,
+                FieldKind::Struct => {
+                    let target = self.target_object(field)?;
+                    let end = field.offset + target.byte_size;
+                    let output = buffer.get_mut(field.offset..end).ok_or_else(|| {
+                        PyValueError::new_err("nested struct lies outside its parent")
+                    })?;
+                    self.encode_struct_into(target, &value, output)?;
+                }
+                FieldKind::ArrayScalar => write_struct_scalar_array(
+                    buffer,
+                    field.offset,
+                    field.fixed_length,
+                    field.scalar.ok_or_else(|| {
+                        PyValueError::new_err("native scalar array has no scalar kind")
+                    })?,
+                    &value,
+                )?,
+                FieldKind::ArrayStruct => {
+                    let target = self.target_object(field)?;
+                    let length = sequence_len(&value)?;
+                    require_fixed_array_length(field.fixed_length, length)?;
+                    for index in 0..length {
+                        let start = field.offset + index * field.element_size;
+                        let end = start + target.byte_size;
+                        let output = buffer.get_mut(start..end).ok_or_else(|| {
+                            PyValueError::new_err("struct array lies outside its parent")
+                        })?;
+                        self.encode_struct_into(target, &sequence_item(&value, index)?, output)?;
+                    }
+                }
+                _ => {
+                    return Err(PyNotImplementedError::new_err(
+                        "unsupported native struct field",
+                    ));
+                }
             }
-            write_struct_scalar(
-                buffer,
-                field.offset,
-                field.scalar.ok_or_else(|| {
-                    PyValueError::new_err("native struct field has no scalar kind")
-                })?,
-                &model.getattr(field.name.as_str())?,
-            )?;
         }
         Ok(())
     }
@@ -2070,6 +2243,9 @@ impl NativePlan {
                     let length = sequence_len(value)?;
                     let width = scalar_size(field.type_scalar)?;
                     let tables = sampled_sequence_size(value, |item| {
+                        if item.is_none() {
+                            return Ok(0);
+                        }
                         let arm = self.union_arm(field, &item)?;
                         self.estimate_table(&self.objects[arm.target_index], &item)
                     })?;
@@ -2079,6 +2255,11 @@ impl NativePlan {
                             width.max(4),
                         ))
                         .saturating_add(tables)
+                }
+                FieldKind::ArrayScalar | FieldKind::ArrayStruct => {
+                    return Err(PyValueError::new_err(
+                        "fixed arrays may only be fields of structs",
+                    ));
                 }
             };
             size = size.saturating_add(referenced);
@@ -2241,15 +2422,21 @@ impl NativePlan {
                     let mut values = Vec::with_capacity(length);
                     let mut tags = Vec::with_capacity(length);
                     for_each_sequence(value, |item| {
+                        if item.is_none() {
+                            tags.push(0);
+                            values.push(NullableOffset(None));
+                            return Ok(());
+                        }
                         let arm = self.union_arm(field, &item)?;
                         tags.push(arm.tag as u8);
-                        values.push(self.build_table(
+                        let offset = self.build_table(
                             builder,
                             &self.objects[arm.target_index],
                             &item,
                             None,
                             vector_length_patches,
-                        )?);
+                        )?;
+                        values.push(NullableOffset(Some(offset.value())));
                         Ok(())
                     })?;
                     discriminator = Some(Discriminator::Offset(erase_offset(
@@ -2257,7 +2444,10 @@ impl NativePlan {
                     )));
                     erase_offset(builder.create_vector(&values))
                 }
-                FieldKind::Scalar | FieldKind::Struct => unreachable!(),
+                FieldKind::Scalar
+                | FieldKind::Struct
+                | FieldKind::ArrayScalar
+                | FieldKind::ArrayStruct => unreachable!(),
             };
             states[index].offset = Some(offset);
             states[index].discriminator = discriminator;
@@ -2354,6 +2544,11 @@ impl NativePlan {
                 | FieldKind::Dynamic
                 | FieldKind::Union
                 | FieldKind::UnionVector => {}
+                FieldKind::ArrayScalar | FieldKind::ArrayStruct => {
+                    return Err(PyValueError::new_err(
+                        "fixed arrays may only be fields of structs",
+                    ));
+                }
             }
         }
         Ok(builder.end_table(table))
