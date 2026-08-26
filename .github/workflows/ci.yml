@@ -18,6 +18,8 @@ jobs:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,9 +55,18 @@ jobs:
 
       - name: Install flatc (Linux)
         if: runner.os == 'Linux'
+        env:
+          FLATC_SHA256: 9f87066dc5dfa7fe02090b55bab5f3e55df03e32c9b0cdf229004ade7d091039
+          FLATC_URL: https://github.com/google/flatbuffers/releases/download/v25.12.19/Linux.flatc.binary.g%2B%2B-13.zip
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes flatbuffers-compiler
+          archive="$RUNNER_TEMP/flatc.zip"
+          destination="$RUNNER_TEMP/flatc"
+          curl --fail --location --retry 3 --output "$archive" "$FLATC_URL"
+          echo "$FLATC_SHA256  $archive" | sha256sum --check -
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          chmod +x "$destination/flatc"
+          echo "$destination" >> "$GITHUB_PATH"
 
       - name: Install flatc (macOS)
         if: runner.os == 'macOS'
@@ -94,6 +105,8 @@ jobs:
     name: Lint, type-check, and build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      UV_PYTHON: "3.14"
 
     steps:
       - name: Check out repository
