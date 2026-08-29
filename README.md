@@ -168,11 +168,13 @@ You can then import the generated root module as
 ### 4. Build a FlatBuffer from a model
 
 The generated module contains a model and a view for every table and struct.
-Create `demo.py`:
+Encoding and root decoding use `msgspec_flatbuffers.flatbuffer`; generated
+types do not define format methods. Create `demo.py`:
 
 ```python
 import numpy as np
 
+from msgspec_flatbuffers import flatbuffer
 from tutorial.monster import Color, Monster, Vec3, Weapon
 
 monster = Monster(
@@ -186,7 +188,7 @@ monster = Monster(
     optional_energy=80,
 )
 
-buffer: memoryview = monster.to_flatbuffer()
+buffer: memoryview = flatbuffer.encode(monster)
 
 assert buffer.readonly
 ```
@@ -199,21 +201,23 @@ PYTHONPATH=generated python demo.py
 
 Later snippets extend the same `demo.py`.
 
-`to_flatbuffer()` returns a read-only `memoryview`. Convert the result only when
-another API requires `bytes`:
+`flatbuffer.encode()` returns a read-only `memoryview`. Convert the result only
+when another API requires `bytes`:
 
 ```python
 owned_bytes = bytes(buffer)
 ```
 
-With the default `initial_size=0`, `to_flatbuffer()` estimates the initial
-allocation. Pass a positive value to set a minimum initial allocation:
+With the default `initial_size=0`, the encoder uses a bounded estimate for
+the initial allocation. Pass a positive value to use that allocation directly
+and skip estimation:
 
 ```python
-buffer = monster.to_flatbuffer(initial_size=4096)
+encoder = flatbuffer.Encoder(initial_size=4096)
+buffer = encoder.encode(monster)
 ```
 
-`to_flatbuffer()` grows the allocation if the estimate is too small.
+The encoder grows the allocation when the initial allocation is too small.
 
 ### 5. Read fields without materializing the object
 
@@ -222,7 +226,8 @@ A view borrows the FlatBuffer and decodes fields as you access them:
 ```python
 from tutorial.monster import MonsterView
 
-view = MonsterView.from_buffer(buffer)
+view_decoder = flatbuffer.Decoder(MonsterView)
+view = view_decoder.decode(buffer)
 position = view.pos
 
 assert view.name == "Orc"
@@ -280,7 +285,7 @@ assert restored.scores.flags.writeable
 When you only need the model, decode it directly:
 
 ```python
-restored = Monster.from_flatbuffer(buffer)
+restored = flatbuffer.decode(buffer, type=Monster)
 ```
 
 Both decoding methods copy the complete object graph. Numeric vectors become
@@ -296,6 +301,30 @@ restored.name = "Goblin"
 restored.scores[0] = 99.0
 restored.weapons.append(Weapon(name="Bow", damage=5))
 ```
+
+A vector of tables whose table declares a `(key)` field becomes a dictionary in
+the materialized model and a read-only `TableMap` in the view. The mapping key
+must equal the value's declared key field:
+
+```fbs
+table Package {
+  name:string (key);
+}
+
+table Index {
+  packages:[Package];
+}
+```
+
+```python
+index = Index(packages={"numpy": Package(name="numpy")})
+view = flatbuffer.decode(flatbuffer.encode(index), type=IndexView)
+
+assert view.packages["numpy"].name == "numpy"
+```
+
+Encoding sorts keyed vectors as required by FlatBuffers. Lookup through the
+view uses binary search without materializing the complete mapping.
 
 ### 7. Add application validation
 
@@ -323,10 +352,10 @@ class ValidatedMonster(Monster, dict=True):
         self.was_validated = True
 ```
 
-Call `from_flatbuffer()` on the subclass, or pass it to `to_model()`:
+Pass the subclass to `flatbuffer.decode()`, or pass it to `to_model()`:
 
 ```python
-validated = ValidatedMonster.from_flatbuffer(buffer)
+validated = flatbuffer.decode(buffer, type=ValidatedMonster)
 validated_from_view = view.to_model(ValidatedMonster)
 
 assert validated.was_validated
@@ -346,32 +375,60 @@ Neither msgspec nor FlatBuffers serializes this state. Any other annotation
 creates a msgspec field. The generated FlatBuffer APIs reject a subclass when
 that field has no matching FlatBuffers field.
 
-### 8. Use msgspec conversion and JSON
+### 8. Encode JSON and MessagePack
 
-Pass the package's conversion hooks to msgspec when a model contains NumPy
-arrays:
+Use the package codecs to encode and decode generated models or ordinary
+`msgspec.Struct` types that contain NumPy arrays:
 
 ```python
-import msgspec
+from msgspec_flatbuffers import json, msgpack
 
-from msgspec_flatbuffers import dec_hook, enc_hook
+encoded = json.encode(monster)
+from_json = json.decode(encoded, type=Monster)
 
-data = msgspec.to_builtins(monster, enc_hook=enc_hook)
-from_dict = msgspec.convert(data, type=Monster, dec_hook=dec_hook)
+packed = msgpack.encode(monster)
+from_messagepack = msgpack.decode(packed, type=Monster)
 
-encoded = msgspec.json.encode(monster, enc_hook=enc_hook)
-from_json = msgspec.json.decode(
-    encoded,
-    type=Monster,
-    dec_hook=dec_hook,
-)
-
-assert from_dict == monster
 assert from_json == monster
+assert from_messagepack == monster
 ```
 
-`dec_hook` restores every generated NumPy dtype, including arrays nested inside
-tables and lists. The restored arrays own their storage and are writable.
+Create reusable encoder and decoder instances when processing many values:
+
+```python
+json_encoder = json.Encoder()
+json_decoder = json.Decoder(Monster)
+
+encoded = json_encoder.encode(monster)
+from_json = json_decoder.decode(encoded)
+```
+
+For an ordinary Struct, the first encode or decode compiles and
+caches a native plan from its field annotations. Call `register()` to compile
+the plan eagerly:
+
+```python
+json_fallbacks = json.register(MyStruct)
+msgpack_fallbacks = msgpack.register(MyStruct)
+```
+
+Each returned tuple lists fields that use a typed msgspec fallback. Supported
+parent fields and sibling subtrees remain native. A field falls back as one
+unit when its annotation is not supported natively, such as a dictionary,
+bytes value, or custom type. Struct-wide options that change the complete wire
+layout may instead select msgspec for the complete document.
+
+The native path handles statically typed numeric vector fields without creating
+intermediate Python lists or Python scalar objects. Decoded arrays have the
+declared dtype, own their storage, and are writable.
+
+Standard msgspec options preserve native processing for supported fields.
+`order="sorted"` sorts Struct field names, while `order="deterministic"` keeps
+Struct declaration order and sorts unordered values in fallback fields. Scalar
+UUID and Decimal fields, generated enums, and `strict=False` scalar and
+numeric-vector coercion are handled natively. `enc_hook`, `dec_hook`, JSON
+`float_hook`, and MessagePack `ext_hook` run only for fields that require
+msgspec fallback when the model supports a native field-level plan.
 
 ### 9. Add a FlatBuffers union
 
@@ -421,13 +478,13 @@ pets = PetList(
 )
 ```
 
-`to_flatbuffer()` chooses each FlatBuffers discriminator from the concrete
+The encoder chooses each FlatBuffers discriminator from the concrete
 Python type. A view exposes both the selected value and its discriminator:
 
 ```python
 from tutorial.pet_list import CatView, Pet, PetListView
 
-pets_view = PetListView.from_buffer(pets.to_flatbuffer())
+pets_view = flatbuffer.decode(flatbuffer.encode(pets), type=PetListView)
 
 assert pets_view.favorite_type is Pet.Cat
 assert isinstance(pets_view.favorite, CatView)
@@ -478,7 +535,10 @@ The model field uses `PetList`, not `bytes`:
 from tutorial.nested_envelope import NestedEnvelope, NestedEnvelopeView
 
 envelope = NestedEnvelope(snapshot=pets, note="nightly snapshot")
-envelope_view = NestedEnvelopeView.from_buffer(envelope.to_flatbuffer())
+envelope_view = flatbuffer.decode(
+    flatbuffer.encode(envelope),
+    type=NestedEnvelopeView,
+)
 snapshot = envelope_view.snapshot
 snapshot_raw = envelope_view.snapshot_raw
 
@@ -568,7 +628,10 @@ metric = Metric(
     values=np.array([1.25, 2.5], dtype=np.float32),
 )
 dynamic = DynamicEnvelope(payload=DynamicEnvelopePayload(metric))
-dynamic_view = DynamicEnvelopeView.from_buffer(dynamic.to_flatbuffer())
+dynamic_view = flatbuffer.decode(
+    flatbuffer.encode(dynamic),
+    type=DynamicEnvelopeView,
+)
 
 payload = dynamic_view.payload
 payload_raw = dynamic_view.payload_raw
@@ -582,15 +645,11 @@ assert payload_raw.readonly
 
 `payload_type_raw` and `payload_raw` expose the stored type name and byte vector.
 `Metric` remains an ordinary, untagged msgspec model. Encode and decode the
-wrapper with the same JSON hooks:
+wrapper with the package JSON codec:
 
 ```python
-encoded = msgspec.json.encode(dynamic, enc_hook=enc_hook)
-decoded = msgspec.json.decode(
-    encoded,
-    type=DynamicEnvelope,
-    dec_hook=dec_hook,
-)
+encoded = json.encode(dynamic)
+decoded = json.decode(encoded, type=DynamicEnvelope)
 
 assert decoded == dynamic
 ```
@@ -617,11 +676,12 @@ dynamic_overrides = DynamicModelOverrides(
     }
 )
 
-validated_buffer_model = DynamicEnvelope.from_flatbuffer(
-    dynamic.to_flatbuffer(),
+validated_buffer_model = flatbuffer.decode(
+    flatbuffer.encode(dynamic),
+    type=DynamicEnvelope,
     dynamic_overrides=dynamic_overrides,
 )
-validated_json_model = msgspec.json.decode(
+validated_json_model = json.decode(
     encoded,
     type=DynamicEnvelope,
     dec_hook=dynamic_overrides.dec_hook,
@@ -650,7 +710,10 @@ opaque = DynamicEnvelope(
         b"payload from a newer plugin",
     )
 )
-forwarded = DynamicEnvelope.from_flatbuffer(opaque.to_flatbuffer())
+forwarded = flatbuffer.decode(
+    flatbuffer.encode(opaque),
+    type=DynamicEnvelope,
+)
 forwarded_payload = forwarded.payload
 
 assert forwarded_payload is not None
@@ -704,7 +767,7 @@ the vector through a chosen view type without copying it:
 ```python
 from tutorial.extension_list import Extension, ExtensionList, ExtensionListView
 
-metric_bytes = bytes(metric.to_flatbuffer())
+metric_bytes = bytes(flatbuffer.encode(metric))
 extension_list = ExtensionList(
     extensions=[
         Extension(
@@ -713,8 +776,9 @@ extension_list = ExtensionList(
         )
     ]
 )
-extension_list_view = ExtensionListView.from_buffer(
-    extension_list.to_flatbuffer()
+extension_list_view = flatbuffer.decode(
+    flatbuffer.encode(extension_list),
+    type=ExtensionListView,
 )
 extensions = extension_list_view.extensions
 
@@ -735,23 +799,34 @@ field when extension modules register an open-ended set of type names.
 
 ### 13. Use size prefixes and file identifiers
 
-Every tutorial schema declares a four-byte file identifier. The
-`MonsterView.from_buffer()` and `Monster.from_flatbuffer()` calls in steps 5 and
-6 check `MNST` by default.
+Every tutorial schema declares a four-byte file identifier. Decoding as either
+`MonsterView` or `Monster` checks `MNST` by default.
 
 Disable the check only when the input intentionally omits or replaces the
 identifier:
 
 ```python
-view = MonsterView.from_buffer(buffer, check_identifier=False)
+view = flatbuffer.decode(
+    buffer,
+    type=MonsterView,
+    check_identifier=False,
+)
 ```
 
 FlatBuffers can also include a four-byte size prefix:
 
 ```python
-framed = monster.to_flatbuffer(size_prefixed=True)
-framed_view = MonsterView.from_buffer(framed, size_prefixed=True)
-framed_model = Monster.from_flatbuffer(framed, size_prefixed=True)
+framed = flatbuffer.encode(monster, size_prefixed=True)
+framed_view = flatbuffer.decode(
+    framed,
+    type=MonsterView,
+    size_prefixed=True,
+)
+framed_model = flatbuffer.decode(
+    framed,
+    type=Monster,
+    size_prefixed=True,
+)
 ```
 
 A size-prefixed reader stops at the payload length declared by the prefix. The
@@ -832,3 +907,8 @@ msgspec_flatbuffers.warn_on_older_runtime = False
 
 The flag does not suppress `GeneratedCodeVersionError` for a major-version
 mismatch.
+
+## Benchmarks
+
+See [benchmarks.md](benchmarks.md) for current comparison charts, methodology,
+and reproducible commands.

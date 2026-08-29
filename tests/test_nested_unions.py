@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import importlib
 import importlib.util
 import json
@@ -17,17 +16,17 @@ from typing import Any
 import flatbuffers
 import msgspec
 import numpy as np
-import numpy.typing as npt
 import pytest
 
 from msgspec_flatbuffers import (
     BufferBoundsError,
     GenerationError,
     InvalidBufferError,
-    dec_hook,
-    enc_hook,
+    flatbuffer,
     generate,
 )
+from msgspec_flatbuffers import json as generated_json
+from msgspec_flatbuffers import msgpack as generated_msgpack
 
 SCHEMAS = Path(__file__).parent / "fixtures" / "nested_unions"
 PAYLOAD_SCHEMA = SCHEMAS / "payload.fbs"
@@ -123,9 +122,9 @@ def test_scalar_union_and_union_vector_round_trip_and_cache(
     assert ".Cat" in residents_annotation and ".Dog" in residents_annotation
     assert residents_annotation.endswith(" | None] | None")
     model = _payload_model(generated)
-    buffer = model.to_flatbuffer()
-    view = generated.PayloadView.from_buffer(buffer)
-    assert generated.Payload.from_flatbuffer(buffer) == model
+    buffer = flatbuffer.encode(model)
+    view = flatbuffer.decode(buffer, type=generated.PayloadView)
+    assert flatbuffer.decode(buffer, type=generated.Payload) == model
 
     favorite = view.favorite
     assert view.favorite_type == generated.Pet.Cat
@@ -157,11 +156,15 @@ def test_scalar_union_and_union_vector_round_trip_and_cache(
 
     materialized = view.to_model()
     assert materialized == model
-    rebuilt = generated.PayloadView.from_buffer(materialized.to_flatbuffer())
+    rebuilt = flatbuffer.decode(
+        flatbuffer.encode(materialized), type=generated.PayloadView
+    )
     assert rebuilt.to_model() == model
     assert materialized.residents is not None
     materialized.residents.append(generated.Dog(name="Tess", good=True))
-    mutated = generated.PayloadView.from_buffer(materialized.to_flatbuffer())
+    mutated = flatbuffer.decode(
+        flatbuffer.encode(materialized), type=generated.PayloadView
+    )
     assert mutated.to_model() == materialized
 
 
@@ -176,7 +179,7 @@ def test_union_serialization_requires_the_declared_model_types(
 
     model = generated.Payload(favorite=Impostor(name="not a Cat"))
     with pytest.raises(TypeError, match="union field.*favorite.*Impostor"):
-        model.to_flatbuffer()
+        flatbuffer.encode(model)
 
 
 def test_union_annotations_select_path_specific_model_subclasses(
@@ -216,10 +219,12 @@ class ValidatedPayload(Payload, dict=True):
         favorite=generated.Cat(name="Miso"),
         residents=[generated.Cat(name="Nori"), generated.Dog(name="Pip")],
     )
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    direct = validated_payload.from_flatbuffer(buffer)
-    from_view = generated.PayloadView.from_buffer(buffer).to_model(validated_payload)
+    direct = flatbuffer.decode(buffer, type=validated_payload)
+    from_view = flatbuffer.decode(buffer, type=generated.PayloadView).to_model(
+        validated_payload
+    )
     for restored in (direct, from_view):
         assert type(restored) is validated_payload
         assert type(restored.favorite) is favorite_cat
@@ -227,7 +232,7 @@ class ValidatedPayload(Payload, dict=True):
         assert restored.residents is not None
         assert type(restored.residents[0]) is resident_cat
         assert restored.residents[0].role == "resident"
-        assert restored.to_flatbuffer().readonly
+        assert flatbuffer.encode(restored).readonly
 
 
 def test_absent_union_stays_none(
@@ -235,7 +240,7 @@ def test_absent_union_stays_none(
 ) -> None:
     generated, _ = generated_modules
     model = generated.Payload()
-    view = generated.PayloadView.from_buffer(model.to_flatbuffer())
+    view = flatbuffer.decode(flatbuffer.encode(model), type=generated.PayloadView)
 
     assert view.favorite_type == generated.Pet.NONE
     assert view.favorite is None
@@ -250,11 +255,11 @@ def test_annotated_nested_flatbuffer_is_typed_cached_and_zero_copy(
     payload, envelope = generated_modules
     nested_model = _payload_model(payload)
     model = envelope.Envelope(payload=nested_model, note="outer")
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
     assert buffer[4:8] == b"ENVP"
-    outer = envelope.EnvelopeView.from_buffer(buffer)
-    assert envelope.Envelope.from_flatbuffer(buffer) == model
+    outer = flatbuffer.decode(buffer, type=envelope.EnvelopeView)
+    assert flatbuffer.decode(buffer, type=envelope.Envelope) == model
     raw = outer.payload_raw
     assert raw is not None
     assert raw.readonly
@@ -269,7 +274,9 @@ def test_annotated_nested_flatbuffer_is_typed_cached_and_zero_copy(
     assert nested.favorite.name == "Miso"
 
     assert outer.to_model() == model
-    rebuilt = envelope.EnvelopeView.from_buffer(outer.to_model().to_flatbuffer())
+    rebuilt = flatbuffer.decode(
+        flatbuffer.encode(outer.to_model()), type=envelope.EnvelopeView
+    )
     assert rebuilt.to_model() == model
 
 
@@ -300,10 +307,10 @@ class ValidatedEnvelope(Envelope, dict=True):
     validated_payload = namespace["ValidatedPayload"]
     validated_envelope = namespace["ValidatedEnvelope"]
     model = envelope.Envelope(payload=_payload_model(payload), note="outer")
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    direct = validated_envelope.from_flatbuffer(buffer)
-    from_view = envelope.EnvelopeView.from_buffer(buffer).to_model(
+    direct = flatbuffer.decode(buffer, type=validated_envelope)
+    from_view = flatbuffer.decode(buffer, type=envelope.EnvelopeView).to_model(
         validated_envelope
     )
     for restored in (direct, from_view):
@@ -321,8 +328,7 @@ def test_nested_flatbuffer_target_does_not_need_to_be_the_file_root(
             (
                 "namespace Example.NonRootNested;",
                 "table Inner { value:int; }",
-                "table Container { payload:[ubyte] "
-                '(nested_flatbuffer: "Inner"); }',
+                'table Container { payload:[ubyte] (nested_flatbuffer: "Inner"); }',
                 "root_type Container;",
             )
         ),
@@ -334,156 +340,27 @@ def test_nested_flatbuffer_target_does_not_need_to_be_the_file_root(
         module = importlib.import_module("example.non_root_nested.container")
         model = module.Container(payload=module.Inner(value=42))
 
-        view = module.ContainerView.from_buffer(model.to_flatbuffer())
+        view = flatbuffer.decode(flatbuffer.encode(model), type=module.ContainerView)
 
         assert module_path == output / "example" / "non_root_nested" / "container.py"
         assert view.payload.value == 42
         assert view.to_model() == model
 
 
-def test_msgspec_hooks_preserve_arrays_and_tagged_unions(
+@pytest.mark.parametrize("codec", [generated_json, generated_msgpack])
+def test_native_codecs_preserve_generated_nested_models_and_unions(
     generated_modules: tuple[ModuleType, ModuleType],
+    codec: Any,
 ) -> None:
     payload, envelope = generated_modules
     model = envelope.Envelope(payload=_payload_model(payload), note="outer")
 
-    marker = "__msgspec_flatbuffers_type__"
-    builtins_value = msgspec.to_builtins(model, enc_hook=enc_hook)
-    assert marker not in builtins_value
-    payload_value = builtins_value["payload"]
-    assert isinstance(payload_value, dict)
-    assert marker not in payload_value
-    assert payload_value["measurements"] == [0.25, 1.5, 8.0]
-    favorite = payload_value["favorite"]
-    assert isinstance(favorite, dict)
-    assert favorite[marker] == "Example.Nested.Cat"
-    residents = payload_value["residents"]
-    assert isinstance(residents, list)
-    assert [item[marker] for item in residents] == [
-        "Example.Nested.Cat",
-        "Example.Nested.Dog",
-        "Example.Nested.Cat",
-    ]
+    restored = codec.decode(codec.encode(model), type=envelope.Envelope)
 
-    from_dict = msgspec.convert(
-        builtins_value,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    )
-    assert from_dict == model
-    assert from_dict.payload is not None
-    assert from_dict.payload.measurements is not None
-    assert from_dict.payload.measurements.dtype == np.dtype(np.float64)
-    assert from_dict.payload.measurements.flags.owndata
-    assert from_dict.payload.measurements.flags.writeable
-
-    encoded = msgspec.json.encode(model, enc_hook=enc_hook)
-    from_json = msgspec.json.decode(
-        encoded,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    )
-    assert from_json == model
-    assert from_json.payload is not None
-    assert from_json.payload.measurements is not None
-    assert from_json.payload.measurements.dtype == np.dtype(np.float64)
-
-    assert payload.__file__ is not None
-    spec = importlib.util.spec_from_file_location(
-        "alternate_generated_payload",
-        payload.__file__,
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    alternate = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = alternate
-    try:
-        spec.loader.exec_module(alternate)
-        cross_import = msgspec.convert(
-            payload_value,
-            type=alternate.Payload,
-            dec_hook=dec_hook,
-        )
-        assert isinstance(cross_import.favorite, alternate.Cat)
-        assert cross_import.measurements is not None
-        assert cross_import.measurements.dtype == np.dtype(np.float64)
-    finally:
-        sys.modules.pop(spec.name, None)
-
-    empty = envelope.Envelope()
-    empty_builtins = msgspec.to_builtins(empty, enc_hook=enc_hook)
-    assert msgspec.convert(
-        empty_builtins,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    ) == empty
-    assert msgspec.json.decode(
-        msgspec.json.encode(empty, enc_hook=enc_hook),
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    ) == empty
-
-    unknown = copy.deepcopy(builtins_value)
-    unknown["payload"]["favorite"][marker] = "unknown.Variant"
-    with pytest.raises(msgspec.ValidationError, match="Invalid value"):
-        msgspec.convert(
-            unknown,
-            type=envelope.Envelope,
-            dec_hook=dec_hook,
-        )
-
-    missing = copy.deepcopy(builtins_value)
-    missing["payload"]["favorite"].pop(marker)
-    with pytest.raises(msgspec.ValidationError, match="missing required field"):
-        msgspec.convert(
-            missing,
-            type=envelope.Envelope,
-            dec_hook=dec_hook,
-        )
-
-    assert envelope.Envelope.__struct_config__.tag is None
-    assert payload.Payload.__struct_config__.tag is None
-    assert payload.Cat.__struct_config__.tag == "Example.Nested.Cat"
-    assert payload.Dog.__struct_config__.tag == "Example.Nested.Dog"
-
-
-def test_msgspec_hooks_restore_representative_numeric_dtypes() -> None:
-    class NumericKinds(msgspec.Struct, frozen=True):
-        signed: npt.NDArray[np.int16]
-        unsigned: npt.NDArray[np.uint32]
-        floating: npt.NDArray[np.float32]
-        flags: npt.NDArray[np.bool_]
-
-    model = NumericKinds(
-        signed=np.array([-2, 3], dtype=np.int16),
-        unsigned=np.array([1, 2**31], dtype=np.uint32),
-        floating=np.array([0.25, 1.5], dtype=np.float32),
-        flags=np.array([True, False], dtype=np.bool_),
-    )
-
-    for restored in (
-        msgspec.convert(
-            msgspec.to_builtins(model, enc_hook=enc_hook),
-            type=NumericKinds,
-            dec_hook=dec_hook,
-        ),
-        msgspec.json.decode(
-            msgspec.json.encode(model, enc_hook=enc_hook),
-            type=NumericKinds,
-            dec_hook=dec_hook,
-        ),
-    ):
-        for field_name, dtype in (
-            ("signed", np.dtype(np.int16)),
-            ("unsigned", np.dtype(np.uint32)),
-            ("floating", np.dtype(np.float32)),
-            ("flags", np.dtype(np.bool_)),
-        ):
-            array = getattr(restored, field_name)
-            assert array.dtype == dtype
-            assert array.flags.owndata
-            assert array.flags.writeable
-            np.testing.assert_array_equal(array, getattr(model, field_name))
+    assert restored == model
+    assert restored.payload is not None
+    assert restored.payload.measurements is not None
+    assert restored.payload.measurements.dtype == np.dtype(np.float64)
 
 
 def test_nested_identifiers_and_size_prefixed_payload(
@@ -491,47 +368,50 @@ def test_nested_identifiers_and_size_prefixed_payload(
 ) -> None:
     payload, envelope = generated_modules
     nested_model = _payload_model(payload)
-    prefixed = nested_model.to_flatbuffer(size_prefixed=True)
+    prefixed = flatbuffer.encode(nested_model, size_prefixed=True)
     assert prefixed[8:12] == b"PAYL"
 
     outer_buffer = _outer_with_payload(prefixed)
-    outer = envelope.EnvelopeView.from_buffer(outer_buffer)
+    outer = flatbuffer.decode(outer_buffer, type=envelope.EnvelopeView)
     nested = outer.payload_view(size_prefixed=True)
     assert nested is outer.payload_view(size_prefixed=True)
     assert nested.serial == 17
     assert nested.favorite.name == "Miso"
 
-    bad_nested = bytearray(nested_model.to_flatbuffer())
+    bad_nested = bytearray(flatbuffer.encode(nested_model))
     bad_nested[4:8] = b"NOPE"
-    bad_outer = envelope.EnvelopeView.from_buffer(_outer_with_payload(bad_nested))
+    bad_outer = flatbuffer.decode(
+        _outer_with_payload(bad_nested), type=envelope.EnvelopeView
+    )
     with pytest.raises(InvalidBufferError, match="file identifier"):
         _ = bad_outer.payload
 
     bad_outer_identifier = bytearray(outer_buffer)
     bad_outer_identifier[4:8] = b"NOPE"
     with pytest.raises(InvalidBufferError, match="file identifier"):
-        envelope.EnvelopeView.from_buffer(bad_outer_identifier)
+        flatbuffer.decode(bad_outer_identifier, type=envelope.EnvelopeView)
 
 
 def test_unknown_and_missing_scalar_union_payloads_fail_lazily(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     generated, _ = generated_modules
-    buffer = bytearray(_payload_model(generated).to_flatbuffer())
-    probe = generated.PayloadView.from_buffer(buffer)
+    buffer = bytearray(flatbuffer.encode(_payload_model(generated)))
+    probe = flatbuffer.decode(buffer, type=generated.PayloadView)
     type_position = probe._field_position(4, 1)
     assert type_position is not None
     buffer[type_position] = 99
 
-    unknown = generated.PayloadView.from_buffer(buffer)
+    unknown = flatbuffer.decode(buffer, type=generated.PayloadView)
     assert int(unknown.favorite_type) == 99
     with pytest.raises(InvalidBufferError, match="unknown .* discriminator"):
         _ = unknown.favorite
     with pytest.raises(InvalidBufferError, match="unknown .* discriminator"):
         unknown.to_model()
 
-    missing = generated.PayloadView.from_buffer(
-        _payload_with_favorite_type(int(generated.Pet.Cat))
+    missing = flatbuffer.decode(
+        _payload_with_favorite_type(int(generated.Pet.Cat)),
+        type=generated.PayloadView,
     )
     assert missing.favorite_type == generated.Pet.Cat
     with pytest.raises(InvalidBufferError, match="no payload"):
@@ -542,14 +422,14 @@ def test_union_vector_rejects_unknown_tags_null_offsets_and_length_mismatch(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     generated, _ = generated_modules
-    original = _payload_model(generated).to_flatbuffer()
+    original = flatbuffer.encode(_payload_model(generated))
 
     unknown_tag_buffer = bytearray(original)
-    probe = generated.PayloadView.from_buffer(unknown_tag_buffer)
+    probe = flatbuffer.decode(unknown_tag_buffer, type=generated.PayloadView)
     type_start, type_length = _require_vector_info(probe, 8, 1)
     assert type_length == 3
     unknown_tag_buffer[type_start + 1] = 99
-    unknown_tag = generated.PayloadView.from_buffer(unknown_tag_buffer)
+    unknown_tag = flatbuffer.decode(unknown_tag_buffer, type=generated.PayloadView)
     assert unknown_tag.residents_type is not None
     assert int(unknown_tag.residents_type[1]) == 99
     assert unknown_tag.residents is not None
@@ -559,29 +439,29 @@ def test_union_vector_rejects_unknown_tags_null_offsets_and_length_mismatch(
         unknown_tag.to_model()
 
     none_tag_buffer = bytearray(original)
-    probe = generated.PayloadView.from_buffer(none_tag_buffer)
+    probe = flatbuffer.decode(none_tag_buffer, type=generated.PayloadView)
     type_start, _ = _require_vector_info(probe, 8, 1)
     none_tag_buffer[type_start + 1] = int(generated.Pet.NONE)
-    none_tag = generated.PayloadView.from_buffer(none_tag_buffer)
+    none_tag = flatbuffer.decode(none_tag_buffer, type=generated.PayloadView)
     assert none_tag.residents is not None
     with pytest.raises(InvalidBufferError, match="NONE.*has a payload"):
         none_tag.residents[1]
 
     null_offset_buffer = bytearray(original)
-    probe = generated.PayloadView.from_buffer(null_offset_buffer)
+    probe = flatbuffer.decode(null_offset_buffer, type=generated.PayloadView)
     value_start, value_length = _require_vector_info(probe, 10, 4)
     assert value_length == 3
     struct.pack_into("<I", null_offset_buffer, value_start, 0)
-    null_offset = generated.PayloadView.from_buffer(null_offset_buffer)
+    null_offset = flatbuffer.decode(null_offset_buffer, type=generated.PayloadView)
     assert null_offset.residents is not None
     with pytest.raises(InvalidBufferError, match="null offset"):
         null_offset.residents[0]
 
     mismatched_buffer = bytearray(original)
-    probe = generated.PayloadView.from_buffer(mismatched_buffer)
+    probe = flatbuffer.decode(mismatched_buffer, type=generated.PayloadView)
     type_start, _ = _require_vector_info(probe, 8, 1)
     struct.pack_into("<I", mismatched_buffer, type_start - 4, 2)
-    mismatched = generated.PayloadView.from_buffer(mismatched_buffer)
+    mismatched = flatbuffer.decode(mismatched_buffer, type=generated.PayloadView)
     with pytest.raises(InvalidBufferError, match="lengths differ"):
         _ = mismatched.residents
 
@@ -680,8 +560,14 @@ def test_union_alternative_short_name_collisions_are_qualified(
         a_model = generated.Root(value=a.Item(a=1))
         b_model = generated.Root(value=b.Item(b=2))
 
-        assert generated.Root.from_flatbuffer(a_model.to_flatbuffer()) == a_model
-        assert generated.Root.from_flatbuffer(b_model.to_flatbuffer()) == b_model
+        assert (
+            flatbuffer.decode(flatbuffer.encode(a_model), type=generated.Root)
+            == a_model
+        )
+        assert (
+            flatbuffer.decode(flatbuffer.encode(b_model), type=generated.Root)
+            == b_model
+        )
 
 
 def test_nested_target_short_name_collision_uses_qualified_type(
@@ -728,7 +614,10 @@ def test_nested_target_short_name_collision_uses_qualified_type(
         generated = importlib.import_module("outer.envelope")
         model = generated.Envelope(payload=shared.Item(shared=42))
 
-        assert generated.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+        assert (
+            flatbuffer.decode(flatbuffer.encode(model), type=generated.Envelope)
+            == model
+        )
     _clear_generated_modules("shared")
     _clear_generated_modules("outer")
 
@@ -774,7 +663,7 @@ def test_generated_union_buffer_decodes_with_flatc_json(
 ) -> None:
     generated, _ = generated_modules
     binary = tmp_path / "wire.bin"
-    binary.write_bytes(_payload_model(generated).to_flatbuffer())
+    binary.write_bytes(flatbuffer.encode(_payload_model(generated)))
 
     subprocess.run(
         [
@@ -853,9 +742,9 @@ def test_required_nested_and_union_fields_have_no_model_defaults_and_build(
         pet=cat,
         pets=[cat, dog],
     )
-    buffer = model.to_flatbuffer()
-    view = required.RequiredHolderView.from_buffer(buffer)
-    assert required.RequiredHolder.from_flatbuffer(buffer) == model
+    buffer = flatbuffer.encode(model)
+    view = flatbuffer.decode(buffer, type=required.RequiredHolderView)
+    assert flatbuffer.decode(buffer, type=required.RequiredHolder) == model
 
     assert view.nested.to_model() == nested
     assert view.pet_type == payload.Pet.Cat
@@ -881,7 +770,7 @@ def test_required_model_builders_reject_runtime_none(
     model = required.RequiredHolder(**values)
 
     with pytest.raises(TypeError, match=field):
-        model.to_flatbuffer()
+        flatbuffer.encode(model)
 
 
 def test_required_views_reject_absent_nested_and_union_fields(
@@ -890,16 +779,16 @@ def test_required_views_reject_absent_nested_and_union_fields(
     payload, required = required_modules
     empty_holder = _empty_required_holder()
 
-    nested = required.RequiredHolderView.from_buffer(empty_holder)
+    nested = flatbuffer.decode(empty_holder, type=required.RequiredHolderView)
     with pytest.raises(InvalidBufferError, match="required field 'nested'"):
         _ = nested.nested
 
-    pet = required.RequiredHolderView.from_buffer(empty_holder)
+    pet = flatbuffer.decode(empty_holder, type=required.RequiredHolderView)
     assert pet.pet_type == payload.Pet.NONE
     with pytest.raises(InvalidBufferError, match="required field 'pet'"):
         _ = pet.pet
 
-    pets = required.RequiredHolderView.from_buffer(empty_holder)
+    pets = flatbuffer.decode(empty_holder, type=required.RequiredHolderView)
     with pytest.raises(InvalidBufferError, match="required field 'pets_type'"):
         _ = pets.pets_type
     with pytest.raises(InvalidBufferError, match="required field 'pets_type'"):
@@ -910,29 +799,31 @@ def test_nested_payload_view_is_confined_to_byte_vector_frame(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     payload, envelope = generated_modules
-    original = envelope.Envelope(
-        payload=_payload_model(payload),
-        note="adjacent outer bytes",
-    ).to_flatbuffer()
+    original = flatbuffer.encode(
+        envelope.Envelope(
+            payload=_payload_model(payload),
+            note="adjacent outer bytes",
+        )
+    )
 
     shortened = bytearray(original)
-    probe = envelope.EnvelopeView.from_buffer(shortened)
+    probe = flatbuffer.decode(shortened, type=envelope.EnvelopeView)
     payload_start, payload_length = _require_vector_info(probe, 4, 1)
     assert payload_length > 8
     struct.pack_into("<I", shortened, payload_start - 4, 8)
-    shortened_view = envelope.EnvelopeView.from_buffer(shortened)
+    shortened_view = flatbuffer.decode(shortened, type=envelope.EnvelopeView)
     raw = shortened_view.payload_raw
     assert raw is not None
     assert len(raw) == 8
-    with pytest.raises(BufferBoundsError):
+    with pytest.raises(BufferBoundsError, match="table header"):
         _ = shortened_view.payload
 
     escaped_root = bytearray(original)
-    probe = envelope.EnvelopeView.from_buffer(escaped_root)
+    probe = flatbuffer.decode(escaped_root, type=envelope.EnvelopeView)
     payload_start, payload_length = _require_vector_info(probe, 4, 1)
     struct.pack_into("<I", escaped_root, payload_start, payload_length + 4)
-    escaped_view = envelope.EnvelopeView.from_buffer(escaped_root)
-    with pytest.raises(BufferBoundsError):
+    escaped_view = flatbuffer.decode(escaped_root, type=envelope.EnvelopeView)
+    with pytest.raises(BufferBoundsError, match="table header"):
         _ = escaped_view.payload
 
 
@@ -989,14 +880,14 @@ def test_union_schema_evolution_preserves_known_values_and_rejects_unknown_arms(
         v1 = importlib.import_module("evolution.v1")
         v2 = importlib.import_module("evolution.v2")
 
-        old_buffer = v1.Root(favorite=v1.Cat(name="Miso")).to_flatbuffer()
-        upgraded = v2.RootView.from_buffer(old_buffer)
+        old_buffer = flatbuffer.encode(v1.Root(favorite=v1.Cat(name="Miso")))
+        upgraded = flatbuffer.decode(old_buffer, type=v2.RootView)
         assert upgraded.favorite_type == v2.Pet.Cat
         assert upgraded.favorite.name == "Miso"
         assert upgraded.to_model() == v2.Root(favorite=v2.Cat(name="Miso"))
 
-        new_buffer = v2.Root(favorite=v2.Dog(name="Pip")).to_flatbuffer()
-        legacy = v1.RootView.from_buffer(new_buffer)
+        new_buffer = flatbuffer.encode(v2.Root(favorite=v2.Dog(name="Pip")))
+        legacy = flatbuffer.decode(new_buffer, type=v1.RootView)
         assert int(legacy.favorite_type) == int(v2.Pet.Dog)
         with pytest.raises(InvalidBufferError, match="unknown .* discriminator"):
             _ = legacy.favorite

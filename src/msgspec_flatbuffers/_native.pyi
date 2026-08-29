@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 class NativeBuffer:
@@ -10,7 +10,7 @@ class NativeModelTypes: ...
 class NativePlan:
     def __init__(self, data: bytes) -> None: ...
 
-    def bind_types(self, types: dict[str, type[object]]) -> None: ...
+    def bind_types(self, types: Mapping[str, type[object]]) -> None: ...
 
     def model_types(
         self,
@@ -51,3 +51,25 @@ class NativePlan:
         size_prefixed: bool = False,
         initial_size: int = 0,
     ) -> memoryview: ...
+
+    def encode_serde(
+        self,
+        root: str,
+        model: object,
+        is_json: bool,
+        *,
+        fallback_encoder: Any,
+        order: str | None,
+        decimal_format: str,
+        uuid_format: str,
+    ) -> bytes: ...
+
+    def decode_serde(
+        self,
+        root: str,
+        buffer: bytes | bytearray | memoryview,
+        is_json: bool,
+        *,
+        strict: bool,
+        fallback_decoders: dict[str, Any],
+    ) -> Any: ...

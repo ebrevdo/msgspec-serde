@@ -9,7 +9,7 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import compile_schema, generate, load_bfbs
+from msgspec_flatbuffers import compile_schema, flatbuffer, generate, load_bfbs
 
 ROOT = Path(__file__).parents[1]
 EXAMPLE = ROOT / "examples" / "schema_evolution"
@@ -45,7 +45,9 @@ def test_new_reader_reads_frozen_old_buffer(
 ) -> None:
     _, v2 = versioned_modules
 
-    reading = v2.ReadingView.from_buffer((FIXTURES / "reading_v1.bin").read_bytes())
+    reading = flatbuffer.decode(
+        (FIXTURES / "reading_v1.bin").read_bytes(), type=v2.ReadingView
+    )
 
     assert reading.id == 7
     assert reading.label == "legacy sensor"
@@ -59,7 +61,9 @@ def test_old_reader_reads_frozen_new_buffer(
 ) -> None:
     v1, _ = versioned_modules
 
-    reading = v1.ReadingView.from_buffer((FIXTURES / "reading_v2.bin").read_bytes())
+    reading = flatbuffer.decode(
+        (FIXTURES / "reading_v2.bin").read_bytes(), type=v1.ReadingView
+    )
 
     assert reading.id == 9
     assert reading.label == "current sensor"
@@ -71,24 +75,28 @@ def test_generated_models_interoperate_across_schema_versions(
 ) -> None:
     v1, v2 = versioned_modules
 
-    old_buffer = v1.Reading(
-        id=17,
-        label="old writer",
-        samples=np.array([1.0, 2.0], dtype=np.float32),
-    ).to_flatbuffer()
-    upgraded = v2.ReadingView.from_buffer(old_buffer)
+    old_buffer = flatbuffer.encode(
+        v1.Reading(
+            id=17,
+            label="old writer",
+            samples=np.array([1.0, 2.0], dtype=np.float32),
+        )
+    )
+    upgraded = flatbuffer.decode(old_buffer, type=v2.ReadingView)
     assert upgraded.id == 17
     assert upgraded.quality == 100
     assert upgraded.note is None
 
-    new_buffer = v2.Reading(
-        id=23,
-        label="new writer",
-        samples=np.array([4.0], dtype=np.float32),
-        quality=91,
-        note="ignored by v1",
-    ).to_flatbuffer()
-    legacy = v1.ReadingView.from_buffer(new_buffer)
+    new_buffer = flatbuffer.encode(
+        v2.Reading(
+            id=23,
+            label="new writer",
+            samples=np.array([4.0], dtype=np.float32),
+            quality=91,
+            note="ignored by v1",
+        )
+    )
+    legacy = flatbuffer.decode(new_buffer, type=v1.ReadingView)
     assert legacy.id == 23
     assert legacy.label == "new writer"
     np.testing.assert_array_equal(legacy.samples, [4.0])
@@ -124,18 +132,21 @@ def test_installed_flatc_can_drive_current_generator(
     assert schema.file_identifier == "EVOL"
 
     generated = _load_module(f"current_flatc_{version}", module_path)
-    frozen = generated.ReadingView.from_buffer(
-        (FIXTURES / f"reading_{version}.bin").read_bytes()
+    frozen = flatbuffer.decode(
+        (FIXTURES / f"reading_{version}.bin").read_bytes(),
+        type=generated.ReadingView,
     )
     assert frozen.id == (7 if version == "v1" else 9)
 
-    rebuilt = generated.Reading(
-        id=31,
-        label=f"generated from {version}",
-        samples=np.array([6.25], dtype=np.float32),
-    ).to_flatbuffer()
+    rebuilt = flatbuffer.encode(
+        generated.Reading(
+            id=31,
+            label=f"generated from {version}",
+            samples=np.array([6.25], dtype=np.float32),
+        )
+    )
     fixed = v1 if version == "v1" else v2
-    checked_in = fixed.ReadingView.from_buffer(rebuilt)
+    checked_in = flatbuffer.decode(rebuilt, type=fixed.ReadingView)
     assert checked_in.id == 31
     assert checked_in.label == f"generated from {version}"
     np.testing.assert_array_equal(checked_in.samples, [6.25])

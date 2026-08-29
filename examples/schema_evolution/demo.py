@@ -14,14 +14,18 @@ from schema_evolution_generated.example.evolution.reading_v2 import (
     ReadingView as ReadingViewV2,
 )
 
+from msgspec_flatbuffers import flatbuffer
+
 
 def main() -> None:
-    old_buffer = ReadingV1(
-        id=7,
-        label="legacy sensor",
-        samples=np.array([1.25, 2.5], dtype=np.float32),
-    ).to_flatbuffer()
-    upgraded = ReadingViewV2.from_buffer(old_buffer)
+    old_buffer = flatbuffer.encode(
+        ReadingV1(
+            id=7,
+            label="legacy sensor",
+            samples=np.array([1.25, 2.5], dtype=np.float32),
+        )
+    )
+    upgraded = flatbuffer.decode(old_buffer, type=ReadingViewV2)
     assert upgraded.samples is not None
     print(
         "v2 reading v1:",
@@ -31,14 +35,16 @@ def main() -> None:
         upgraded.note,
     )
 
-    new_buffer = ReadingV2(
-        id=9,
-        label="current sensor",
-        samples=np.array([3.5], dtype=np.float32),
-        quality=87,
-        note="added by schema v2",
-    ).to_flatbuffer()
-    legacy = ReadingViewV1.from_buffer(new_buffer)
+    new_buffer = flatbuffer.encode(
+        ReadingV2(
+            id=9,
+            label="current sensor",
+            samples=np.array([3.5], dtype=np.float32),
+            quality=87,
+            note="added by schema v2",
+        )
+    )
+    legacy = flatbuffer.decode(new_buffer, type=ReadingViewV1)
     assert legacy.samples is not None
     print("v1 reading v2:", legacy.label, legacy.samples.tolist())
 

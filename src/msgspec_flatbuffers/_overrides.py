@@ -8,7 +8,7 @@ from typing import Any, Self, overload
 
 import msgspec
 
-from ._conversion import dec_hook as default_dec_hook
+from ._conversion import decode_fallback
 from ._dynamic import DynamicValue, dynamic_from_builtins, dynamic_types
 from ._models import validate_model_subclass
 
@@ -78,7 +78,7 @@ class DynamicModelOverrides(UserDict[type[msgspec.Struct], type[msgspec.Struct]]
                 dec_hook=self.dec_hook,
                 dynamic_overrides=self,
             )
-        return default_dec_hook(annotation, value)
+        return decode_fallback(annotation, value)
 
 
 def _validate_dynamic_override(

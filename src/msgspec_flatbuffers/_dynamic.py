@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 import msgspec
 
+from ._flatbuffer import _model_binding
+from ._flatbuffer import decode as decode_flatbuffer
+from ._flatbuffer import encode as encode_flatbuffer
 from ._models import validate_model_subclass
 from ._runtime import TableView
 
@@ -76,10 +79,9 @@ class _DynamicTypeRegistry:
                     "dynamic FlatBuffer registration conflicts with an existing "
                     "tag or model"
                 )
-            if tag_entry is not None:
-                return tag_entry
-            if model_entry is not None:
-                return model_entry
+            existing = tag_entry or model_entry
+            if existing is not None:
+                return existing
             self._by_tag[entry.tag] = entry
             self._by_model[entry.model_type] = entry
             self._registration_version += 1
@@ -308,7 +310,7 @@ class DynamicView:
             return None
         cached = self._value
         if cached is _ABSENT:
-            cached = entry.view_type.from_buffer(self._data)
+            cached = decode_flatbuffer(self._data, type=entry.view_type)
             self._value = cached
         return entry, cast(TableView, cached)
 
@@ -336,9 +338,7 @@ def _require_allowed_prefix(tag: str, prefix: str | None) -> None:
         return
     if tag.startswith(prefix) and len(tag) > len(prefix):
         return
-    raise ValueError(
-        f"dynamic FlatBuffer tag {tag!r} is outside {prefix + '*'!r}"
-    )
+    raise ValueError(f"dynamic FlatBuffer tag {tag!r} is outside {prefix + '*'!r}")
 
 
 def _validated_entry(
@@ -353,8 +353,6 @@ def _validated_entry(
         raise TypeError("dynamic FlatBuffer models must be msgspec.Struct types")
     if not isinstance(view_type, type) or not issubclass(view_type, TableView):
         raise TypeError("dynamic FlatBuffer views must be TableView types")
-    if not callable(getattr(model_type, "to_flatbuffer", None)):
-        raise TypeError("dynamic FlatBuffer models must define to_flatbuffer()")
     if not callable(getattr(view_type, "to_model", None)):
         raise TypeError("dynamic FlatBuffer views must define to_model()")
 
@@ -370,9 +368,7 @@ def dynamic_allow_prefix(pattern: str) -> str:
         or pattern.count("*") != 1
         or len(pattern) <= 2
     ):
-        raise ValueError(
-            "dynamic_allow must be a nonempty namespace followed by '.*'"
-        )
+        raise ValueError("dynamic_allow must be a nonempty namespace followed by '.*'")
     return pattern[:-1]
 
 
@@ -389,6 +385,7 @@ def register_dynamic_type(
 ) -> DynamicType:
     """Register a dynamic type in the process-wide registry."""
 
+    _model_binding(model_type)
     return dynamic_types.register(tag, model_type, view_type)
 
 
@@ -412,7 +409,7 @@ def encode_dynamic(
         raise TypeError(
             f"unregistered dynamic FlatBuffer model {type(model).__qualname__}"
         )
-    data = cast(Any, model).to_flatbuffer()
+    data = encode_flatbuffer(model)
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("dynamic FlatBuffer serializers must return a buffer")
     return entry.tag, data
@@ -450,15 +447,11 @@ def dynamic_from_builtins(
         raise TypeError("dynamic FlatBuffer values must decode from an object")
     tag = value.get(_MSGSPEC_TAG_FIELD)
     if not isinstance(tag, str):
-        raise ValueError(
-            f"dynamic FlatBuffer object is missing {_MSGSPEC_TAG_FIELD!r}"
-        )
+        raise ValueError(f"dynamic FlatBuffer object is missing {_MSGSPEC_TAG_FIELD!r}")
     value_type._require_allowed(tag)
     if _OPAQUE_DATA_FIELD in value:
         if value.keys() != _OPAQUE_DYNAMIC_FIELDS:
-            raise ValueError(
-                "opaque dynamic FlatBuffer objects have unexpected fields"
-            )
+            raise ValueError("opaque dynamic FlatBuffer objects have unexpected fields")
         data = msgspec.convert(value[_OPAQUE_DATA_FIELD], type=bytes)
         return value_type.opaque(tag, data)
 
@@ -496,7 +489,6 @@ __all__ = [
     "dynamic_from_builtins",
     "dynamic_to_builtins",
     "dynamic_types",
-    "encode_dynamic",
     "register_dynamic_module",
     "register_dynamic_type",
 ]

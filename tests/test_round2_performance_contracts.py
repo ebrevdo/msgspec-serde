@@ -23,6 +23,7 @@ from msgspec_flatbuffers import (
     TableVector,
     TableView,
     TypeReference,
+    flatbuffer,
     render_module,
 )
 
@@ -223,9 +224,9 @@ def test_fully_cached_vector_preserves_dense_index_and_slice_semantics() -> None
     assert vector[-1] is values[-1]
     assert vector[5:31:4] == values[5:31:4]
     assert vector[::-11] == values[::-11]
-    with pytest.raises(IndexError):
+    with pytest.raises(IndexError, match="tuple index out of range"):
         _ = vector[len(vector)]
-    with pytest.raises(IndexError):
+    with pytest.raises(IndexError, match="tuple index out of range"):
         _ = vector[-len(vector) - 1]
 
 
@@ -241,7 +242,7 @@ def test_struct_vector_reuses_a_validated_read_only_span() -> None:
     assert vector[0] is first
     assert first.buffer.readonly
     assert first.buffer.obj is buffer
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="read-only"):
         first.buffer[0] = 0
 
 
@@ -392,10 +393,10 @@ def test_generated_scalar_reads_reject_positions_outside_the_table(
     namespace = _rendered_namespace(_scalar_table_schema(), "//scalar.fbs")
     root_type = namespace["ScalarRoot"]
     view_type = namespace["ScalarRootView"]
-    buffer = bytearray(root_type(value=123).to_flatbuffer())
-    valid_view = view_type.from_buffer(buffer)
+    buffer = bytearray(flatbuffer.encode(root_type(value=123)))
+    valid_view = flatbuffer.decode(buffer, type=view_type)
     struct.pack_into("<H", buffer, valid_view._vtable_offset + 4, relative)
-    corrupt_view = view_type.from_buffer(buffer)
+    corrupt_view = flatbuffer.decode(buffer, type=view_type)
 
     with pytest.raises(InvalidBufferError, match="outside"):
         _ = corrupt_view.value

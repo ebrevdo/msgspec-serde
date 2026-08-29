@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-import msgspec
 import numpy as np
 import pytest
 
 import msgspec_flatbuffers
-from msgspec_flatbuffers import dec_hook, enc_hook, generate
+from msgspec_flatbuffers import flatbuffer, generate, json
+from msgspec_flatbuffers._flatbuffer import register_type
 
 ROOT = Path(__file__).parents[1]
 COMPATIBILITY = ROOT / "tests" / "generated_compatibility"
@@ -96,7 +96,14 @@ def generated_case(
             gen_onefile=True,
         )
     module_name = f"_generated_compatibility_{case.name}"
-    return case, _load_module(module_name, module_path)
+    module = _load_module(module_name, module_path)
+    register_type(
+        module.Monster,
+        module._FB_NATIVE_MODULE,
+        "Compatibility.Monster",
+        "COMP",
+    )
+    return case, module
 
 
 def test_generated_public_api_contract(
@@ -120,11 +127,11 @@ def test_generated_public_api_contract(
         colors=[generated.Color.Red, generated.Color.Blue],
     )
 
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
     assert buffer.readonly
-    assert generated.Monster.from_flatbuffer(buffer) == model
+    assert flatbuffer.decode(buffer, type=generated.Monster) == model
 
-    view = generated.MonsterView.from_buffer(buffer)
+    view = flatbuffer.decode(buffer, type=generated.MonsterView)
     assert view.name == "compatibility"
     assert view.name is view.name
     assert view.pos.z == 3.0
@@ -143,27 +150,24 @@ def test_generated_public_api_contract(
     restored.scores[0] = 99.0
     assert view.scores[0] == 1.5
 
-    framed = model.to_flatbuffer(size_prefixed=True)
+    framed = flatbuffer.encode(model, size_prefixed=True)
     assert (
-        generated.MonsterView.from_buffer(
+        flatbuffer.decode(
             framed,
+            type=generated.MonsterView,
             size_prefixed=True,
         ).to_model()
         == model
     )
 
-    encoded = msgspec.json.encode(model, enc_hook=enc_hook)
-    decoded = msgspec.json.decode(
-        encoded,
-        type=generated.Monster,
-        dec_hook=dec_hook,
-    )
+    encoded = json.encode(model)
+    decoded = json.decode(encoded, type=generated.Monster)
     assert decoded == model
 
     class ApplicationMonster(generated.Monster, dict=True):
         def __post_init__(self) -> None:
             self.was_validated = True
 
-    application_model = ApplicationMonster.from_flatbuffer(buffer)
+    application_model = flatbuffer.decode(buffer, type=ApplicationMonster)
     assert application_model.was_validated
-    assert application_model.to_flatbuffer().readonly
+    assert flatbuffer.encode(application_model).readonly

@@ -13,7 +13,13 @@ import msgspec
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import BufferBoundsError, dec_hook, enc_hook, generate
+from msgspec_flatbuffers import (
+    BufferBoundsError,
+    flatbuffer,
+    generate,
+    json,
+    msgpack,
+)
 
 HAS_FLATC = shutil.which("flatc") is not None
 pytestmark = pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
@@ -29,9 +35,7 @@ def _load_module(name: str, path: Path) -> ModuleType:
         for child in generated_root.iterdir()
         if child.is_dir() and (child / "__init__.py").is_file()
     }
-    generated_modules = {
-        child.stem for child in generated_root.glob("*.py")
-    }
+    generated_modules = {child.stem for child in generated_root.glob("*.py")}
     for imported_name in tuple(sys.modules):
         if (
             imported_name.split(".", 1)[0] in generated_packages
@@ -76,12 +80,9 @@ def _assert_writable_owned_arrays(model: object, names: Iterable[str]) -> None:
         assert array.flags.writeable
 
 
-def _assert_json_round_trip(model: object) -> None:
-    assert msgspec.json.decode(
-        msgspec.json.encode(model, enc_hook=enc_hook),
-        type=type(model),
-        dec_hook=dec_hook,
-    ) == model
+def _assert_serde_round_trip(model: msgspec.Struct) -> None:
+    for codec in (json, msgpack):
+        assert codec.decode(codec.encode(model), type=type(model)) == model
 
 
 def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
@@ -107,18 +108,20 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
         optional_count=9,
     )
 
-    model_buffer = model.to_flatbuffer()
+    model_buffer = flatbuffer.encode(model)
     assert model_buffer.readonly
     assert type(model_buffer.obj).__name__ == "NativeBuffer"
     assert type(model_buffer.obj).__module__ == "msgspec_flatbuffers._native"
-    assert generated.BasicView.from_buffer(model_buffer).to_model() == model
+    assert flatbuffer.decode(model_buffer, type=generated.BasicView).to_model() == model
 
     packed_buffer = generated._FB_NATIVE_MODULE.pack(
         "Native.Basic",
         model,
         identifier="BASC",
     )
-    assert generated.BasicView.from_buffer(packed_buffer).to_model() == model
+    assert (
+        flatbuffer.decode(packed_buffer, type=generated.BasicView).to_model() == model
+    )
 
     presized_buffer = generated._FB_NATIVE_MODULE.pack(
         "Native.Basic",
@@ -126,7 +129,7 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
         identifier="BASC",
         initial_size=128,
     )
-    view = generated.BasicView.from_buffer(presized_buffer)
+    view = flatbuffer.decode(presized_buffer, type=generated.BasicView)
 
     assert view.to_model() == model
     assert presized_buffer[4:8] == b"BASC"
@@ -138,26 +141,34 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
         size_prefixed=True,
         initial_size=128,
     )
-    assert generated.BasicView.from_buffer(
-        prefixed_buffer,
-        size_prefixed=True,
-    ).to_model() == model
-    assert generated.Basic.from_flatbuffer(
-        prefixed_buffer,
-        size_prefixed=True,
-    ) == model
+    assert (
+        flatbuffer.decode(
+            prefixed_buffer,
+            type=generated.BasicView,
+            size_prefixed=True,
+        ).to_model()
+        == model
+    )
+    assert (
+        flatbuffer.decode(
+            prefixed_buffer,
+            type=generated.Basic,
+            size_prefixed=True,
+        )
+        == model
+    )
 
     undersized_frame = bytearray(prefixed_buffer)
     struct.pack_into("<I", undersized_frame, 0, 8)
-    with pytest.raises(BufferBoundsError):
-        generated.Basic.from_flatbuffer(undersized_frame, size_prefixed=True)
+    with pytest.raises(BufferBoundsError, match="int32 at offset"):
+        flatbuffer.decode(undersized_frame, type=generated.Basic, size_prefixed=True)
 
     invalid_utf8 = bytearray(model_buffer)
     label_start = invalid_utf8.find(b"built in Rust")
     assert label_start >= 0
     invalid_utf8[label_start] = 0xFF
-    with pytest.raises(UnicodeDecodeError):
-        generated.Basic.from_flatbuffer(invalid_utf8)
+    with pytest.raises(UnicodeDecodeError, match="invalid utf-8 sequence"):
+        flatbuffer.decode(invalid_utf8, type=generated.Basic)
 
     defaults = generated.Basic(label="defaults")
     defaults_buffer = generated._FB_NATIVE_MODULE.pack(
@@ -165,7 +176,10 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
         defaults,
         identifier="BASC",
     )
-    assert generated.BasicView.from_buffer(defaults_buffer).to_model() == defaults
+    assert (
+        flatbuffer.decode(defaults_buffer, type=generated.BasicView).to_model()
+        == defaults
+    )
 
     class MissingLabel:
         flag = True
@@ -205,7 +219,7 @@ def test_native_module_plan_builds_nested_tables(tmp_path: Path) -> None:
         identifier="NEST",
     )
 
-    assert generated.ParentView.from_buffer(buffer).to_model() == model
+    assert flatbuffer.decode(buffer, type=generated.ParentView).to_model() == model
 
 
 def test_native_materialization_handles_deep_recursive_tables(
@@ -229,7 +243,7 @@ def test_native_materialization_handles_deep_recursive_tables(
         node = builder.EndObject()
     builder.Finish(node)
 
-    current = generated.Node.from_flatbuffer(builder.Output())
+    current = flatbuffer.decode(builder.Output(), type=generated.Node)
     count = 0
     while current is not None:
         following = current.next
@@ -267,12 +281,12 @@ def test_nested_structs_and_fixed_arrays_round_trip(tmp_path: Path) -> None:
     )
     model = generated.Root(data=data)
 
-    buffer = model.to_flatbuffer()
-    restored = generated.Root.from_flatbuffer(buffer)
-    view = generated.RootView.from_buffer(buffer)
+    buffer = flatbuffer.encode(model)
+    restored = flatbuffer.decode(buffer, type=generated.Root)
+    view = flatbuffer.decode(buffer, type=generated.RootView)
 
     assert restored == model
-    _assert_json_round_trip(model)
+    _assert_serde_round_trip(model)
     assert restored.data is not None
     _assert_writable_owned_arrays(restored.data, ["values"])
     assert view.data is not None
@@ -282,14 +296,12 @@ def test_nested_structs_and_fixed_arrays_round_trip(tmp_path: Path) -> None:
     assert view.data.points[0].x == 1
     assert view.data.points[0] is view.data.points[0]
     assert view.data.pair.first.y == 4
-    assert generated.FixedData.__annotations__["values"] == (
-        "npt.NDArray[np.int32]"
-    )
+    assert generated.FixedData.__annotations__["values"] == ("npt.NDArray[np.int32]")
     assert generated.FixedData.__annotations__["modes"].endswith(".Mode]")
 
     data.values = np.array([1, 2, 3], dtype=np.int32)
     with pytest.raises(ValueError, match="fixed array requires 4 items"):
-        model.to_flatbuffer()
+        flatbuffer.encode(model)
 
 
 def test_union_vectors_round_trip_none_elements(tmp_path: Path) -> None:
@@ -307,12 +319,12 @@ def test_union_vectors_round_trip_none_elements(tmp_path: Path) -> None:
         pets=[generated.Cat(lives=7), None, generated.Dog(good=False)]
     )
 
-    buffer = model.to_flatbuffer()
-    restored = generated.Root.from_flatbuffer(buffer)
-    pets = generated.RootView.from_buffer(buffer).pets
+    buffer = flatbuffer.encode(model)
+    restored = flatbuffer.decode(buffer, type=generated.Root)
+    pets = flatbuffer.decode(buffer, type=generated.RootView).pets
 
     assert restored == model
-    _assert_json_round_trip(model)
+    _assert_serde_round_trip(model)
     assert pets is not None
     assert pets[0].lives == 7
     assert pets[1] is None
@@ -357,7 +369,7 @@ def test_fixed_arrays_round_trip_every_numpy_dtype(tmp_path: Path) -> None:
     }
     model = generated.Root(values=generated.FixedArrays(**arrays))
 
-    restored = generated.Root.from_flatbuffer(model.to_flatbuffer())
+    restored = flatbuffer.decode(flatbuffer.encode(model), type=generated.Root)
 
     assert restored == model
     assert restored.values is not None
@@ -390,9 +402,9 @@ def test_native_plan_round_trips_every_numpy_vector_dtype(tmp_path: Path) -> Non
     }
     model = generated.Vectors(**arrays, blob=b"\x00\x01\xff")
 
-    buffer = model.to_flatbuffer()
-    view_restored = generated.VectorsView.from_buffer(buffer).to_model()
-    model_restored = generated.Vectors.from_flatbuffer(buffer)
+    buffer = flatbuffer.encode(model)
+    view_restored = flatbuffer.decode(buffer, type=generated.VectorsView).to_model()
+    model_restored = flatbuffer.decode(buffer, type=generated.Vectors)
 
     assert view_restored == model
     assert model_restored == model
@@ -400,14 +412,12 @@ def test_native_plan_round_trips_every_numpy_vector_dtype(tmp_path: Path) -> Non
     assert generated.Vectors.__annotations__["bools"] == (
         "npt.NDArray[np.bool_] | None"
     )
-    assert generated.Vectors.__annotations__["i64s"] == (
-        "npt.NDArray[np.int64] | None"
-    )
+    assert generated.Vectors.__annotations__["i64s"] == ("npt.NDArray[np.int64] | None")
     assert generated.Vectors.__annotations__["blob"] == "bytes | None"
 
     assert model_restored.f32s is not None
     model_restored.f32s[0] = 99.0
-    source = generated.VectorsView.from_buffer(buffer).f32s
+    source = flatbuffer.decode(buffer, type=generated.VectorsView).f32s
     assert source is not None
     assert source[0] == arrays["f32s"][0]
 
@@ -415,14 +425,17 @@ def test_native_plan_round_trips_every_numpy_vector_dtype(tmp_path: Path) -> Non
         **{name: np.empty(0, dtype=array.dtype) for name, array in arrays.items()},
         blob=b"",
     )
-    empty_restored = generated.Vectors.from_flatbuffer(empty_model.to_flatbuffer())
+    empty_restored = flatbuffer.decode(
+        flatbuffer.encode(empty_model), type=generated.Vectors
+    )
     assert empty_restored == empty_model
     _assert_writable_owned_arrays(empty_restored, arrays)
 
-    strided = {
-        name: np.repeat(array, 2)[::2] for name, array in arrays.items()
-    }
+    strided = {name: np.repeat(array, 2)[::2] for name, array in arrays.items()}
     strided_model = generated.Vectors(**strided, blob=memoryview(b"strided"))
-    assert generated.VectorsView.from_buffer(
-        strided_model.to_flatbuffer()
-    ).to_model() == strided_model
+    assert (
+        flatbuffer.decode(
+            flatbuffer.encode(strided_model), type=generated.VectorsView
+        ).to_model()
+        == strided_model
+    )

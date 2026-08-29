@@ -8,7 +8,7 @@ sync:
 
 # Run the Python test suite.
 test:
-    uv run --locked pytest -q
+    uv run --locked --group benchmark pytest -q
 
 # Run Python linting and type checking.
 lint:
@@ -30,7 +30,19 @@ build:
 
 # Run the benchmark suite and pass through optional arguments.
 benchmark *args:
-    uv run --no-sync python benchmarks/benchmark.py {{args}}
+    uv run --locked --group benchmark python -m benchmarks.run_pinned -- python -m benchmarks.benchmark {{args}}
+
+# Generate the benchmark report images from saved benchmark outputs.
+benchmark-report *args:
+    uv run --locked --group benchmark python -m benchmarks.report {{args}}
+
+# Run msgspec's vendored JSON or MessagePack benchmark.
+benchmark-upstream-encodings *args:
+    uv run --locked --group upstream-benchmark python -m benchmarks.run_pinned --cwd benchmarks/upstream_msgspec -- python -m benchmarks.bench_encodings {{args}}
+
+# Profile upstream Structs at 16- and 256-value vector sizes by default.
+benchmark-upstream-profile *args:
+    uv run --locked --group upstream-benchmark python -m benchmarks.run_pinned --cwd benchmarks/upstream_msgspec -- python -m benchmarks.profile_msgspec_flatbuffers {{args}}
 
 # Freeze generated code for the current release.
 freeze-release:

@@ -28,6 +28,14 @@ module-name = "msgspec_flatbuffers._native"
 python-source = "src"
 
 [dependency-groups]
+benchmark = [
+    "matplotlib>=3.10",
+    "pyperf>=2.10",
+]
+upstream-benchmark = [
+    "orjson==3.11.4",
+    "ormsgpack==1.11.0",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.16.4",
@@ -36,11 +44,13 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py312"
 extend-exclude = [
+    "benchmarks/upstream_msgspec",
     "examples/schema_evolution/schema_evolution_generated",
     "src/msgspec_flatbuffers/_reflection",
     "tests/generated_compatibility/releases",

@@ -95,7 +95,7 @@ def test_parse_bfbs_rejects_default_vector_and_string_features() -> None:
 
 
 def test_compile_schema_reports_missing_compiler() -> None:
-    with pytest.raises(FlatcNotFoundError):
+    with pytest.raises(FlatcNotFoundError, match="flatc executable not found"):
         compile_schema(FIXTURE, flatc="definitely-not-a-flatc-executable")
 
 

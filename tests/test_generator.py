@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import pytest
@@ -23,10 +23,14 @@ from msgspec_flatbuffers import (
     InvalidBufferError,
     ObjectDefinition,
     Schema,
+    TableMap,
     TypeReference,
+    flatbuffer,
     generate,
     render_module,
 )
+from msgspec_flatbuffers import json as generated_json
+from msgspec_flatbuffers import msgpack as generated_msgpack
 from msgspec_flatbuffers.cli import main
 
 FIXTURE = Path(__file__).parent / "fixtures" / "monster.fbs"
@@ -104,6 +108,10 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     assert module_path.read_text(encoding="utf-8") == generated_source
 
     generated = _load_module("test_generated_monster", module_path)
+    assert not hasattr(generated.Monster, "to_flatbuffer")
+    assert not hasattr(generated.Monster, "from_flatbuffer")
+    assert not hasattr(generated.MonsterView, "from_buffer")
+    assert not hasattr(generated, "build_monster")
     model = generated.Monster(
         pos=generated.Vec3(x=1.0, y=2.0, z=3.0),
         mana=175,
@@ -125,14 +133,14 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
         colors=[generated.Color.Red, generated.Color.Blue],
     )
 
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
     assert isinstance(buffer, memoryview)
     assert buffer.readonly
     assert type(buffer.obj).__name__ == "NativeBuffer"
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="read-only"):
         buffer[0] = 0
-    view = generated.MonsterView.from_buffer(buffer)
-    assert generated.Monster.from_flatbuffer(buffer) == model
+    view = flatbuffer.decode(buffer, type=generated.MonsterView)
+    assert flatbuffer.decode(buffer, type=generated.Monster) == model
 
     assert view.name == "fred"
     assert view.name is view.name
@@ -144,9 +152,9 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     assert not view.scores.flags.writeable
     np.testing.assert_array_equal(view.scores, [1.5, 2.5, 3.5])
     assert view.scores is view.scores
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="WRITEABLE flag"):
         view.scores.setflags(write=True)
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="read-only"):
         view.inventory[0] = 9
 
     weapons = view.weapons
@@ -195,11 +203,11 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     assert view.scores[0] == 1.5
     assert len(view.weapons) == 2
     assert tuple(view.tags) == ("one", "two")
-    assert generated.MonsterView.from_buffer(
-        first_model.to_flatbuffer()
+    assert flatbuffer.decode(
+        flatbuffer.encode(first_model), type=generated.MonsterView
     ).to_model() == first_model
 
-    untouched_view = generated.MonsterView.from_buffer(buffer)
+    untouched_view = flatbuffer.decode(buffer, type=generated.MonsterView)
     untouched_weapons = untouched_view.weapons
     assert untouched_weapons is not None
     assert untouched_weapons.cached_count == 0
@@ -208,31 +216,30 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
 
     model.hp = 1
     assert model.hp == 1
-    with pytest.raises(AttributeError):
+    with pytest.raises(AttributeError, match="extra_state"):
         view.extra_state = "not allowed"
 
-    size_prefixed = model.to_flatbuffer(size_prefixed=True)
-    size_prefixed_view = generated.MonsterView.from_buffer(
-        size_prefixed,
-        size_prefixed=True,
-    )
+    size_prefixed = flatbuffer.Encoder(size_prefixed=True).encode(model)
+    size_prefixed_view = flatbuffer.Decoder(
+        generated.MonsterView, size_prefixed=True
+    ).decode(size_prefixed)
     assert size_prefixed_view.hp == 1
     assert bytes(size_prefixed_view.buffer) == size_prefixed[4:]
-    assert generated.Monster.from_flatbuffer(
-        size_prefixed,
-        size_prefixed=True,
+    assert flatbuffer.Decoder(generated.Monster, size_prefixed=True).decode(
+        size_prefixed
     ) == model
     undersized_identifier = bytearray(size_prefixed)
     struct.pack_into("<I", undersized_identifier, 0, 4)
     with pytest.raises(BufferBoundsError, match="file identifier"):
-        generated.MonsterView.from_buffer(
+        flatbuffer.decode(
             undersized_identifier,
+            type=generated.MonsterView,
             size_prefixed=True,
         )
 
     default_model = generated.Monster()
-    empty_buffer = default_model.to_flatbuffer()
-    defaults = generated.MonsterView.from_buffer(empty_buffer)
+    empty_buffer = flatbuffer.encode(default_model)
+    defaults = flatbuffer.decode(empty_buffer, type=generated.MonsterView)
     assert defaults.optional_energy is None
     assert defaults.weapons is None
     assert defaults.scores is None
@@ -241,7 +248,7 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     assert defaults.colors is None
 
     assert len(empty_buffer) == 16
-    assert empty_buffer.obj._allocation_size == 17
+    assert cast(Any, empty_buffer.obj)._allocation_size == 17
 
     empty_vectors = generated.Monster(
         weapons=[],
@@ -250,8 +257,8 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
         path=[],
         colors=[],
     )
-    empty_materialized = generated.MonsterView.from_buffer(
-        empty_vectors.to_flatbuffer()
+    empty_materialized = flatbuffer.decode(
+        flatbuffer.encode(empty_vectors), type=generated.MonsterView
     ).to_model()
     assert empty_materialized == empty_vectors
     assert empty_materialized.weapons == []
@@ -264,12 +271,12 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
     wrong_identifier = bytearray(buffer)
     wrong_identifier[4:8] = b"NOPE"
     with pytest.raises(InvalidBufferError, match="file identifier"):
-        generated.MonsterView.from_buffer(wrong_identifier)
+        flatbuffer.decode(wrong_identifier, type=generated.MonsterView)
     with pytest.raises(InvalidBufferError, match="file identifier"):
-        generated.Monster.from_flatbuffer(wrong_identifier)
+        flatbuffer.decode(wrong_identifier, type=generated.Monster)
 
     invalid_vector = bytearray(buffer)
-    unchecked = generated.MonsterView.from_buffer(invalid_vector)
+    unchecked = flatbuffer.decode(invalid_vector, type=generated.MonsterView)
     inventory_field = unchecked._field_position(12, 4)
     assert inventory_field is not None
     inventory_length = inventory_field + struct.unpack_from(
@@ -278,31 +285,29 @@ def test_generated_module_round_trips_and_caches_views(tmp_path: Path) -> None:
         inventory_field,
     )[0]
     struct.pack_into("<I", invalid_vector, inventory_length, 2**32 - 1)
-    corrupt_inventory = generated.MonsterView.from_buffer(invalid_vector)
+    corrupt_inventory = flatbuffer.decode(invalid_vector, type=generated.MonsterView)
     with pytest.raises(BufferBoundsError, match="vector data"):
         _ = corrupt_inventory.inventory
     with pytest.raises(BufferBoundsError, match="vector data"):
         corrupt_inventory.to_model()
     with pytest.raises(BufferBoundsError, match="vector data"):
-        generated.Monster.from_flatbuffer(invalid_vector)
+        flatbuffer.decode(invalid_vector, type=generated.Monster)
 
     invalid_table_vector = bytearray(buffer)
-    unchecked = generated.MonsterView.from_buffer(invalid_table_vector)
+    unchecked = flatbuffer.decode(invalid_table_vector, type=generated.MonsterView)
     weapons_info = unchecked._vector_info(16, 4)
     assert weapons_info is not None
     weapons_start, weapons_length = weapons_info
     assert weapons_length == 2
     struct.pack_into("<I", invalid_table_vector, weapons_start, 0)
-    corrupt_weapons = generated.MonsterView.from_buffer(
-        invalid_table_vector
-    ).weapons
+    corrupt_weapons = flatbuffer.decode(invalid_table_vector, type=generated.MonsterView).weapons
     assert corrupt_weapons is not None
     with pytest.raises(InvalidBufferError, match="table vector element"):
         corrupt_weapons[0]
     with pytest.raises(InvalidBufferError, match="table vector offset"):
-        generated.MonsterView.from_buffer(invalid_table_vector).to_model()
+        flatbuffer.decode(invalid_table_vector, type=generated.MonsterView).to_model()
     with pytest.raises(InvalidBufferError, match="table vector offset"):
-        generated.Monster.from_flatbuffer(invalid_table_vector)
+        flatbuffer.decode(invalid_table_vector, type=generated.Monster)
 
     reference_root = tmp_path / "reference"
     reference_root.mkdir()
@@ -385,10 +390,10 @@ class InvalidMonster(Monster):
         weapons=[generated.Weapon(name="Axe", damage=5)],
         path=[generated.Vec3(x=4.0, y=5.0, z=6.0)],
     )
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    direct = validated_monster.from_flatbuffer(buffer)
-    from_view = generated.MonsterView.from_buffer(buffer).to_model(validated_monster)
+    direct = flatbuffer.decode(buffer, type=validated_monster)
+    from_view = flatbuffer.decode(buffer, type=generated.MonsterView).to_model(validated_monster)
     for restored in (direct, from_view):
         assert type(restored) is validated_monster
         assert restored.was_validated
@@ -400,15 +405,15 @@ class InvalidMonster(Monster):
         assert restored.path is not None
         assert type(restored.path[0]) is validated_vec3
         assert restored.path[0].was_validated
-        assert restored.to_flatbuffer().readonly
+        assert flatbuffer.encode(restored).readonly
 
     assert set(validated_monster.__struct_fields__) == set(
         generated.Monster.__struct_fields__
     )
     with pytest.raises(TypeError, match="serialized msgspec fields"):
-        invalid_monster.from_flatbuffer(buffer)
+        flatbuffer.decode(buffer, type=invalid_monster)
     with pytest.raises(TypeError, match="serialized msgspec fields"):
-        invalid_monster(name="invalid").to_flatbuffer()
+        flatbuffer.encode(invalid_monster(name="invalid"))
 
 
 def test_generate_resolves_types_from_another_fbs_module(tmp_path: Path) -> None:
@@ -441,10 +446,222 @@ def test_generate_resolves_types_from_another_fbs_module(tmp_path: Path) -> None
         generated = _load_module("example.root", module_path)
 
         model = generated.Root(child=generated.Child(value=42))
-        view = generated.RootView.from_buffer(model.to_flatbuffer())
+        view = flatbuffer.decode(flatbuffer.encode(model), type=generated.RootView)
         assert view.child.value == 42
         assert view.child is view.child
         assert view.to_model() == model
+
+
+def test_keyed_table_vectors_use_sorted_mappings(tmp_path: Path) -> None:
+    source = tmp_path / "keyed.fbs"
+    _write_schema(
+        source,
+        "namespace Example;",
+        "table Named { name:string (key); value:int; }",
+        "table Numbered { id:int (key); label:string; }",
+        "table Root { named:[Named]; numbered:[Numbered]; }",
+        "root_type Root;",
+        'file_identifier "KEYS";',
+    )
+    output = tmp_path / "generated"
+    module_path = generate(source, output, project_root=tmp_path)
+    generated_source = module_path.read_text(encoding="utf-8")
+    generated = _load_module("test_generated_keyed", module_path)
+    model = generated.Root(
+        named={
+            "beta": generated.Named(name="beta", value=2),
+            "alpha": generated.Named(name="alpha", value=1),
+        },
+        numbered={
+            20: generated.Numbered(id=20, label="twenty"),
+            -5: generated.Numbered(id=-5, label="negative"),
+        },
+    )
+
+    assert "named: dict[str," in generated_source
+    assert "numbered: dict[int," in generated_source
+    assert "TableMap[str," in generated_source
+    assert "TableMap[int," in generated_source
+
+    buffer = flatbuffer.encode(model)
+    view = flatbuffer.decode(buffer, type=generated.RootView)
+    assert isinstance(view.named, TableMap)
+    assert view.numbered is not None
+    assert list(view.named) == ["alpha", "beta"]
+    assert view.named["beta"].value == 2
+    assert list(view.numbered) == [-5, 20]
+    assert view.numbered[-5].label == "negative"
+    with pytest.raises(KeyError, match="missing"):
+        view.named["missing"]
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        view.named["gamma"] = generated.NamedView  # type: ignore[index]
+
+    restored = flatbuffer.decode(buffer, type=generated.Root)
+    assert restored == model
+    assert restored.named is not None
+    assert list(restored.named) == ["alpha", "beta"]
+    for codec in (generated_json, generated_msgpack):
+        decoded = codec.decode(codec.encode(model), type=generated.Root)
+        assert decoded == model
+        assert isinstance(decoded.named, dict)
+
+    mismatched = generated.Root(
+        named={"wrong": generated.Named(name="actual", value=1)}
+    )
+    with pytest.raises(ValueError, match="key does not match"):
+        flatbuffer.encode(mismatched)
+    with pytest.raises(TypeError, match="requires a dict"):
+        flatbuffer.encode(
+            generated.Root(named=[generated.Named(name="alpha", value=1)])
+        )
+
+    namespace: dict[str, Any] = {
+        "Named": generated.Named,
+        "Root": generated.Root,
+    }
+    exec(
+        compile(
+            """
+class ApplicationNamed(Named):
+    pass
+
+class ApplicationRoot(Root):
+    named: dict[str, ApplicationNamed] | None = None
+
+class InvalidKeyRoot(Root):
+    named: dict[int, ApplicationNamed] | None = None
+""",
+            "<keyed-subclasses>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    application = flatbuffer.decode(buffer, type=namespace["ApplicationRoot"])
+    assert type(application.named["alpha"]) is namespace["ApplicationNamed"]
+    with pytest.raises(TypeError, match="mapping key annotation"):
+        flatbuffer.decode(buffer, type=namespace["InvalidKeyRoot"])
+
+    reference_root = tmp_path / "reference"
+    subprocess.run(
+        ["flatc", "--python", "-o", str(reference_root), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    with _temporary_sys_path(reference_root):
+        reference = _load_module("Example.Root", reference_root / "Example/Root.py")
+        reference_view = reference.Root.GetRootAs(buffer)
+        assert reference_view.Named(0).Name() == b"alpha"
+        assert reference_view.Named(1).Name() == b"beta"
+        assert reference_view.Numbered(0).Id() == -5
+
+    external_json = tmp_path / "keyed.json"
+    external_json.write_text(
+        (
+            '{"named":[{"name":"beta","value":2},'
+            '{"name":"alpha","value":1}],'
+            '"numbered":[{"id":20,"label":"twenty"},'
+            '{"id":-5,"label":"negative"}]}'
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "flatc",
+            "-b",
+            "--strict-json",
+            "-o",
+            str(tmp_path),
+            str(source),
+            str(external_json),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    external = flatbuffer.decode(
+        (tmp_path / "keyed.bin").read_bytes(),
+        type=generated.Root,
+    )
+    assert list(external.named) == ["alpha", "beta"]
+    assert list(external.numbered) == [-5, 20]
+
+
+def test_generated_subclass_serde_honors_wire_options(tmp_path: Path) -> None:
+    module_path = generate(FIXTURE, tmp_path / "generated")
+    generated = _load_module("test_generated_serde_subclass", module_path)
+
+    class TaggedMonster(generated.Monster, tag="sub", omit_defaults=True):
+        pass
+
+    model = TaggedMonster(name="wire options")
+    encoded = generated_json.encode(model)
+
+    assert b'"type":"sub"' in encoded
+    assert b'"mana"' not in encoded
+    assert generated_json.decode(encoded, type=TaggedMonster) == model
+
+
+def test_keyed_table_vectors_support_scalar_key_types(tmp_path: Path) -> None:
+    source = tmp_path / "scalar_keys.fbs"
+    _write_schema(
+        source,
+        "namespace ScalarKeys;",
+        "enum Code:ushort { Zero, Two = 2 }",
+        "table Flagged { key:bool (key); }",
+        "table Unsigned { key:ulong (key); }",
+        "table Single { key:float (key); }",
+        "table Double { key:double (key); }",
+        "table Coded { key:Code (key); }",
+        (
+            "table Root { flags:[Flagged]; unsigned:[Unsigned]; "
+            "single:[Single]; double:[Double]; coded:[Coded]; }"
+        ),
+        "root_type Root;",
+    )
+    generated = _load_module(
+        "test_generated_scalar_keys",
+        generate(source, tmp_path / "generated", project_root=tmp_path),
+    )
+    model = generated.Root(
+        flags={
+            True: generated.Flagged(key=True),
+            False: generated.Flagged(key=False),
+        },
+        unsigned={
+            2**63: generated.Unsigned(key=2**63),
+            1: generated.Unsigned(key=1),
+        },
+        single={
+            2.5: generated.Single(key=2.5),
+            0.1: generated.Single(key=0.1),
+            -1.0: generated.Single(key=-1.0),
+        },
+        double={
+            3.5: generated.Double(key=3.5),
+            -2.0: generated.Double(key=-2.0),
+        },
+        coded={
+            generated.Code.Two: generated.Coded(key=generated.Code.Two),
+            generated.Code.Zero: generated.Coded(key=generated.Code.Zero),
+        },
+    )
+
+    view = flatbuffer.decode(flatbuffer.encode(model), type=generated.RootView)
+
+    assert list(view.flags) == [False, True]
+    assert list(view.unsigned) == [1, 2**63]
+    np.testing.assert_allclose(list(view.single), [-1.0, 0.1, 2.5])
+    assert list(view.double) == [-2.0, 3.5]
+    assert list(view.coded) == [generated.Code.Zero, generated.Code.Two]
+    assert view.unsigned[2**63].key == 2**63
+    assert view.single[0.1].key == pytest.approx(0.1)
+
+    with pytest.raises(ValueError, match="cannot be NaN"):
+        flatbuffer.encode(
+            generated.Root(single={np.nan: generated.Single(key=np.nan)})
+        )
 
 
 def test_byte_vector_can_be_loaded_as_a_cached_nested_view(tmp_path: Path) -> None:
@@ -473,11 +690,13 @@ def test_byte_vector_can_be_loaded_as_a_cached_nested_view(tmp_path: Path) -> No
         adam = _load_module("example.adam_extension", adam_path)
 
         type_id = 0xA813
-        payload = adam.AdamExtension(beta1=0.9, beta2=0.999).to_flatbuffer()
-        outer = base.Base(
-            extensions=[base.Extension(type_id=type_id, data=payload)]
-        ).to_flatbuffer()
-        extensions = base.BaseView.from_buffer(outer).extensions
+        payload = flatbuffer.encode(
+            adam.AdamExtension(beta1=0.9, beta2=0.999)
+        )
+        outer = flatbuffer.encode(
+            base.Base(extensions=[base.Extension(type_id=type_id, data=payload)])
+        )
+        extensions = flatbuffer.decode(outer, type=base.BaseView).extensions
         assert extensions is not None
         extension = extensions[0]
         payload_view = extension.data
@@ -492,21 +711,23 @@ def test_byte_vector_can_be_loaded_as_a_cached_nested_view(tmp_path: Path) -> No
         assert nested.buffer is payload_view
         assert payload_view.obj is outer.obj
 
-        missing_data = base.Base(
-            extensions=[base.Extension(type_id=type_id)]
-        ).to_flatbuffer()
-        missing_extensions = base.BaseView.from_buffer(missing_data).extensions
+        missing_data = flatbuffer.encode(
+            base.Base(extensions=[base.Extension(type_id=type_id)])
+        )
+        missing_extensions = flatbuffer.decode(missing_data, type=base.BaseView).extensions
         assert missing_extensions is not None
         assert missing_extensions[0].data_as(adam.AdamExtensionView) is None
 
-        prefixed_payload = adam.AdamExtension(
-            beta1=0.8,
-            beta2=0.888,
-        ).to_flatbuffer(size_prefixed=True)
-        prefixed_outer = base.Base(
-            extensions=[base.Extension(type_id=type_id, data=prefixed_payload)]
-        ).to_flatbuffer()
-        prefixed_extensions = base.BaseView.from_buffer(prefixed_outer).extensions
+        prefixed_payload = flatbuffer.encode(
+            adam.AdamExtension(beta1=0.8, beta2=0.888),
+            size_prefixed=True,
+        )
+        prefixed_outer = flatbuffer.encode(
+            base.Base(
+                extensions=[base.Extension(type_id=type_id, data=prefixed_payload)]
+            )
+        )
+        prefixed_extensions = flatbuffer.decode(prefixed_outer, type=base.BaseView).extensions
         assert prefixed_extensions is not None
         prefixed_extension = prefixed_extensions[0]
         prefixed_nested = prefixed_extension.data_as(
@@ -522,10 +743,12 @@ def test_byte_vector_can_be_loaded_as_a_cached_nested_view(tmp_path: Path) -> No
 
         invalid_payload = bytearray(payload)
         invalid_payload[4:8] = b"NOPE"
-        invalid_outer = base.Base(
-            extensions=[base.Extension(type_id=type_id, data=invalid_payload)]
-        ).to_flatbuffer()
-        invalid_extensions = base.BaseView.from_buffer(invalid_outer).extensions
+        invalid_outer = flatbuffer.encode(
+            base.Base(
+                extensions=[base.Extension(type_id=type_id, data=invalid_payload)]
+            )
+        )
+        invalid_extensions = flatbuffer.decode(invalid_outer, type=base.BaseView).extensions
         assert invalid_extensions is not None
         with pytest.raises(InvalidBufferError, match="file identifier"):
             invalid_extensions[0].data_as(adam.AdamExtensionView)
@@ -538,11 +761,12 @@ def test_native_builder_presizes_shallow_vectors(tmp_path: Path) -> None:
     scores = np.arange(16_384, dtype=np.float32)
     model = generated.Monster(inventory=inventory, scores=scores)
 
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    assert buffer.obj._allocation_size >= len(buffer)
-    assert buffer.obj._allocation_size * 100 <= len(buffer) * 102
-    rebuilt = generated.MonsterView.from_buffer(buffer).to_model()
+    allocation_size = cast(Any, buffer.obj)._allocation_size
+    assert allocation_size >= len(buffer)
+    assert allocation_size * 100 <= len(buffer) * 102
+    rebuilt = flatbuffer.decode(buffer, type=generated.MonsterView).to_model()
     assert rebuilt == model
 
 
@@ -553,18 +777,20 @@ def test_numeric_vector_serialization_requires_generated_numpy_dtype(
     generated = _load_module("test_generated_numeric_dtype", module_path)
 
     with pytest.raises(TypeError, match="native Float32 data"):
-        generated.Monster(
-            scores=np.array([1.0, 2.0], dtype=np.float64)
-        ).to_flatbuffer()
+        flatbuffer.encode(
+            generated.Monster(scores=np.array([1.0, 2.0], dtype=np.float64))
+        )
 
     non_native = np.dtype(np.float32).newbyteorder("S")
     with pytest.raises(TypeError, match="native Float32 data"):
-        generated.Monster(
-            scores=np.array([1.0, 2.0], dtype=non_native)
-        ).to_flatbuffer()
+        flatbuffer.encode(
+            generated.Monster(scores=np.array([1.0, 2.0], dtype=non_native))
+        )
 
 
-def test_native_builder_samples_variable_size_vectors(tmp_path: Path) -> None:
+def test_native_builder_bounds_size_estimation_and_honors_initial_size(
+    tmp_path: Path,
+) -> None:
     module_path = generate(FIXTURE, tmp_path / "generated")
     source = module_path.read_text(encoding="utf-8")
     assert "import flatbuffers" not in source
@@ -580,15 +806,21 @@ def test_native_builder_samples_variable_size_vectors(tmp_path: Path) -> None:
     tags = ["t" * (1_000 + index) for index in range(100)]
     model = generated.Monster(weapons=weapons, tags=tags)
 
-    buffer = model.to_flatbuffer(initial_size=16)
+    estimated_buffer = flatbuffer.encode(model)
+    undersized_buffer = flatbuffer.encode(model, initial_size=16)
+    estimated_allocation = cast(Any, estimated_buffer.obj)._allocation_size
+    grown_allocation = cast(Any, undersized_buffer.obj)._allocation_size
 
-    assert buffer.obj._allocation_size > 250_000
-    assert buffer.obj._allocation_size * 100 <= len(buffer) * 102
-    assert generated.MonsterView.from_buffer(buffer).to_model() == model
+    assert estimated_allocation >= len(estimated_buffer)
+    assert estimated_allocation * 100 <= len(estimated_buffer) * 108
+    assert grown_allocation > 250_000
+    assert grown_allocation & (grown_allocation - 1) == 0
+    assert grown_allocation < len(undersized_buffer) * 2
+    assert flatbuffer.decode(undersized_buffer, type=generated.MonsterView).to_model() == model
 
 
 @pytest.mark.parametrize("field", ["from_flatbuffer", "to_flatbuffer"])
-def test_model_method_name_collisions_are_rejected(
+def test_former_model_method_names_are_regular_schema_fields(
     tmp_path: Path,
     field: str,
 ) -> None:
@@ -598,8 +830,13 @@ def test_model_method_name_collisions_are_rejected(
         f"table Root {{ {field}:int; }} root_type Root;",
     )
 
-    with pytest.raises(GenerationError, match="generated model method"):
-        generate(source, tmp_path / "generated", project_root=tmp_path)
+    module_path = generate(source, tmp_path / "generated", project_root=tmp_path)
+    generated = _load_module(f"test_generated_{field}", module_path)
+    model = generated.Root(**{field: 42})
+
+    restored = flatbuffer.decode(flatbuffer.encode(model), type=generated.Root)
+
+    assert getattr(restored, field) == 42
 
 
 def test_cli_generates_a_module(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -633,7 +870,26 @@ def test_multiple_namespaces_generate_separate_modules(tmp_path: Path) -> None:
         beta = importlib.import_module("multiple_beta.item")
         model = beta.Item(alpha=alpha.Item(value=42))
 
-        assert beta.Item.from_flatbuffer(model.to_flatbuffer()) == model
+        assert flatbuffer.decode(flatbuffer.encode(model), type=beta.Item) == model
+
+
+def test_enum_only_module_omits_model_runtime(tmp_path: Path) -> None:
+    source = tmp_path / "colors.fbs"
+    _write_schema(
+        source,
+        "namespace Example;",
+        "enum Color:byte { Red, Blue }",
+    )
+
+    module_path = generate(source, tmp_path / "generated", project_root=tmp_path)
+    generated_source = module_path.read_text(encoding="utf-8")
+    generated = _load_module("example.color", module_path)
+
+    assert "import msgspec" not in generated_source
+    assert "import numpy" not in generated_source
+    assert "_FB_NATIVE_MODULE" not in generated_source
+    assert "resolve_model_types" not in generated_source
+    assert generated.Color.Blue == 1
 
 
 def test_gen_onefile_flattens_unique_namespaces(tmp_path: Path) -> None:
@@ -658,7 +914,7 @@ def test_gen_onefile_flattens_unique_namespaces(tmp_path: Path) -> None:
     model = generated.Root(child=generated.Child(value=42))
 
     assert module_path == output / "one_file.py"
-    assert generated.Root.from_flatbuffer(model.to_flatbuffer()) == model
+    assert flatbuffer.decode(flatbuffer.encode(model), type=generated.Root) == model
 
 
 def test_gen_onefile_resolves_included_onefile_modules(tmp_path: Path) -> None:
@@ -691,7 +947,7 @@ def test_gen_onefile_resolves_included_onefile_modules(tmp_path: Path) -> None:
         model = root_module.Root(child=common_module.Child(value=42))
 
         assert root_path == output / "onefile_root.py"
-        assert root_module.Root.from_flatbuffer(model.to_flatbuffer()) == model
+        assert flatbuffer.decode(flatbuffer.encode(model), type=root_module.Root) == model
 
 
 def test_multiple_namespace_modules_can_reference_each_other(
@@ -714,7 +970,7 @@ def test_multiple_namespace_modules_can_reference_each_other(
         cycle_b = importlib.import_module("namespace_cycle_b.b")
         model = cycle_b.B(a=cycle_a.A())
 
-        assert cycle_b.B.from_flatbuffer(model.to_flatbuffer()) == model
+        assert flatbuffer.decode(flatbuffer.encode(model), type=cycle_b.B) == model
 
 
 def test_gen_onefile_rejects_namespace_name_collisions(tmp_path: Path) -> None:
@@ -782,10 +1038,10 @@ def test_runtime_support_names_can_be_schema_names(tmp_path: Path) -> None:
     generated = _load_module("support_name_generated", path)
 
     model = generated.TableView()
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    assert generated.TableView.from_flatbuffer(buffer) == model
-    assert generated.TableViewView.from_buffer(buffer).to_model() == model
+    assert flatbuffer.decode(buffer, type=generated.TableView) == model
+    assert flatbuffer.decode(buffer, type=generated.TableViewView).to_model() == model
 
 
 def test_generation_rejects_offset64_before_rendering() -> None:

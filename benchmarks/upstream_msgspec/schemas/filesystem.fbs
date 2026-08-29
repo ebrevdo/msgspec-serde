@@ -1,0 +1,27 @@
+table File {
+  name:string (required);
+  created_by:string (required);
+  created_at:string (required);
+  int_values:[int32] (required);
+  float_values:[float64] (required);
+  updated_by:string;
+  updated_at:string;
+  nbytes:ulong;
+  permissions:string (required);
+}
+
+union Entry { File, Directory }
+
+table Directory {
+  name:string (required);
+  created_by:string (required);
+  created_at:string (required);
+  int_values:[int32] (required);
+  float_values:[float64] (required);
+  updated_by:string;
+  updated_at:string;
+  contents:[Entry] (required);
+}
+
+root_type Directory;
+file_identifier "FSBM";

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from functools import cache
+from types import UnionType
+from typing import Any, TypeGuard, Union, get_args, get_origin
 
 import msgspec
-from msgspec.inspect import ListType, StructType, Type, UnionType, type_info
 
 from ._native import NativeModelTypes, NativePlan
 
@@ -31,7 +32,9 @@ def validate_model_subclass(
             f"{getattr(replacement, '__qualname__', replacement)!s} must subclass "
             f"{generated.__qualname__}"
         )
-    if set(replacement.__struct_fields__) != set(generated.__struct_fields__):
+    generated_fields = {field.name for field in msgspec.structs.fields(generated)}
+    replacement_fields = {field.name for field in msgspec.structs.fields(replacement)}
+    if replacement_fields != generated_fields:
         raise TypeError(
             f"{replacement.__qualname__} changes the serialized msgspec fields of "
             f"{generated.__qualname__}; use ClassVar or dict=True for "
@@ -46,26 +49,25 @@ class _ModelResolver:
         self.bindings: list[_Binding] = []
         self._visited: set[tuple[type[msgspec.Struct], type[msgspec.Struct]]] = set()
 
-    def collect(self, generated: Type, requested: Type) -> None:
-        if not isinstance(generated, StructType) or not isinstance(
-            requested, StructType
-        ):
-            raise TypeError("FlatBuffer model targets must be msgspec Struct types")
-
-        generated_type = generated.cls
-        requested_type = requested.cls
-        pair = (generated_type, requested_type)
+    def collect(
+        self,
+        generated: type[msgspec.Struct],
+        requested: type[msgspec.Struct],
+    ) -> None:
+        pair = (generated, requested)
         if pair in self._visited:
             return
-        validate_model_subclass(generated_type, requested_type)
+        validate_model_subclass(generated, requested)
         self._visited.add(pair)
 
-        requested_fields = {field.name: field for field in requested.fields}
-        for generated_field in generated.fields:
+        requested_fields = {
+            field.name: field for field in msgspec.structs.fields(requested)
+        }
+        for generated_field in msgspec.structs.fields(generated):
             requested_field = requested_fields[generated_field.name]
             self._collect_field(
-                generated_type,
-                requested_type,
+                generated,
+                requested,
                 generated_field.name,
                 generated_field.type,
                 requested_field.type,
@@ -76,80 +78,141 @@ class _ModelResolver:
         generated_parent: type[msgspec.Struct],
         requested_parent: type[msgspec.Struct],
         field_name: str,
-        generated: Type,
-        requested: Type,
+        generated_annotation: Any,
+        requested_annotation: Any,
     ) -> None:
-        if isinstance(generated, StructType):
-            if not isinstance(requested, StructType):
-                raise TypeError(
-                    f"{requested_parent.__qualname__}.{field_name} must select a "
-                    f"subclass of {generated.cls.__qualname__}"
-                )
-            if requested.cls is not generated.cls:
-                self.bindings.append(
-                    (
-                        generated_parent,
-                        requested_parent,
-                        field_name,
-                        generated.cls,
-                        requested.cls,
-                    )
-                )
-            self.collect(generated, requested)
-            return
-
-        if isinstance(generated, ListType):
-            if not isinstance(requested, ListType):
-                _reject_model_shape_change(generated, requested_parent, field_name)
-                return
-            self._collect_field(
+        if _is_struct_type(generated_annotation):
+            self._collect_struct(
                 generated_parent,
                 requested_parent,
                 field_name,
-                generated.item_type,
-                requested.item_type,
+                generated_annotation,
+                requested_annotation,
             )
             return
 
-        if not isinstance(generated, UnionType):
+        if get_origin(generated_annotation) in (list, dict):
+            self._collect_container_value(
+                generated_parent,
+                requested_parent,
+                field_name,
+                generated_annotation,
+                requested_annotation,
+            )
             return
 
-        if not isinstance(requested, UnionType):
-            _reject_model_shape_change(generated, requested_parent, field_name)
+        if _is_union(generated_annotation):
+            self._collect_union(
+                generated_parent,
+                requested_parent,
+                field_name,
+                generated_annotation,
+                requested_annotation,
+            )
+
+    def _collect_struct(
+        self,
+        generated_parent: type[msgspec.Struct],
+        requested_parent: type[msgspec.Struct],
+        field_name: str,
+        generated: type[msgspec.Struct],
+        requested: Any,
+    ) -> None:
+        if not _is_struct_type(requested):
+            raise TypeError(
+                f"{requested_parent.__qualname__}.{field_name} must select a "
+                f"subclass of {generated.__qualname__}"
+            )
+        if requested is not generated:
+            self.bindings.append(
+                (
+                    generated_parent,
+                    requested_parent,
+                    field_name,
+                    generated,
+                    requested,
+                )
+            )
+        self.collect(generated, requested)
+
+    def _collect_container_value(
+        self,
+        generated_parent: type[msgspec.Struct],
+        requested_parent: type[msgspec.Struct],
+        field_name: str,
+        generated_annotation: Any,
+        requested_annotation: Any,
+    ) -> None:
+        origin = get_origin(generated_annotation)
+        generated_args = get_args(generated_annotation)
+        requested_args = get_args(requested_annotation)
+        if get_origin(requested_annotation) is not origin or len(requested_args) != len(
+            generated_args
+        ):
+            _reject_model_shape_change(
+                generated_annotation,
+                requested_parent,
+                field_name,
+            )
+            return
+        if origin is dict:
+            if requested_args[0] != generated_args[0]:
+                raise TypeError(
+                    f"{requested_parent.__qualname__}.{field_name} has an "
+                    "incompatible model-mapping key annotation"
+                )
+            generated_value = generated_args[1]
+            requested_value = requested_args[1]
+        else:
+            generated_value = generated_args[0]
+            requested_value = requested_args[0]
+        self._collect_field(
+            generated_parent,
+            requested_parent,
+            field_name,
+            generated_value,
+            requested_value,
+        )
+
+    def _collect_union(
+        self,
+        generated_parent: type[msgspec.Struct],
+        requested_parent: type[msgspec.Struct],
+        field_name: str,
+        generated_annotation: Any,
+        requested_annotation: Any,
+    ) -> None:
+        if not _is_union(requested_annotation):
+            _reject_model_shape_change(
+                generated_annotation,
+                requested_parent,
+                field_name,
+            )
             return
 
+        requested_args = get_args(requested_annotation)
         requested_structs = tuple(
-            item for item in requested.types if isinstance(item, StructType)
+            item for item in requested_args if _is_struct_type(item)
         )
-        requested_lists = tuple(
-            item for item in requested.types if isinstance(item, ListType)
-        )
-        for generated_item in generated.types:
-            if isinstance(generated_item, ListType):
-                if len(requested_lists) != 1:
-                    raise TypeError(
-                        f"{requested_parent.__qualname__}.{field_name} has an "
-                        "incompatible model-vector annotation"
-                    )
-                self._collect_field(
+        for generated_item in get_args(generated_annotation):
+            if get_origin(generated_item) in (list, dict):
+                self._collect_union_container(
                     generated_parent,
                     requested_parent,
                     field_name,
                     generated_item,
-                    requested_lists[0],
+                    requested_args,
                 )
                 continue
-            if not isinstance(generated_item, StructType):
+            if not _is_struct_type(generated_item):
                 continue
             matches = [
-                item
-                for item in requested_structs
-                if issubclass(item.cls, generated_item.cls)
+                item for item in requested_structs if issubclass(item, generated_item)
             ]
             if len(matches) != 1:
                 raise TypeError(
                     f"{requested_parent.__qualname__}.{field_name} must contain "
-                    f"exactly one subclass of {generated_item.cls.__qualname__}"
+                    f"exactly one subclass of {generated_item.__qualname__}"
                 )
             self._collect_field(
                 generated_parent,
@@ -158,6 +221,30 @@ class _ModelResolver:
                 generated_item,
                 matches[0],
             )
+
+    def _collect_union_container(
+        self,
+        generated_parent: type[msgspec.Struct],
+        requested_parent: type[msgspec.Struct],
+        field_name: str,
+        generated_annotation: Any,
+        requested_args: tuple[Any, ...],
+    ) -> None:
+        origin = get_origin(generated_annotation)
+        matches = tuple(item for item in requested_args if get_origin(item) is origin)
+        if len(matches) != 1:
+            kind = "vector" if origin is list else "mapping"
+            raise TypeError(
+                f"{requested_parent.__qualname__}.{field_name} has an "
+                f"incompatible model-{kind} annotation"
+            )
+        self._collect_field(
+            generated_parent,
+            requested_parent,
+            field_name,
+            generated_annotation,
+            matches[0],
+        )
 
 
 @cache
@@ -171,12 +258,12 @@ def resolve_model_types(
     if requested is generated:
         return None
     resolver = _ModelResolver()
-    resolver.collect(type_info(generated), type_info(requested))
+    resolver.collect(generated, requested)
     return plan.model_types(generated, requested, resolver.bindings)
 
 
 def _reject_model_shape_change(
-    generated: Type,
+    generated: Any,
     requested_parent: type[msgspec.Struct],
     field_name: str,
 ) -> None:
@@ -187,14 +274,18 @@ def _reject_model_shape_change(
         )
 
 
-def _contains_struct(value: Type) -> bool:
-    if isinstance(value, StructType):
+def _contains_struct(value: Any) -> bool:
+    if _is_struct_type(value):
         return True
-    if isinstance(value, ListType):
-        return _contains_struct(value.item_type)
-    if isinstance(value, UnionType):
-        return any(_contains_struct(item) for item in value.types)
-    return False
+    return any(_contains_struct(item) for item in get_args(value))
+
+
+def _is_struct_type(value: Any) -> TypeGuard[type[msgspec.Struct]]:
+    return isinstance(value, type) and issubclass(value, msgspec.Struct)
+
+
+def _is_union(value: Any) -> bool:
+    return get_origin(value) in (Union, UnionType)
 
 
 __all__ = ["resolve_model_types", "validate_model_subclass"]

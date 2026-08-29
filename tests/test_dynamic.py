@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import Barrier
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 import numpy as np
@@ -25,11 +25,12 @@ from msgspec_flatbuffers import (
     InvalidBufferError,
     TableView,
     compile_schema,
-    dec_hook,
     dynamic_types,
-    enc_hook,
+    flatbuffer,
     generate,
 )
+from msgspec_flatbuffers import json as generated_json
+from msgspec_flatbuffers import msgpack as generated_msgpack
 
 SCHEMAS = Path(__file__).parent / "fixtures" / "dynamic"
 PAYLOAD_SCHEMA = SCHEMAS / "payload.fbs"
@@ -96,53 +97,32 @@ def test_custom_dynamic_attributes_are_reflected() -> None:
     )
 
 
-def test_known_dynamic_value_round_trips_msgspec_formats(
+def test_known_dynamic_value_round_trips_native_codecs(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     payload, envelope = generated_modules
     model = _model(payload, envelope)
     assert envelope.Envelope.__annotations__["payload"] == "EnvelopePayload | None"
     assert "EnvelopePayload" in envelope.__all__
-    assert "payload_type" not in envelope.Envelope.__annotations__
     assert payload.Metric.__struct_config__.tag is None
-    assert envelope.Envelope.__struct_config__.tag is None
 
-    builtins = msgspec.to_builtins(model, enc_hook=enc_hook)
-    metric_value = {
-        "name": "latency",
-        "values": [1.25, 2.5],
-    }
-    assert msgspec.to_builtins(model.payload.value, enc_hook=enc_hook) == metric_value
-    assert builtins["payload"] == {
-        "__msgspec_flatbuffers_type__": METRIC_TAG,
-        "value": metric_value,
-    }
-    assert msgspec.convert(
-        builtins,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    ) == model
+    for codec in (generated_json, generated_msgpack):
+        restored = codec.decode(codec.encode(model), type=envelope.Envelope)
+        assert restored == model
+        restored_payload = restored.payload
+        assert restored_payload is not None
+        restored_value = restored_payload.value
+        assert restored_value is not None
+        assert restored_value.values.dtype == np.dtype(np.float32)
 
-    encoded = msgspec.json.encode(model, enc_hook=enc_hook)
-    decoded = msgspec.json.decode(
-        encoded,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    )
-    assert decoded == model
-    assert type(decoded.payload) is envelope.EnvelopePayload
-    assert isinstance(decoded.payload.value, payload.Metric)
-
-    flatbuffer = decoded.to_flatbuffer()
-    assert envelope.EnvelopeView.from_buffer(flatbuffer).to_model() == decoded
-
+    builtins = msgspec.json.decode(generated_json.encode(model))
+    assert builtins["payload"]["__msgspec_flatbuffers_type__"] == METRIC_TAG
     disallowed = copy.deepcopy(builtins)
     disallowed["payload"]["__msgspec_flatbuffers_type__"] = "Other.Metric"
     with pytest.raises(msgspec.ValidationError, match="outside"):
-        msgspec.convert(
-            disallowed,
+        generated_json.decode(
+            msgspec.json.encode(disallowed),
             type=envelope.Envelope,
-            dec_hook=dec_hook,
         )
 
 
@@ -198,12 +178,12 @@ class InvalidMetric(Metric):
             )
         )
     )
-    flatbuffer = model.to_flatbuffer()
-    decoded = envelope.Envelope.from_flatbuffer(
-        flatbuffer,
+    wire = flatbuffer.Encoder().encode(model)
+    decoded = flatbuffer.Decoder(
+        envelope.Envelope,
         dynamic_overrides=overrides,
-    )
-    from_view = envelope.EnvelopeView.from_buffer(flatbuffer).to_model(
+    ).decode(wire)
+    from_view = flatbuffer.decode(wire, type=envelope.EnvelopeView).to_model(
         dynamic_overrides=overrides,
     )
     for restored in (decoded, from_view):
@@ -211,29 +191,26 @@ class InvalidMetric(Metric):
         assert type(restored.payload.value) is validated_metric
         assert restored.payload.value.was_validated
 
-    payload_view = envelope.EnvelopeView.from_buffer(flatbuffer).payload
+    payload_view = flatbuffer.decode(wire, type=envelope.EnvelopeView).payload
     assert payload_view is not None
     payload_model = payload_view.to_model(dynamic_overrides=overrides)
     assert type(payload_model.value) is validated_metric
 
-    encoded = msgspec.json.encode(model, enc_hook=enc_hook)
+    encoded = generated_json.encode(model)
     assert b"was_validated" not in encoded
-    json_decoded = msgspec.json.decode(
-        encoded,
-        type=envelope.Envelope,
-        dec_hook=overrides.dec_hook,
-    )
-    assert json_decoded.payload is not None
-    assert type(json_decoded.payload.value) is validated_metric
-    assert json_decoded.payload.value.was_validated
-
-    default_decoded = msgspec.json.decode(
-        encoded,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    )
+    default_decoded = generated_json.decode(encoded, type=envelope.Envelope)
     assert default_decoded.payload is not None
     assert type(default_decoded.payload.value) is payload.Metric
+
+    for codec in (generated_json, generated_msgpack):
+        native_decoded = codec.decode(
+            codec.encode(model),
+            type=envelope.Envelope,
+            dec_hook=overrides.dec_hook,
+        )
+        assert native_decoded.payload is not None
+        assert type(native_decoded.payload.value) is validated_metric
+        assert native_decoded.payload.value.was_validated
 
     with pytest.raises(TypeError, match="serialized msgspec fields"):
         DynamicModelOverrides({payload.Metric: invalid_metric})
@@ -251,9 +228,9 @@ def test_known_dynamic_value_round_trips_flatbuffer(
 ) -> None:
     payload, envelope = generated_modules
     model = _model(payload, envelope)
-    buffer = model.to_flatbuffer()
-    view = envelope.EnvelopeView.from_buffer(buffer)
-    native_model = envelope.Envelope.from_flatbuffer(buffer)
+    buffer = flatbuffer.encode(model)
+    view = flatbuffer.decode(buffer, type=envelope.EnvelopeView)
+    native_model = flatbuffer.decode(buffer, type=envelope.Envelope)
     assert native_model == model
     assert type(native_model.payload) is envelope.EnvelopePayload
     raw = view.payload_raw
@@ -283,11 +260,12 @@ def test_large_dynamic_payload_uses_exact_native_sizing(
     )
     model = envelope.Envelope(payload=envelope.EnvelopePayload(metric))
 
-    buffer = model.to_flatbuffer()
+    buffer = flatbuffer.encode(model)
 
-    assert buffer.obj._allocation_size >= len(buffer)
-    assert buffer.obj._allocation_size * 100 <= len(buffer) * 102
-    assert envelope.EnvelopeView.from_buffer(buffer).to_model() == model
+    allocation_size = cast(Any, buffer.obj)._allocation_size
+    assert allocation_size >= len(buffer)
+    assert allocation_size * 100 <= len(buffer) * 102
+    assert flatbuffer.decode(buffer, type=envelope.EnvelopeView).to_model() == model
 
 
 def test_dynamic_field_rejects_invalid_model_values(
@@ -297,26 +275,28 @@ def test_dynamic_field_rejects_invalid_model_values(
     model = _model(payload, envelope)
 
     with pytest.raises(TypeError, match="DynamicValue"):
-        envelope.Envelope(payload=model.payload.value).to_flatbuffer()
+        flatbuffer.encode(envelope.Envelope(payload=model.payload.value))
 
     with pytest.raises(ValueError, match="outside"):
-        envelope.Envelope(
-            payload=envelope.EnvelopePayload.opaque("Other.Metric", b"data")
-        ).to_flatbuffer()
+        flatbuffer.encode(
+            envelope.Envelope(
+                payload=envelope.EnvelopePayload.opaque("Other.Metric", b"data")
+            )
+        )
 
 
 def test_dynamic_view_rejects_invalid_nested_flatbuffer(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     payload, envelope = generated_modules
-    buffer = _model(payload, envelope).to_flatbuffer()
+    buffer = flatbuffer.encode(_model(payload, envelope))
     invalid_payload = bytearray(buffer)
-    probe = envelope.EnvelopeView.from_buffer(invalid_payload)
+    probe = flatbuffer.decode(invalid_payload, type=envelope.EnvelopeView)
     payload_info = probe._vector_info(6, 1)
     assert payload_info is not None
     payload_start, _ = payload_info
     invalid_payload[payload_start + 4 : payload_start + 8] = b"NOPE"
-    invalid_view = envelope.EnvelopeView.from_buffer(invalid_payload)
+    invalid_view = flatbuffer.decode(invalid_payload, type=envelope.EnvelopeView)
     invalid_dynamic = invalid_view.payload
     assert invalid_dynamic is not None
     with pytest.raises(InvalidBufferError, match="file identifier"):
@@ -324,29 +304,32 @@ def test_dynamic_view_rejects_invalid_nested_flatbuffer(
     with pytest.raises(InvalidBufferError, match="file identifier"):
         invalid_view.to_model()
     with pytest.raises(InvalidBufferError, match="file identifier"):
-        envelope.Envelope.from_flatbuffer(invalid_payload)
+        flatbuffer.decode(invalid_payload, type=envelope.Envelope)
 
 
 def test_dynamic_view_rejects_disallowed_wire_tag(
     generated_modules: tuple[ModuleType, ModuleType],
 ) -> None:
     payload, envelope = generated_modules
-    buffer = _model(payload, envelope).to_flatbuffer()
+    buffer = flatbuffer.encode(_model(payload, envelope))
     disallowed_tag = bytearray(buffer)
-    probe = envelope.EnvelopeView.from_buffer(disallowed_tag)
+    probe = flatbuffer.decode(disallowed_tag, type=envelope.EnvelopeView)
     type_position = probe._field_position(4, 4)
     assert type_position is not None
-    type_start = type_position + struct.unpack_from(
-        "<I",
-        disallowed_tag,
-        type_position,
-    )[0]
+    type_start = (
+        type_position
+        + struct.unpack_from(
+            "<I",
+            disallowed_tag,
+            type_position,
+        )[0]
+    )
     assert struct.unpack_from("<I", disallowed_tag, type_start)[0] == len(METRIC_TAG)
     disallowed_tag[type_start + 4 : type_start + 4 + len(METRIC_TAG)] = (
         b"Outside.Dynamic.Metric"
     )
     with pytest.raises(ValueError, match="outside"):
-        _ = envelope.EnvelopeView.from_buffer(disallowed_tag).payload
+        _ = flatbuffer.decode(disallowed_tag, type=envelope.EnvelopeView).payload
 
 
 def test_unknown_allowed_dynamic_value_is_preserved(
@@ -359,32 +342,24 @@ def test_unknown_allowed_dynamic_value_is_preserved(
     )
     model = envelope.Envelope(payload=opaque, note="forward")
 
-    builtins = msgspec.to_builtins(model, enc_hook=enc_hook)
+    encoded = generated_json.encode(model)
+    builtins = msgspec.json.decode(encoded)
     assert builtins["payload"] == {
         "__msgspec_flatbuffers_type__": "Example.Dynamic.Future",
         "__msgspec_flatbuffers_data__": "dW5rbm93biBwYXlsb2Fk",
     }
-    assert msgspec.convert(
-        builtins,
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    ) == model
-    assert msgspec.json.decode(
-        msgspec.json.encode(model, enc_hook=enc_hook),
-        type=envelope.Envelope,
-        dec_hook=dec_hook,
-    ) == model
+    assert generated_json.decode(encoded, type=envelope.Envelope) == model
 
     unexpected = copy.deepcopy(builtins)
     unexpected["payload"]["extra"] = True
     with pytest.raises(msgspec.ValidationError, match="unexpected fields"):
-        msgspec.convert(
-            unexpected,
+        generated_json.decode(
+            msgspec.json.encode(unexpected),
             type=envelope.Envelope,
-            dec_hook=dec_hook,
         )
 
-    view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
+    wire = flatbuffer.encode(model)
+    view = flatbuffer.decode(wire, type=envelope.EnvelopeView)
     dynamic = view.payload
     assert dynamic is not None
     assert dynamic.tag == "Example.Dynamic.Future"
@@ -392,7 +367,7 @@ def test_unknown_allowed_dynamic_value_is_preserved(
     assert dynamic.value is None
     assert bytes(dynamic.data) == b"unknown payload"
     assert view.to_model() == model
-    assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+    assert flatbuffer.decode(wire, type=envelope.Envelope) == model
 
 
 def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> None:
@@ -444,7 +419,8 @@ def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> No
         )
         model = envelope.Envelope(payload=envelope.EnvelopePayload(payload))
 
-        view = envelope.EnvelopeView.from_buffer(model.to_flatbuffer())
+        wire = flatbuffer.encode(model)
+        view = flatbuffer.decode(wire, type=envelope.EnvelopeView)
         dynamic = view.payload
         assert dynamic is not None
         nested = dynamic.value
@@ -452,7 +428,7 @@ def test_dynamic_payload_supports_scalar_and_vector_unions(tmp_path: Path) -> No
         assert nested.favorite.name == "Miso"
         assert [resident.name for resident in nested.residents] == ["Tess", "Luna"]
         assert view.to_model() == model
-        assert envelope.Envelope.from_flatbuffer(model.to_flatbuffer()) == model
+        assert flatbuffer.decode(wire, type=envelope.Envelope) == model
     _clear_generated_modules("perf")
 
 
@@ -469,10 +445,10 @@ def test_dynamic_field_rejects_inconsistent_wire_values(
     message: str,
 ) -> None:
     payload, envelope = generated_modules
-    buffer = bytearray(_model(payload, envelope).to_flatbuffer())
-    probe = envelope.EnvelopeView.from_buffer(buffer)
+    buffer = bytearray(flatbuffer.encode(_model(payload, envelope)))
+    probe = flatbuffer.decode(buffer, type=envelope.EnvelopeView)
     struct.pack_into("<H", buffer, probe._vtable_offset + vtable_entry_offset, 0)
-    inconsistent = envelope.EnvelopeView.from_buffer(buffer)
+    inconsistent = flatbuffer.decode(buffer, type=envelope.EnvelopeView)
     with pytest.raises(InvalidBufferError, match=message):
         _ = inconsistent.payload
 
@@ -480,9 +456,6 @@ def test_dynamic_field_rejects_inconsistent_wire_values(
 def test_dynamic_registry_supports_concurrent_registration() -> None:
     class Model(msgspec.Struct):
         value: int
-
-        def to_flatbuffer(self) -> bytes:
-            return b"buffer"
 
     class View(TableView):
         def to_model(self) -> Model:
@@ -532,9 +505,6 @@ def test_dynamic_registry_invalidates_cached_subclass_resolution() -> None:
     class Model(msgspec.Struct):
         value: int
 
-        def to_flatbuffer(self) -> bytes:
-            return b"buffer"
-
     class Child(Model):
         pass
 
@@ -554,8 +524,7 @@ def test_lazy_dynamic_module_imports_outside_registry_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Model(msgspec.Struct):
-        def to_flatbuffer(self) -> bytes:
-            return b"buffer"
+        pass
 
     class View(TableView):
         def to_model(self) -> Model:

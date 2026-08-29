@@ -219,6 +219,7 @@ __marimo__/
 
 # Project-specific Python tooling and local files
 examples/tutorial/generated/
+benchmark-results/
 .ty/
 .idea/
 .vscode/

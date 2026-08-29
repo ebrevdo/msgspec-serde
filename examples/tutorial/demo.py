@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-import msgspec
 import numpy as np
 
 # These modules are created by the tutorial's generation command.
@@ -39,7 +38,7 @@ from tutorial.pet_list import (  # ty: ignore[unresolved-import]
     PetListView,
 )
 
-from msgspec_flatbuffers import DynamicModelOverrides, dec_hook, enc_hook
+from msgspec_flatbuffers import DynamicModelOverrides, flatbuffer, json, msgpack
 
 
 class ValidatedWeapon(Weapon, dict=True):
@@ -68,7 +67,7 @@ class ValidatedMetric(Metric, dict=True):
 dynamic_overrides = DynamicModelOverrides({Metric: ValidatedMetric})
 
 
-def main() -> None:
+def _monster_round_trip() -> tuple[Monster, str, str, bytes]:
     monster = Monster(
         pos=Vec3(x=1.0, y=2.0, z=3.0),
         name="Orc",
@@ -79,8 +78,8 @@ def main() -> None:
         tags=["boss", "cave"],
         optional_energy=80,
     )
-    buffer = monster.to_flatbuffer()
-    view = MonsterView.from_buffer(buffer)
+    buffer = flatbuffer.encode(monster)
+    view = flatbuffer.decode(buffer, type=MonsterView)
     position = view.pos
     weapons = view.weapons
 
@@ -98,43 +97,54 @@ def main() -> None:
     assert restored.scores is not None
     assert restored.scores.flags.owndata
     assert restored.scores.flags.writeable
-    assert Monster.from_flatbuffer(buffer) == monster
+    assert flatbuffer.decode(buffer, type=Monster) == monster
 
-    validated = ValidatedMonster.from_flatbuffer(buffer)
+    validated = flatbuffer.decode(buffer, type=ValidatedMonster)
     validated_from_view = view.to_model(ValidatedMonster)
     assert validated.was_validated
     assert validated.weapons is not None
     assert isinstance(validated.weapons[0], ValidatedWeapon)
     assert validated_from_view.was_validated
 
-    encoded = msgspec.json.encode(monster, enc_hook=enc_hook)
-    decoded = msgspec.json.decode(encoded, type=Monster, dec_hook=dec_hook)
+    encoded = json.encode(monster)
+    decoded = json.decode(encoded, type=Monster)
     assert decoded == monster
+    packed = msgpack.encode(monster)
+    assert msgpack.decode(packed, type=Monster) == monster
 
+    return monster, view.name, weapons[0].name, encoded
+
+
+def _union_and_nested_round_trip() -> tuple[str, str]:
     pets = PetList(
         favorite=Cat(name="Miso"),
         residents=[Cat(name="Miso"), Dog(name="Pip")],
     )
-    pets_view = PetListView.from_buffer(pets.to_flatbuffer())
+    pets_view = flatbuffer.decode(flatbuffer.encode(pets), type=PetListView)
     assert pets_view.favorite_type is Pet.Cat
     assert isinstance(pets_view.favorite, CatView)
 
     nested = NestedEnvelope(snapshot=pets, note="nightly snapshot")
-    nested_view = NestedEnvelopeView.from_buffer(nested.to_flatbuffer())
+    nested_view = flatbuffer.decode(flatbuffer.encode(nested), type=NestedEnvelopeView)
     snapshot = nested_view.snapshot
     snapshot_raw = nested_view.snapshot_raw
     assert snapshot is not None
     assert snapshot.favorite_type is Pet.Cat
     assert snapshot_raw is not None
     assert snapshot_raw.readonly
+    assert nested_view.note is not None
 
+    return pets_view.favorite_type.name, nested_view.note
+
+
+def _dynamic_round_trip() -> tuple[Metric, str]:
     metric = Metric(
         name="latency",
         values=np.array([1.25, 2.5], dtype=np.float32),
     )
     dynamic = DynamicEnvelope(payload=DynamicEnvelopePayload(metric))
-    dynamic_buffer = dynamic.to_flatbuffer()
-    dynamic_view = DynamicEnvelopeView.from_buffer(dynamic_buffer)
+    dynamic_buffer = flatbuffer.encode(dynamic)
+    dynamic_view = flatbuffer.decode(dynamic_buffer, type=DynamicEnvelopeView)
     dynamic_payload = dynamic_view.payload
     dynamic_raw = dynamic_view.payload_raw
     assert dynamic_payload is not None
@@ -143,16 +153,17 @@ def main() -> None:
     assert dynamic_view.payload_type_raw == "Tutorial.Metric"
     assert dynamic_raw is not None
     assert dynamic_raw.readonly
-    assert DynamicEnvelope.from_flatbuffer(dynamic_buffer) == dynamic
+    assert flatbuffer.decode(dynamic_buffer, type=DynamicEnvelope) == dynamic
 
-    validated_dynamic = DynamicEnvelope.from_flatbuffer(
+    validated_dynamic = flatbuffer.decode(
         dynamic_buffer,
+        type=DynamicEnvelope,
         dynamic_overrides=dynamic_overrides,
     )
     assert validated_dynamic.payload is not None
     assert isinstance(validated_dynamic.payload.value, ValidatedMetric)
-    dynamic_json = msgspec.json.encode(dynamic, enc_hook=enc_hook)
-    validated_json = msgspec.json.decode(
+    dynamic_json = json.encode(dynamic)
+    validated_json = json.decode(
         dynamic_json,
         type=DynamicEnvelope,
         dec_hook=dynamic_overrides.dec_hook,
@@ -160,11 +171,17 @@ def main() -> None:
     assert validated_json.payload is not None
     assert isinstance(validated_json.payload.value, ValidatedMetric)
 
-    metric_bytes = bytes(metric.to_flatbuffer())
+    return metric, dynamic_payload.tag
+
+
+def _nested_payload_round_trip(metric: Metric) -> None:
+    metric_bytes = bytes(flatbuffer.encode(metric))
     extension_list = ExtensionList(
         extensions=[Extension(type_id=0xA813, data=metric_bytes)]
     )
-    extension_list_view = ExtensionListView.from_buffer(extension_list.to_flatbuffer())
+    extension_list_view = flatbuffer.decode(
+        flatbuffer.encode(extension_list), type=ExtensionListView
+    )
     extensions = extension_list_view.extensions
     assert extensions is not None
     metric_view = extensions[0].data_as(MetricView)
@@ -172,12 +189,19 @@ def main() -> None:
     assert metric_view.name == "latency"
     assert extensions[0].data_as(MetricView) is metric_view
 
-    framed = monster.to_flatbuffer(size_prefixed=True)
-    assert Monster.from_flatbuffer(framed, size_prefixed=True) == monster
 
-    print(view.name, weapons[0].name)
-    print(pets_view.favorite_type.name, nested_view.note)
-    print(dynamic_payload.tag)
+def main() -> None:
+    monster, monster_name, weapon_name, encoded = _monster_round_trip()
+    pet_name, nested_note = _union_and_nested_round_trip()
+    metric, dynamic_tag = _dynamic_round_trip()
+    _nested_payload_round_trip(metric)
+
+    framed = flatbuffer.encode(monster, size_prefixed=True)
+    assert flatbuffer.decode(framed, type=Monster, size_prefixed=True) == monster
+
+    print(monster_name, weapon_name)
+    print(pet_name, nested_note)
+    print(dynamic_tag)
     print(encoded.decode())
 
 

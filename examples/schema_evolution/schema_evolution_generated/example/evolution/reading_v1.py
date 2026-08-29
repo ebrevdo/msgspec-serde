@@ -3,29 +3,30 @@
 from __future__ import annotations
 
 import struct
-from typing import Self, overload
+from typing import overload
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 
-from msgspec_flatbuffers import (
+from msgspec_flatbuffers import _check_generated_code_version
+
+__msgspec_flatbuffers_generated_version__ = '0.1.0'
+_check_generated_code_version(__msgspec_flatbuffers_generated_version__)
+
+from msgspec_flatbuffers import (  # noqa: E402
     DynamicModelOverrides,
     InvalidBufferError,
-    OpenIntEnum,
-    StringVector,
-    StructVector,
-    StructView,
-    TableVector,
-    TableView,
+    TableView as _FbTableView,
 )
-from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types
-from msgspec_flatbuffers._native import NativePlan as _NativePlan
+from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types  # noqa: E402
+from msgspec_flatbuffers._native import NativePlan as _NativePlan  # noqa: E402
+from msgspec_flatbuffers._flatbuffer import register_type as _register_flatbuffer_type  # noqa: E402
 
 _UINT16 = struct.Struct('<H')
 _UINT64 = struct.Struct('<Q')
 
-_FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x01\xa7objects\x91\x85\xa4name\xb9Example.Evolution.Reading\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x93\x88\xa4name\xa2id\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\x00\xa4kind\xa6scalar\xa6scalar\xa6uint64\x87\xa4name\xa5label\xa4slot\x01\xa6offset\x06\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string\x88\xa4name\xa7samples\xa4slot\x02\xa6offset\x08\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa7float32')
+_FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x02\xa7objects\x91\x88\xa4name\xb9Example.Evolution.Reading\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x93\x88\xa4name\xa2id\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\x00\xa4kind\xa6scalar\xa6scalar\xa6uint64\x87\xa4name\xa5label\xa4slot\x01\xa6offset\x06\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string\x88\xa4name\xa7samples\xa4slot\x02\xa6offset\x08\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa7float32\xacserde_fields\x93\x82\xa9attr_name\xa2id\xabencode_name\xa2id\x82\xa9attr_name\xa5label\xabencode_name\xa5label\x82\xa9attr_name\xa7samples\xabencode_name\xa7samples\xafserde_tag_field\xc0\xa9serde_tag\xc0')
 
 
 class Reading(msgspec.Struct, kw_only=True, eq=False):
@@ -45,60 +46,8 @@ class Reading(msgspec.Struct, kw_only=True, eq=False):
     def __ne__(self, other: object) -> bool:
         return not self == other
 
-    @classmethod
-    def from_flatbuffer(
-        cls,
-        buffer: bytes | bytearray | memoryview,
-        *,
-        offset: int = 0,
-        size_prefixed: bool = False,
-        check_identifier: bool = True,
-        dynamic_overrides: DynamicModelOverrides | None = None,
-    ) -> Self:
-        if cls is Reading and dynamic_overrides is None:
-            return _FB_NATIVE_MODULE.unpack(
-                'Example.Evolution.Reading',
-                buffer,
-                identifier='EVOL',
-                offset=offset,
-                size_prefixed=size_prefixed,
-                check_identifier=check_identifier,
-            )
-        model_types = None if cls is Reading else _resolve_model_types(
-            _FB_NATIVE_MODULE, Reading, cls
-        )
-        return _FB_NATIVE_MODULE.unpack(
-            'Example.Evolution.Reading',
-            buffer,
-            identifier='EVOL',
-            offset=offset,
-            size_prefixed=size_prefixed,
-            check_identifier=check_identifier,
-            model_types=model_types,
-            dynamic_overrides=dynamic_overrides,
-        )
 
-    def to_flatbuffer(
-        self,
-        *,
-        size_prefixed: bool = False,
-        initial_size: int = 0,
-    ) -> memoryview:
-        return _FB_NATIVE_MODULE.pack(
-            'Example.Evolution.Reading',
-            self,
-            identifier='EVOL',
-            size_prefixed=size_prefixed,
-            initial_size=initial_size,
-        )
-
-
-_FB_NATIVE_MODULE.bind_types({
-    'Example.Evolution.Reading': Reading,
-})
-
-
-class ReadingView(TableView):
+class ReadingView(_FbTableView):
     __slots__ = ('_fb_cached_label', '_fb_cached_samples')
     __flatbuffer_identifier__ = b'EVOL'
 
@@ -173,19 +122,12 @@ class ReadingView(TableView):
         )
 
 
-def build_reading(
-    value: Reading,
-    *,
-    size_prefixed: bool = False,
-    initial_size: int = 0,
-) -> memoryview:
-    return _FB_NATIVE_MODULE.pack(
-        'Example.Evolution.Reading',
-        value,
-        identifier='EVOL',
-        size_prefixed=size_prefixed,
-        initial_size=initial_size,
-    )
+_FB_NATIVE_MODULE.bind_types({
+    'Example.Evolution.Reading': Reading,
+})
 
 
-__all__ = ['Reading', 'ReadingView', 'build_reading']
+_register_flatbuffer_type(Reading, _FB_NATIVE_MODULE, 'Example.Evolution.Reading', 'EVOL')
+
+
+__all__ = ['Reading', 'ReadingView']

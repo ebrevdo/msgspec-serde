@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import struct
-from typing import Self, overload, Any, TypeVar
+from typing import Any, TypeVar, overload
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 
-from msgspec_flatbuffers import (
-    _check_generated_code_version,
+from msgspec_flatbuffers import _check_generated_code_version
+
+__msgspec_flatbuffers_generated_version__ = '0.1.0'
+_check_generated_code_version(__msgspec_flatbuffers_generated_version__)
+
+from msgspec_flatbuffers import (  # noqa: E402
     DynamicModelOverrides,
     InvalidBufferError,
     OpenIntEnum as _FbOpenIntEnum,
@@ -20,11 +24,10 @@ from msgspec_flatbuffers import (
     TableVector,
     TableView as _FbTableView,
 )
-from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types
-from msgspec_flatbuffers._native import NativePlan as _NativePlan
-
-__msgspec_flatbuffers_generated_version__ = '0.1.0'
-_check_generated_code_version(__msgspec_flatbuffers_generated_version__)
+from msgspec_flatbuffers._models import resolve_model_types as _resolve_model_types  # noqa: E402
+from msgspec_flatbuffers._native import NativePlan as _NativePlan  # noqa: E402
+from msgspec_flatbuffers._flatbuffer import decode as _decode_flatbuffer  # noqa: E402
+from msgspec_flatbuffers._flatbuffer import register_type as _register_flatbuffer_type  # noqa: E402
 
 _NestedViewT = TypeVar("_NestedViewT", bound=_FbTableView)
 
@@ -34,7 +37,7 @@ _INT32 = struct.Struct('<i')
 _INT8 = struct.Struct('<b')
 _UINT16 = struct.Struct('<H')
 
-_FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x01\xa7objects\x93\x85\xa4name\xb5Compatibility.Monster\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x9c\x88\xa4name\xa3pos\xa4slot\x00\xa6offset\x04\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6struct\xa6target\xb2Compatibility.Vec3\x88\xa4name\xa4mana\xa4slot\x01\xa6offset\x06\xa8optional\xc2\xa8required\xc2\xa7default\xcc\x96\xa4kind\xa6scalar\xa6scalar\xa5int16\x88\xa4name\xa2hp\xa4slot\x02\xa6offset\x08\xa8optional\xc2\xa8required\xc2\xa7defaultd\xa4kind\xa6scalar\xa6scalar\xa5int16\x87\xa4name\xa4name\xa4slot\x03\xa6offset\n\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6string\x87\xa4name\xa9inventory\xa4slot\x04\xa6offset\x0c\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xabvector_byte\x89\xa4name\xa5color\xa4slot\x05\xa6offset\x0e\xa8optional\xc2\xa8required\xc2\xa7default\x03\xa4kind\xa6scalar\xa6scalar\xa4int8\xa9enum_type\xb3Compatibility.Color\x88\xa4name\xa7weapons\xa4slot\x06\xa6offset\x10\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xacvector_table\xa6target\xb4Compatibility.Weapon\x88\xa4name\xa6scores\xa4slot\x07\xa6offset\x12\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa7float32\x87\xa4name\xa4tags\xa4slot\x08\xa6offset\x14\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_string\x88\xa4name\xa4path\xa4slot\t\xa6offset\x16\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_struct\xa6target\xb2Compatibility.Vec3\x88\xa4name\xafoptional_energy\xa4slot\n\xa6offset\x18\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xa6scalar\xa6scalar\xa5int32\x89\xa4name\xa6colors\xa4slot\x0b\xa6offset\x1a\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xa4kind\xadvector_scalar\xa6scalar\xa4int8\xa9enum_type\xb3Compatibility.Color\x85\xa4name\xb2Compatibility.Vec3\xa9is_struct\xc3\xa9byte_size\x0c\xadmin_alignment\x04\xa6fields\x93\x88\xa4name\xa1x\xa4slot\x00\xa6offset\x00\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xa4kind\xa6scalar\xa6scalar\xa7float32\x88\xa4name\xa1y\xa4slot\x01\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xa4kind\xa6scalar\xa6scalar\xa7float32\x88\xa4name\xa1z\xa4slot\x02\xa6offset\x08\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xa4kind\xa6scalar\xa6scalar\xa7float32\x85\xa4name\xb4Compatibility.Weapon\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x92\x87\xa4name\xa4name\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc3\xa7default\xc0\xa4kind\xa6string\x88\xa4name\xa6damage\xa4slot\x01\xa6offset\x06\xa8optional\xc2\xa8required\xc2\xa7default\x00\xa4kind\xa6scalar\xa6scalar\xa5int16')
+_FB_NATIVE_MODULE = _NativePlan(b'\x82\xa7version\x02\xa7objects\x93\x88\xa4name\xb5Compatibility.Monster\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x9c\x89\xa4name\xa3pos\xa4slot\x00\xa6offset\x04\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xa6struct\xa6target\xb2Compatibility.Vec3\x89\xa4name\xa4mana\xa4slot\x01\xa6offset\x06\xa8optional\xc2\xa8required\xc2\xa7default\xcc\x96\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa5int16\x89\xa4name\xa2hp\xa4slot\x02\xa6offset\x08\xa8optional\xc2\xa8required\xc2\xa7defaultd\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa5int16\x88\xa4name\xa4name\xa4slot\x03\xa6offset\n\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xa6string\x88\xa4name\xa9inventory\xa4slot\x04\xa6offset\x0c\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xabvector_byte\x8a\xa4name\xa5color\xa4slot\x05\xa6offset\x0e\xa8optional\xc2\xa8required\xc2\xa7default\x03\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa4int8\xa9enum_type\xb3Compatibility.Color\x89\xa4name\xa7weapons\xa4slot\x06\xa6offset\x10\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xacvector_table\xa6target\xb4Compatibility.Weapon\x89\xa4name\xa6scores\xa4slot\x07\xa6offset\x12\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xadvector_scalar\xa6scalar\xa7float32\x88\xa4name\xa4tags\xa4slot\x08\xa6offset\x14\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xadvector_string\x89\xa4name\xa4path\xa4slot\t\xa6offset\x16\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xadvector_struct\xa6target\xb2Compatibility.Vec3\x89\xa4name\xafoptional_energy\xa4slot\n\xa6offset\x18\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xa6scalar\xa6scalar\xa5int32\x8a\xa4name\xa6colors\xa4slot\x0b\xa6offset\x1a\xa8optional\xc3\xa8required\xc2\xa7default\xc0\xaeserde_nullable\xc3\xa4kind\xadvector_scalar\xa6scalar\xa4int8\xa9enum_type\xb3Compatibility.Color\xacserde_fields\x9c\x82\xa9attr_name\xa3pos\xabencode_name\xa3pos\x82\xa9attr_name\xa4mana\xabencode_name\xa4mana\x82\xa9attr_name\xa2hp\xabencode_name\xa2hp\x82\xa9attr_name\xa4name\xabencode_name\xa4name\x82\xa9attr_name\xa9inventory\xabencode_name\xa9inventory\x82\xa9attr_name\xa5color\xabencode_name\xa5color\x82\xa9attr_name\xa7weapons\xabencode_name\xa7weapons\x82\xa9attr_name\xa6scores\xabencode_name\xa6scores\x82\xa9attr_name\xa4tags\xabencode_name\xa4tags\x82\xa9attr_name\xa4path\xabencode_name\xa4path\x82\xa9attr_name\xafoptional_energy\xabencode_name\xafoptional_energy\x82\xa9attr_name\xa6colors\xabencode_name\xa6colors\xafserde_tag_field\xc0\xa9serde_tag\xc0\x88\xa4name\xb2Compatibility.Vec3\xa9is_struct\xc3\xa9byte_size\x0c\xadmin_alignment\x04\xa6fields\x93\x89\xa4name\xa1x\xa4slot\x00\xa6offset\x00\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa7float32\x89\xa4name\xa1y\xa4slot\x01\xa6offset\x04\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa7float32\x89\xa4name\xa1z\xa4slot\x02\xa6offset\x08\xa8optional\xc2\xa8required\xc2\xa7default\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa7float32\xacserde_fields\x93\x82\xa9attr_name\xa1x\xabencode_name\xa1x\x82\xa9attr_name\xa1y\xabencode_name\xa1y\x82\xa9attr_name\xa1z\xabencode_name\xa1z\xafserde_tag_field\xc0\xa9serde_tag\xc0\x88\xa4name\xb4Compatibility.Weapon\xa9is_struct\xc2\xa9byte_size\x00\xadmin_alignment\x01\xa6fields\x92\x88\xa4name\xa4name\xa4slot\x00\xa6offset\x04\xa8optional\xc2\xa8required\xc3\xa7default\xc0\xaeserde_nullable\xc2\xa4kind\xa6string\x89\xa4name\xa6damage\xa4slot\x01\xa6offset\x06\xa8optional\xc2\xa8required\xc2\xa7default\x00\xaeserde_nullable\xc2\xa4kind\xa6scalar\xa6scalar\xa5int16\xacserde_fields\x92\x82\xa9attr_name\xa4name\xabencode_name\xa4name\x82\xa9attr_name\xa6damage\xabencode_name\xa6damage\xafserde_tag_field\xc0\xa9serde_tag\xc0')
 
 
 class Color(_FbOpenIntEnum):
@@ -78,53 +81,6 @@ class Monster(msgspec.Struct, kw_only=True, eq=False):
     def __ne__(self, other: object) -> bool:
         return not self == other
 
-    @classmethod
-    def from_flatbuffer(
-        cls,
-        buffer: bytes | bytearray | memoryview,
-        *,
-        offset: int = 0,
-        size_prefixed: bool = False,
-        check_identifier: bool = True,
-        dynamic_overrides: DynamicModelOverrides | None = None,
-    ) -> Self:
-        if cls is Monster and dynamic_overrides is None:
-            return _FB_NATIVE_MODULE.unpack(
-                'Compatibility.Monster',
-                buffer,
-                identifier='COMP',
-                offset=offset,
-                size_prefixed=size_prefixed,
-                check_identifier=check_identifier,
-            )
-        model_types = None if cls is Monster else _resolve_model_types(
-            _FB_NATIVE_MODULE, Monster, cls
-        )
-        return _FB_NATIVE_MODULE.unpack(
-            'Compatibility.Monster',
-            buffer,
-            identifier='COMP',
-            offset=offset,
-            size_prefixed=size_prefixed,
-            check_identifier=check_identifier,
-            model_types=model_types,
-            dynamic_overrides=dynamic_overrides,
-        )
-
-    def to_flatbuffer(
-        self,
-        *,
-        size_prefixed: bool = False,
-        initial_size: int = 0,
-    ) -> memoryview:
-        return _FB_NATIVE_MODULE.pack(
-            'Compatibility.Monster',
-            self,
-            identifier='COMP',
-            size_prefixed=size_prefixed,
-            initial_size=initial_size,
-        )
-
 
 class Vec3(msgspec.Struct, kw_only=True):
     x: float
@@ -135,53 +91,6 @@ class Vec3(msgspec.Struct, kw_only=True):
 class Weapon(msgspec.Struct, kw_only=True):
     name: str
     damage: int = 0
-
-    @classmethod
-    def from_flatbuffer(
-        cls,
-        buffer: bytes | bytearray | memoryview,
-        *,
-        offset: int = 0,
-        size_prefixed: bool = False,
-        check_identifier: bool = True,
-        dynamic_overrides: DynamicModelOverrides | None = None,
-    ) -> Self:
-        if cls is Weapon and dynamic_overrides is None:
-            return _FB_NATIVE_MODULE.unpack(
-                'Compatibility.Weapon',
-                buffer,
-                identifier=None,
-                offset=offset,
-                size_prefixed=size_prefixed,
-                check_identifier=check_identifier,
-            )
-        model_types = None if cls is Weapon else _resolve_model_types(
-            _FB_NATIVE_MODULE, Weapon, cls
-        )
-        return _FB_NATIVE_MODULE.unpack(
-            'Compatibility.Weapon',
-            buffer,
-            identifier=None,
-            offset=offset,
-            size_prefixed=size_prefixed,
-            check_identifier=check_identifier,
-            model_types=model_types,
-            dynamic_overrides=dynamic_overrides,
-        )
-
-    def to_flatbuffer(
-        self,
-        *,
-        size_prefixed: bool = False,
-        initial_size: int = 0,
-    ) -> memoryview:
-        return _FB_NATIVE_MODULE.pack(
-            'Compatibility.Weapon',
-            self,
-            identifier=None,
-            size_prefixed=size_prefixed,
-            initial_size=initial_size,
-        )
 
 
 class MonsterView(_FbTableView):
@@ -326,7 +235,7 @@ class MonsterView(_FbTableView):
         if payload is None:
             return None
         try:
-            cache: dict[tuple[type[TableView], bool], Any] = (
+            cache: dict[tuple[type[_FbTableView], bool], Any] = (
                 self._cache['_fb_nested_views:inventory']
             )
         except KeyError:
@@ -336,8 +245,8 @@ class MonsterView(_FbTableView):
         try:
             return cache[key]
         except KeyError:
-            value = view_type.from_buffer(
-                payload,
+            value = _decode_flatbuffer(
+                payload, type=view_type,
                 size_prefixed=size_prefixed,
             )
             cache[key] = value
@@ -515,19 +424,10 @@ _FB_NATIVE_MODULE.bind_types({
 })
 
 
-def build_monster(
-    value: Monster,
-    *,
-    size_prefixed: bool = False,
-    initial_size: int = 0,
-) -> memoryview:
-    return _FB_NATIVE_MODULE.pack(
-        'Compatibility.Monster',
-        value,
-        identifier='COMP',
-        size_prefixed=size_prefixed,
-        initial_size=initial_size,
-    )
+_register_flatbuffer_type(Monster, _FB_NATIVE_MODULE, 'Compatibility.Monster', 'COMP')
 
 
-__all__ = ['Color', 'Monster', 'MonsterView', 'Vec3', 'Vec3View', 'Weapon', 'WeaponView', 'build_monster']
+_register_flatbuffer_type(Weapon, _FB_NATIVE_MODULE, 'Compatibility.Weapon', None)
+
+
+__all__ = ['Color', 'Monster', 'MonsterView', 'Vec3', 'Vec3View', 'Weapon', 'WeaponView']

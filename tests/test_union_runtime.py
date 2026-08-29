@@ -13,6 +13,7 @@ from msgspec_flatbuffers import (
     TableView,
     UnionDispatch,
     UnionVector,
+    flatbuffer,
 )
 
 _INT32 = struct.Struct("<i")
@@ -91,7 +92,7 @@ def _build_union_vector(
 
 
 def _union_vector(buffer: bytes | bytearray) -> UnionVector[ChildView]:
-    holder = HolderView.from_buffer(buffer)
+    holder = flatbuffer.decode(buffer, type=HolderView)
     types = holder._read_numpy_vector(4, "<i4")
     values = holder._vector_info(6, _UINT32.size)
     assert types is not None and values is not None
@@ -107,11 +108,11 @@ def _union_vector(buffer: bytes | bytearray) -> UnionVector[ChildView]:
 
 
 def test_scalar_union_reads_known_table_and_none() -> None:
-    populated = HolderView.from_buffer(
-        _build_scalar_union(tag=555, include_payload=True)
+    populated = flatbuffer.decode(
+        _build_scalar_union(tag=555, include_payload=True), type=HolderView
     )
-    empty = HolderView.from_buffer(
-        _build_scalar_union(tag=0, include_payload=False)
+    empty = flatbuffer.decode(
+        _build_scalar_union(tag=0, include_payload=False), type=HolderView
     )
 
     value = populated._read_union(6, 555, _DISPATCH)
@@ -134,8 +135,9 @@ def test_scalar_union_rejects_inconsistent_or_unknown_values(
     include_payload: bool,
     message: str,
 ) -> None:
-    view = HolderView.from_buffer(
-        _build_scalar_union(tag=tag, include_payload=include_payload)
+    view = flatbuffer.decode(
+        _build_scalar_union(tag=tag, include_payload=include_payload),
+        type=HolderView,
     )
 
     with pytest.raises(InvalidBufferError, match=message):
@@ -144,13 +146,13 @@ def test_scalar_union_rejects_inconsistent_or_unknown_values(
 
 def test_scalar_union_rejects_an_out_of_bounds_target() -> None:
     buffer = bytearray(_build_scalar_union(tag=555, include_payload=True))
-    view = HolderView.from_buffer(buffer)
+    view = flatbuffer.decode(buffer, type=HolderView)
     position = view._field_position(6, _UINT32.size)
     assert position is not None
     _UINT32.pack_into(buffer, position, 2**32 - 1)
 
     with pytest.raises(BufferBoundsError, match="union field target"):
-        HolderView.from_buffer(buffer)._read_union(6, 555, _DISPATCH)
+        flatbuffer.decode(buffer, type=HolderView)._read_union(6, 555, _DISPATCH)
 
 
 def test_union_vector_caches_checked_table_views_with_wide_tags() -> None:

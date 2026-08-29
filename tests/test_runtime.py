@@ -6,7 +6,7 @@ from threading import Barrier
 
 import pytest
 
-from msgspec_flatbuffers import BufferBoundsError, CachedVector, TableView
+from msgspec_flatbuffers import BufferBoundsError, CachedVector, TableView, flatbuffer
 
 
 class ExampleView(TableView):
@@ -63,10 +63,10 @@ def _size_prefixed(payload: bytes | bytearray) -> bytes:
     return struct.pack("<I", len(payload)) + payload
 
 
-def test_from_buffer_keeps_a_read_only_view_of_the_original_buffer() -> None:
+def test_decode_keeps_a_read_only_view_of_the_original_buffer() -> None:
     buffer = _minimal_table_buffer()
 
-    view = ExampleView.from_buffer(buffer)
+    view = flatbuffer.decode(buffer, type=ExampleView)
 
     assert view.table_offset == 8
     assert view.buffer.readonly
@@ -79,8 +79,9 @@ def test_size_prefixed_root_is_bounded_to_its_declared_payload() -> None:
     trailing = b"trailing frame"
     framed = bytearray(leading + _size_prefixed(payload) + trailing)
 
-    view = ExampleView.from_buffer(
+    view = flatbuffer.decode(
         framed,
+        type=ExampleView,
         offset=len(leading),
         size_prefixed=True,
     )
@@ -99,15 +100,15 @@ def test_size_prefixed_root_rejects_a_payload_too_small_for_its_root(
     struct.pack_into("<I", payload, 0, 8)
     framed = bytearray(struct.pack("<I", declared_size) + payload)
 
-    with pytest.raises(BufferBoundsError):
-        ExampleView.from_buffer(framed, size_prefixed=True)
+    with pytest.raises(BufferBoundsError, match="exceeds a .*byte buffer"):
+        flatbuffer.decode(framed, type=ExampleView, size_prefixed=True)
 
 
 def test_size_prefixed_root_rejects_a_declared_payload_past_the_input() -> None:
     framed = struct.pack("<I", 12) + bytes(11)
 
     with pytest.raises(BufferBoundsError, match="size-prefixed buffer"):
-        ExampleView.from_buffer(framed, size_prefixed=True)
+        flatbuffer.decode(framed, type=ExampleView, size_prefixed=True)
 
 
 def test_concatenated_size_prefixed_roots_keep_separate_buffers() -> None:
@@ -115,9 +116,10 @@ def test_concatenated_size_prefixed_roots_keep_separate_buffers() -> None:
     frame = _size_prefixed(payload)
     combined = bytearray(frame + frame)
 
-    first = ExampleView.from_buffer(combined, size_prefixed=True)
-    second = ExampleView.from_buffer(
+    first = flatbuffer.decode(combined, type=ExampleView, size_prefixed=True)
+    second = flatbuffer.decode(
         combined,
+        type=ExampleView,
         offset=len(frame),
         size_prefixed=True,
     )
@@ -136,8 +138,9 @@ def test_size_prefixed_root_cannot_use_a_vtable_before_its_payload() -> None:
     framed = leading_vtable + _size_prefixed(payload)
 
     with pytest.raises(BufferBoundsError, match="vtable header"):
-        ExampleView.from_buffer(
+        flatbuffer.decode(
             framed,
+            type=ExampleView,
             offset=len(leading_vtable),
             size_prefixed=True,
         )
@@ -153,7 +156,7 @@ def test_size_prefixed_field_cannot_use_trailing_string_bytes() -> None:
     declared_size = 20
     framed = struct.pack("<I", declared_size) + payload
 
-    view = StringExampleView.from_buffer(framed, size_prefixed=True)
+    view = flatbuffer.decode(framed, type=StringExampleView, size_prefixed=True)
 
     with pytest.raises(BufferBoundsError, match="string length"):
         _ = view.name
@@ -167,12 +170,12 @@ def test_size_prefixed_field_cannot_use_trailing_string_bytes() -> None:
         (b"\x00\x00\x00\x00", -1),
     ],
 )
-def test_from_buffer_rejects_out_of_bounds_offsets(
+def test_decode_rejects_out_of_bounds_offsets(
     buffer: bytes,
     offset: int,
 ) -> None:
-    with pytest.raises(BufferBoundsError):
-        ExampleView.from_buffer(buffer, offset=offset)
+    with pytest.raises(BufferBoundsError, match="exceeds a .*byte buffer"):
+        flatbuffer.decode(buffer, type=ExampleView, offset=offset)
 
 
 def test_view_rejects_noncontiguous_input() -> None:

@@ -1,14 +1,17 @@
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_int, c_void};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use bytemuck::{Pod, Zeroable, cast_slice};
+use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use flatbuffers::{
     FLATBUFFERS_MAX_BUFFER_SIZE, FlatBufferBuilder, Push, PushAlignment, TableFinishedWIPOffset,
     UnionWIPOffset, VOffsetT, WIPOffset,
 };
+use numpy::PyArrayMethods;
 use pyo3::IntoPyObjectExt;
 use pyo3::buffer::{Element, PyBuffer, PyUntypedBuffer};
 use pyo3::exceptions::{
@@ -18,9 +21,15 @@ use pyo3::exceptions::{
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyBytes, PyDict, PyList, PyMemoryView, PyModule, PyString, PyTuple, PyType};
+use pyo3::types::{
+    PyBytes, PyDict, PyInt, PyList, PyMemoryView, PyModule, PyString, PyTuple, PyType,
+};
 use rmpv::Value;
-use serde::Deserialize;
+use serde::de::{
+    DeserializeSeed, Error as DeserializeError, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
+use serde::ser::{Error as SerdeError, SerializeMap, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Deserialize)]
 struct ModuleWire {
@@ -33,10 +42,28 @@ struct ObjectWire {
     name: String,
     #[serde(skip)]
     index: usize,
+    #[serde(skip)]
+    key_field_index: Option<usize>,
     is_struct: bool,
     byte_size: usize,
     min_alignment: usize,
     fields: Vec<FieldWire>,
+    serde_fields: Vec<SerdeFieldWire>,
+    serde_tag_field: Option<String>,
+    serde_tag: Option<String>,
+}
+
+impl ObjectWire {
+    fn key_field(&self) -> Option<&FieldWire> {
+        self.key_field_index
+            .and_then(|index| self.fields.get(index))
+    }
+}
+
+#[derive(Deserialize)]
+struct SerdeFieldWire {
+    attr_name: String,
+    encode_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -57,6 +84,9 @@ enum FieldKind {
     UnionVector,
     ArrayScalar,
     ArrayStruct,
+    Uuid,
+    Decimal,
+    Fallback,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -102,6 +132,16 @@ struct FieldWire {
     optional: bool,
     required: bool,
     #[serde(default)]
+    serde_nullable: bool,
+    #[serde(default)]
+    serde_element_nullable: bool,
+    #[serde(default)]
+    serde_python_int: bool,
+    #[serde(default)]
+    serde_omit_default: bool,
+    #[serde(default)]
+    key: bool,
+    #[serde(default)]
     target: Option<String>,
     #[serde(skip)]
     target_index: Option<usize>,
@@ -121,6 +161,71 @@ struct FieldWire {
     fixed_length: usize,
     #[serde(default)]
     element_size: usize,
+    #[serde(default)]
+    fallback_id: Option<String>,
+}
+
+enum TableKey {
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float32(f32),
+    Float64(f64),
+    String(String),
+}
+
+impl TableKey {
+    fn extract(field: &FieldWire, value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        match field.kind {
+            FieldKind::String => Ok(Self::String(value.extract()?)),
+            FieldKind::Scalar => match field
+                .scalar
+                .ok_or_else(|| PyValueError::new_err("key field has no scalar type"))?
+            {
+                ScalarKind::Bool => Ok(Self::Bool(value.extract()?)),
+                ScalarKind::Int8 | ScalarKind::Int16 | ScalarKind::Int32 | ScalarKind::Int64 => {
+                    Ok(Self::Signed(value.extract()?))
+                }
+                ScalarKind::Uint8
+                | ScalarKind::Uint16
+                | ScalarKind::Uint32
+                | ScalarKind::Uint64 => Ok(Self::Unsigned(value.extract()?)),
+                ScalarKind::Float32 => {
+                    let value = value.extract::<f32>()?;
+                    if value.is_nan() {
+                        return Err(PyValueError::new_err("table keys cannot be NaN"));
+                    }
+                    Ok(Self::Float32(value))
+                }
+                ScalarKind::Float64 => {
+                    let value = value.extract::<f64>()?;
+                    if value.is_nan() {
+                        return Err(PyValueError::new_err("table keys cannot be NaN"));
+                    }
+                    Ok(Self::Float64(value))
+                }
+            },
+            _ => Err(PyValueError::new_err(
+                "table key fields must be scalar or string fields",
+            )),
+        }
+    }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
+            (Self::Signed(left), Self::Signed(right)) => left.cmp(right),
+            (Self::Unsigned(left), Self::Unsigned(right)) => left.cmp(right),
+            (Self::Float32(left), Self::Float32(right)) => {
+                left.partial_cmp(right).expect("NaN keys rejected")
+            }
+            (Self::Float64(left), Self::Float64(right)) => {
+                left.partial_cmp(right).expect("NaN keys rejected")
+            }
+            (Self::String(left), Self::String(right)) => left.cmp(right),
+            _ => unreachable!("one FlatBuffers map has one key type"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -142,7 +247,7 @@ impl Push for NullableOffset {
         let value = self
             .0
             .map_or(0, |offset| (4 + written_len - offset as usize) as u32);
-        unsafe { value.push(dst, written_len) };
+        dst[..size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -171,6 +276,20 @@ enum PreparedValue<'py> {
 struct BoundTypes {
     by_pointer: HashMap<usize, usize>,
     by_name: HashMap<String, Py<PyType>>,
+    serde_objects: Vec<Option<SerdeObject>>,
+    serde_supported: bool,
+}
+
+struct SerdeObject {
+    fields: Vec<SerdeField>,
+    keyword_names: Py<PyTuple>,
+    tag: Option<(String, String)>,
+}
+
+struct SerdeField {
+    object_field_index: usize,
+    attr_name: Py<PyString>,
+    encode_name: String,
 }
 
 struct BoundModelSubclass {
@@ -309,6 +428,9 @@ impl NativeBuffer {
         let bytes = &data.data[data.start..];
         let (data_ptr, length) = (bytes.as_ptr(), bytes.len());
         drop(data);
+        // SAFETY: PyO3 provides a valid writable Py_buffer pointer. `slf` is
+        // transferred to `view.obj`, keeping the immutable Vec allocation alive
+        // until CPython releases the exported buffer.
         unsafe {
             (*view).obj = slf.into_any().into_ptr();
             (*view).buf = data_ptr.cast_mut().cast::<c_void>();
@@ -403,30 +525,121 @@ fn vtable_offset(slot: u16) -> VOffsetT {
     4 + slot * 2
 }
 
+const SIZE_ESTIMATE_WORK_LIMIT: usize = 6;
+const SIZE_ESTIMATE_SAMPLE_LIMIT: usize = 6;
+const SIZE_ESTIMATE_SEQUENCE_WORK_LIMIT: usize = 4;
+const DEFAULT_STRING_SIZE_ESTIMATE: usize = 32;
+const DEFAULT_TABLE_SIZE_ESTIMATE: usize = 64;
+
+struct SizeEstimateBudget {
+    remaining: usize,
+}
+
+impl SizeEstimateBudget {
+    fn new() -> Self {
+        Self {
+            remaining: SIZE_ESTIMATE_WORK_LIMIT,
+        }
+    }
+
+    fn consume(&mut self, work: usize) -> bool {
+        if work > self.remaining {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= work;
+        true
+    }
+
+    fn take_samples(&mut self, length: usize, work_per_sample: usize) -> usize {
+        let samples = self.available_samples(length, work_per_sample);
+        self.remaining -= samples * work_per_sample.max(1);
+        samples
+    }
+
+    fn available_samples(&self, length: usize, work_per_sample: usize) -> usize {
+        let work_per_sample = work_per_sample.max(1);
+        let desired = length.min(SIZE_ESTIMATE_SAMPLE_LIMIT);
+        let wanted = desired.min(SIZE_ESTIMATE_SEQUENCE_WORK_LIMIT / work_per_sample);
+        wanted.min(self.remaining / work_per_sample)
+    }
+}
+
+fn table_estimate_work(object: &ObjectWire) -> usize {
+    object.fields.len().max(1)
+}
+
+fn mix_sample_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn sample_seed(object: &ObjectWire, field: &FieldWire, length: usize) -> u64 {
+    mix_sample_seed(
+        (object.index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ ((field.slot as u64) << 32)
+            ^ length as u64,
+    )
+}
+
+fn stratified_sample_index(length: usize, count: usize, index: usize, seed: u64) -> usize {
+    if count == 1 {
+        return length / 2;
+    }
+    if index == 0 {
+        return 0;
+    }
+    if index + 1 == count {
+        return length - 1;
+    }
+    let strata = count - 2;
+    let width = length - 2;
+    let stratum = index - 1;
+    let start = 1 + stratum * width / strata;
+    let end = 1 + (stratum + 1) * width / strata;
+    start + mix_sample_seed(seed ^ index as u64) as usize % (end - start)
+}
+
 fn sampled_sequence_size(
     value: &Bound<'_, PyAny>,
+    length: usize,
+    sample_count: usize,
+    seed: u64,
+    default_item_size: usize,
     mut item_size: impl FnMut(Bound<'_, PyAny>) -> PyResult<usize>,
 ) -> PyResult<usize> {
-    let length = sequence_len(value)?;
     if length == 0 {
         return Ok(0);
     }
+    let sample_count = sample_count.min(length);
+    if sample_count == 0 {
+        return Ok(length.saturating_mul(default_item_size));
+    }
     let mut sampled = 0usize;
-    let sample_count = length.min(6);
-    if length <= 6 {
-        for index in 0..length {
-            sampled = sampled.saturating_add(item_size(sequence_item(value, index)?)?);
-        }
-    } else {
-        let middle = length / 2;
-        for index in [0, 1, middle - 1, middle, length - 2, length - 1] {
-            sampled = sampled.saturating_add(item_size(sequence_item(value, index)?)?);
-        }
+    for sample in 0..sample_count {
+        let index = if sample_count == length {
+            sample
+        } else {
+            stratified_sample_index(length, sample_count, sample, seed)
+        };
+        sampled = sampled.saturating_add(item_size(sequence_item(value, index)?)?);
     }
     Ok(sampled
         .saturating_mul(length)
         .saturating_add(sample_count - 1)
         / sample_count)
+}
+
+fn estimated_capacity(estimate: usize) -> usize {
+    let headroom = (estimate.saturating_add(99) / 100).max(1);
+    estimate.saturating_add(headroom)
+}
+
+fn offset_vector_size(length: usize) -> usize {
+    aligned_payload_size(length.saturating_mul(4).saturating_add(4), 4)
 }
 
 fn default_bool(value: &Value) -> PyResult<bool> {
@@ -1051,6 +1264,1847 @@ fn write_struct_scalar_array(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SerdeUuidFormat {
+    Canonical,
+    Hex,
+    Bytes,
+}
+
+#[derive(Clone, Copy)]
+struct SerdeEncodeContext<'a, 'py> {
+    plan: &'a NativePlan,
+    fallback_encoder: &'a Bound<'py, PyAny>,
+    sorted: bool,
+    decimal_as_number: bool,
+    uuid_format: SerdeUuidFormat,
+}
+
+struct SerdeModel<'a, 'py> {
+    context: SerdeEncodeContext<'a, 'py>,
+    model: Bound<'py, PyAny>,
+    object_index: usize,
+}
+
+struct SerdeFieldValue<'a, 'py> {
+    context: SerdeEncodeContext<'a, 'py>,
+    field: &'a FieldWire,
+    value: Bound<'py, PyAny>,
+}
+
+struct SerdeScalarValue<'a, 'py> {
+    value: &'a Bound<'py, PyAny>,
+    scalar: ScalarKind,
+}
+
+impl Serialize for SerdeScalarValue<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.scalar {
+            ScalarKind::Bool => {
+                serializer.serialize_bool(self.value.extract::<bool>().map_err(S::Error::custom)?)
+            }
+            ScalarKind::Float32 | ScalarKind::Float64 => {
+                serializer.serialize_f64(self.value.extract::<f64>().map_err(S::Error::custom)?)
+            }
+            ScalarKind::Uint8 | ScalarKind::Uint16 | ScalarKind::Uint32 | ScalarKind::Uint64 => {
+                serializer.serialize_u64(self.value.extract::<u64>().map_err(S::Error::custom)?)
+            }
+            ScalarKind::Int8 | ScalarKind::Int16 | ScalarKind::Int32 | ScalarKind::Int64 => {
+                serializer.serialize_i64(self.value.extract::<i64>().map_err(S::Error::custom)?)
+            }
+        }
+    }
+}
+
+fn serialize_numpy<T, S>(value: &Bound<'_, PyAny>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Copy + numpy::Element + Serialize,
+    S: Serializer,
+{
+    let array: numpy::PyReadonlyArray1<'_, T> = value.extract().map_err(|_| {
+        S::Error::custom("numeric vector fields must be one-dimensional with the declared dtype")
+    })?;
+    match array.as_slice() {
+        Ok(values) => values.serialize(serializer),
+        Err(_) => array
+            .as_array()
+            .iter()
+            .copied()
+            .collect::<Vec<T>>()
+            .serialize(serializer),
+    }
+}
+
+fn serialize_numpy_field<S>(
+    value: &Bound<'_, PyAny>,
+    scalar: ScalarKind,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.len().map_err(S::Error::custom)? == 0 {
+        return serializer.serialize_seq(Some(0))?.end();
+    }
+    match scalar {
+        ScalarKind::Bool => serialize_numpy::<bool, S>(value, serializer),
+        ScalarKind::Int8 => serialize_numpy::<i8, S>(value, serializer),
+        ScalarKind::Uint8 => serialize_numpy::<u8, S>(value, serializer),
+        ScalarKind::Int16 => serialize_numpy::<i16, S>(value, serializer),
+        ScalarKind::Uint16 => serialize_numpy::<u16, S>(value, serializer),
+        ScalarKind::Int32 => serialize_numpy::<i32, S>(value, serializer),
+        ScalarKind::Uint32 => serialize_numpy::<u32, S>(value, serializer),
+        ScalarKind::Int64 => serialize_numpy::<i64, S>(value, serializer),
+        ScalarKind::Uint64 => serialize_numpy::<u64, S>(value, serializer),
+        ScalarKind::Float32 => serialize_numpy::<f32, S>(value, serializer),
+        ScalarKind::Float64 => serialize_numpy::<f64, S>(value, serializer),
+    }
+}
+
+fn serialize_python_int<S>(value: &Bound<'_, PyAny>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Ok(value) = value.extract::<i64>() {
+        return serializer.serialize_i64(value);
+    }
+    if let Ok(value) = value.extract::<u64>() {
+        return serializer.serialize_u64(value);
+    }
+    let text = value.str().map_err(S::Error::custom)?;
+    let raw: sonic_rs::LazyValue<'_> =
+        sonic_rs::from_str(text.to_str().map_err(S::Error::custom)?).map_err(S::Error::custom)?;
+    raw.serialize(serializer)
+}
+
+fn uuid_text(value: &Bound<'_, PyAny>, format: SerdeUuidFormat) -> PyResult<String> {
+    match format {
+        SerdeUuidFormat::Canonical => Ok(value.str()?.to_str()?.to_owned()),
+        SerdeUuidFormat::Hex => value.getattr("hex")?.extract(),
+        SerdeUuidFormat::Bytes => Err(PyValueError::new_err(
+            "UUID bytes format is only valid for MessagePack",
+        )),
+    }
+}
+
+fn serialize_uuid<S>(
+    value: &Bound<'_, PyAny>,
+    format: SerdeUuidFormat,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&uuid_text(value, format).map_err(S::Error::custom)?)
+}
+
+fn serialize_decimal<S>(
+    value: &Bound<'_, PyAny>,
+    as_number: bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let text = value.str().map_err(S::Error::custom)?;
+    let text = text.to_str().map_err(S::Error::custom)?;
+    if !as_number {
+        return serializer.serialize_str(text);
+    }
+    let raw: sonic_rs::LazyValue<'_> = sonic_rs::from_str(text).map_err(S::Error::custom)?;
+    raw.serialize(serializer)
+}
+
+fn serde_field_is_default(field: &FieldWire, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !field.serde_omit_default {
+        return Ok(false);
+    }
+    match &field.default {
+        Value::Nil => Ok(value.is_none()),
+        Value::Boolean(default) => Ok(value.extract::<bool>()? == *default),
+        Value::Integer(default) => {
+            if let Some(default) = default.as_i64() {
+                Ok(value.extract::<i64>()? == default)
+            } else if let Some(default) = default.as_u64() {
+                Ok(value.extract::<u64>()? == default)
+            } else {
+                Err(PyTypeError::new_err("unsupported integer serde default"))
+            }
+        }
+        Value::F32(default) => Ok(value.extract::<f32>()? == *default),
+        Value::F64(default) => Ok(value.extract::<f64>()? == *default),
+        Value::String(default) => Ok(value.extract::<&str>()?
+            == default
+                .as_str()
+                .ok_or_else(|| PyTypeError::new_err("serde default is not valid UTF-8"))?),
+        Value::Binary(default) => Ok(value.extract::<Vec<u8>>()? == *default),
+        _ => Err(PyTypeError::new_err("unsupported native serde default")),
+    }
+}
+
+fn serialize_serde_field<M>(
+    map: &mut M,
+    context: SerdeEncodeContext<'_, '_>,
+    metadata_field: &SerdeField,
+    field: &FieldWire,
+    value: Bound<'_, PyAny>,
+) -> Result<(), M::Error>
+where
+    M: SerializeMap,
+{
+    map.serialize_entry(
+        &metadata_field.encode_name,
+        &SerdeFieldValue {
+            context,
+            field,
+            value,
+        },
+    )
+}
+
+impl Serialize for SerdeModel<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let metadata =
+            serde_object(self.context.plan, self.object_index).map_err(S::Error::custom)?;
+        let object = &self.context.plan.objects[self.object_index];
+        let mut fields = Vec::with_capacity(metadata.fields.len());
+        for metadata_field in &metadata.fields {
+            let field = &object.fields[metadata_field.object_field_index];
+            let value = self
+                .model
+                .getattr(metadata_field.attr_name.bind(self.model.py()))
+                .map_err(S::Error::custom)?;
+            if serde_field_is_default(field, &value).map_err(S::Error::custom)? {
+                continue;
+            }
+            fields.push((metadata_field, field, value));
+        }
+        let mut map =
+            serializer.serialize_map(Some(fields.len() + usize::from(metadata.tag.is_some())))?;
+        if !self.context.sorted {
+            if let Some((field, value)) = &metadata.tag {
+                map.serialize_entry(field, value)?;
+            }
+            for (metadata_field, field, value) in fields {
+                serialize_serde_field(&mut map, self.context, metadata_field, field, value)?;
+            }
+            return map.end();
+        }
+        fields.sort_by(|(left, _, _), (right, _, _)| left.encode_name.cmp(&right.encode_name));
+        let tag_index = metadata.tag.as_ref().map(|(tag_field, _)| {
+            fields.partition_point(|(field, _, _)| field.encode_name < *tag_field)
+        });
+        for index in 0..=fields.len() {
+            if tag_index == Some(index)
+                && let Some((field, value)) = &metadata.tag
+            {
+                map.serialize_entry(field, value)?;
+            }
+            let Some((metadata_field, field, value)) = fields.get(index) else {
+                continue;
+            };
+            serialize_serde_field(&mut map, self.context, metadata_field, field, value.clone())?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for SerdeFieldValue<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.value.is_none() {
+            return serializer.serialize_none();
+        }
+        match self.field.kind {
+            FieldKind::Scalar if self.field.serde_python_int => {
+                serialize_python_int(&self.value, serializer)
+            }
+            FieldKind::Scalar => SerdeScalarValue {
+                value: &self.value,
+                scalar: self
+                    .field
+                    .scalar
+                    .ok_or_else(|| S::Error::custom("scalar field has no scalar type"))?,
+            }
+            .serialize(serializer),
+            FieldKind::String => {
+                serializer.serialize_str(self.value.extract::<&str>().map_err(S::Error::custom)?)
+            }
+            FieldKind::Uuid => serialize_uuid(&self.value, self.context.uuid_format, serializer),
+            FieldKind::Decimal => {
+                serialize_decimal(&self.value, self.context.decimal_as_number, serializer)
+            }
+            FieldKind::Table | FieldKind::Struct | FieldKind::Nested | FieldKind::Union => {
+                let object_index = self
+                    .context
+                    .plan
+                    .model_object_index(&self.value)
+                    .map_err(S::Error::custom)?;
+                SerdeModel {
+                    context: self.context,
+                    model: self.value.clone(),
+                    object_index,
+                }
+                .serialize(serializer)
+            }
+            FieldKind::VectorByte | FieldKind::VectorScalar | FieldKind::ArrayScalar => {
+                let scalar = if self.field.kind == FieldKind::VectorByte {
+                    ScalarKind::Uint8
+                } else {
+                    self.field.scalar.ok_or_else(|| {
+                        S::Error::custom("numeric vector field has no scalar type")
+                    })?
+                };
+                if self.field.enum_type.is_some() {
+                    let values = self.value.cast::<PyList>().map_err(S::Error::custom)?;
+                    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                    for value in values {
+                        sequence.serialize_element(&SerdeScalarValue {
+                            value: &value,
+                            scalar,
+                        })?;
+                    }
+                    sequence.end()
+                } else {
+                    serialize_numpy_field(&self.value, scalar, serializer)
+                }
+            }
+            FieldKind::VectorString => {
+                let values = self.value.cast::<PyList>().map_err(S::Error::custom)?;
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence
+                        .serialize_element(value.extract::<&str>().map_err(S::Error::custom)?)?;
+                }
+                sequence.end()
+            }
+            FieldKind::VectorTable
+            | FieldKind::VectorStruct
+            | FieldKind::ArrayStruct
+            | FieldKind::UnionVector => {
+                let values = self.value.cast::<PyList>().map_err(S::Error::custom)?;
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    if value.is_none() {
+                        sequence.serialize_element(&Option::<u8>::None)?;
+                    } else {
+                        let object_index = self
+                            .context
+                            .plan
+                            .model_object_index(&value)
+                            .map_err(S::Error::custom)?;
+                        sequence.serialize_element(&SerdeModel {
+                            context: self.context,
+                            model: value,
+                            object_index,
+                        })?;
+                    }
+                }
+                sequence.end()
+            }
+            FieldKind::Dynamic => Err(S::Error::custom(
+                "dynamic fields require the msgspec serde fallback",
+            )),
+            FieldKind::Fallback => {
+                let encoded = self
+                    .context
+                    .fallback_encoder
+                    .call1((&self.value,))
+                    .map_err(S::Error::custom)?;
+                let encoded = encoded.cast::<PyBytes>().map_err(S::Error::custom)?;
+                let value: sonic_rs::LazyValue<'_> =
+                    sonic_rs::from_slice(encoded.as_bytes()).map_err(S::Error::custom)?;
+                value.serialize(serializer)
+            }
+        }
+    }
+}
+
+fn msgpack_error(error: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(format!("cannot encode MessagePack: {error}"))
+}
+
+fn with_numpy_slice<T>(
+    value: &Bound<'_, PyAny>,
+    operation: impl FnOnce(&[T]) -> PyResult<()>,
+) -> PyResult<()>
+where
+    T: Copy + numpy::Element,
+{
+    let array: numpy::PyReadonlyArray1<'_, T> = value.extract().map_err(|_| {
+        PyTypeError::new_err(
+            "numeric vector fields must be one-dimensional with the declared dtype",
+        )
+    })?;
+    match array.as_slice() {
+        Ok(values) => operation(values),
+        Err(_) => {
+            let values = array.as_array().iter().copied().collect::<Vec<T>>();
+            operation(&values)
+        }
+    }
+}
+
+fn write_messagepack_array(
+    value: &Bound<'_, PyAny>,
+    scalar: ScalarKind,
+    output: &mut Vec<u8>,
+) -> PyResult<()> {
+    macro_rules! write_values {
+        ($ty:ty, $write:expr) => {
+            with_numpy_slice::<$ty>(value, |values| {
+                rmp::encode::write_array_len(
+                    output,
+                    u32::try_from(values.len()).map_err(|_| {
+                        PyValueError::new_err("numeric vector is too large for MessagePack")
+                    })?,
+                )
+                .map_err(msgpack_error)?;
+                for &item in values {
+                    $write(output, item).map_err(msgpack_error)?;
+                }
+                Ok(())
+            })
+        };
+    }
+
+    match scalar {
+        ScalarKind::Bool => write_values!(bool, rmp::encode::write_bool),
+        ScalarKind::Int8 => write_values!(i8, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_sint(output, i64::from(value))
+        }),
+        ScalarKind::Uint8 => write_values!(u8, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_uint(output, u64::from(value))
+        }),
+        ScalarKind::Int16 => write_values!(i16, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_sint(output, i64::from(value))
+        }),
+        ScalarKind::Uint16 => write_values!(u16, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_uint(output, u64::from(value))
+        }),
+        ScalarKind::Int32 => write_values!(i32, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_sint(output, i64::from(value))
+        }),
+        ScalarKind::Uint32 => write_values!(u32, |output: &mut Vec<u8>, value| {
+            rmp::encode::write_uint(output, u64::from(value))
+        }),
+        ScalarKind::Int64 => write_values!(i64, rmp::encode::write_sint),
+        ScalarKind::Uint64 => write_values!(u64, rmp::encode::write_uint),
+        ScalarKind::Float32 => write_values!(f32, rmp::encode::write_f32),
+        ScalarKind::Float64 => write_values!(f64, rmp::encode::write_f64),
+    }
+}
+
+fn write_messagepack_model(
+    context: SerdeEncodeContext<'_, '_>,
+    model: &Bound<'_, PyAny>,
+    object_index: usize,
+    output: &mut Vec<u8>,
+) -> PyResult<()> {
+    let metadata = serde_object(context.plan, object_index)?;
+    let object = &context.plan.objects[object_index];
+    let mut fields = Vec::with_capacity(metadata.fields.len());
+    for metadata_field in &metadata.fields {
+        let field = &object.fields[metadata_field.object_field_index];
+        let value = model.getattr(metadata_field.attr_name.bind(model.py()))?;
+        if serde_field_is_default(field, &value)? {
+            continue;
+        }
+        fields.push((metadata_field, field, value));
+    }
+    let length = fields.len() + usize::from(metadata.tag.is_some());
+    rmp::encode::write_map_len(
+        output,
+        u32::try_from(length)
+            .map_err(|_| PyValueError::new_err("generated model has too many fields"))?,
+    )
+    .map_err(msgpack_error)?;
+    if !context.sorted {
+        if let Some((field, value)) = &metadata.tag {
+            rmp::encode::write_str(output, field).map_err(msgpack_error)?;
+            rmp::encode::write_str(output, value).map_err(msgpack_error)?;
+        }
+        for (metadata_field, field, value) in fields {
+            rmp::encode::write_str(output, &metadata_field.encode_name).map_err(msgpack_error)?;
+            write_messagepack_field(context, field, &value, output)?;
+        }
+        return Ok(());
+    }
+    fields.sort_by(|(left, _, _), (right, _, _)| left.encode_name.cmp(&right.encode_name));
+    let tag_index = metadata.tag.as_ref().map(|(tag_field, _)| {
+        fields.partition_point(|(field, _, _)| field.encode_name < *tag_field)
+    });
+    for index in 0..=fields.len() {
+        if tag_index == Some(index)
+            && let Some((field, value)) = &metadata.tag
+        {
+            rmp::encode::write_str(output, field).map_err(msgpack_error)?;
+            rmp::encode::write_str(output, value).map_err(msgpack_error)?;
+        }
+        let Some((metadata_field, field, value)) = fields.get(index) else {
+            continue;
+        };
+        rmp::encode::write_str(output, &metadata_field.encode_name).map_err(msgpack_error)?;
+        write_messagepack_field(context, field, value, output)?;
+    }
+    Ok(())
+}
+
+fn write_messagepack_scalar(
+    output: &mut Vec<u8>,
+    scalar: ScalarKind,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    match scalar {
+        ScalarKind::Bool => {
+            rmp::encode::write_bool(output, value.extract()?).map_err(msgpack_error)?
+        }
+        ScalarKind::Float32 | ScalarKind::Float64 => {
+            rmp::encode::write_f64(output, value.extract()?).map_err(msgpack_error)?
+        }
+        ScalarKind::Uint8 | ScalarKind::Uint16 | ScalarKind::Uint32 | ScalarKind::Uint64 => {
+            rmp::encode::write_uint(output, value.extract()?).map_err(msgpack_error)?;
+        }
+        ScalarKind::Int8 | ScalarKind::Int16 | ScalarKind::Int32 | ScalarKind::Int64 => {
+            rmp::encode::write_sint(output, value.extract()?).map_err(msgpack_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_messagepack_field(
+    context: SerdeEncodeContext<'_, '_>,
+    field: &FieldWire,
+    value: &Bound<'_, PyAny>,
+    output: &mut Vec<u8>,
+) -> PyResult<()> {
+    if value.is_none() {
+        rmp::encode::write_nil(output).map_err(msgpack_error)?;
+        return Ok(());
+    }
+    match field.kind {
+        FieldKind::Scalar if field.serde_python_int => {
+            if let Ok(value) = value.extract::<i64>() {
+                rmp::encode::write_sint(output, value).map_err(msgpack_error)?;
+            } else {
+                rmp::encode::write_uint(output, value.extract()?).map_err(msgpack_error)?;
+            }
+        }
+        FieldKind::Scalar => write_messagepack_scalar(
+            output,
+            field
+                .scalar
+                .ok_or_else(|| PyRuntimeError::new_err("scalar field has no scalar type"))?,
+            value,
+        )?,
+        FieldKind::String => {
+            rmp::encode::write_str(output, value.extract()?).map_err(msgpack_error)?;
+        }
+        FieldKind::Uuid => match context.uuid_format {
+            SerdeUuidFormat::Canonical | SerdeUuidFormat::Hex => {
+                rmp::encode::write_str(output, &uuid_text(value, context.uuid_format)?)
+                    .map_err(msgpack_error)?;
+            }
+            SerdeUuidFormat::Bytes => {
+                let bytes = value.getattr("bytes")?.cast_into::<PyBytes>()?;
+                rmp::encode::write_bin_len(
+                    output,
+                    u32::try_from(bytes.len()?).expect("UUID bytes fit in u32"),
+                )
+                .map_err(msgpack_error)?;
+                output.extend_from_slice(bytes.as_bytes());
+            }
+        },
+        FieldKind::Decimal => {
+            if context.decimal_as_number {
+                rmp::encode::write_f64(output, value.extract()?).map_err(msgpack_error)?;
+            } else {
+                rmp::encode::write_str(output, value.str()?.to_str()?).map_err(msgpack_error)?;
+            }
+        }
+        FieldKind::Table | FieldKind::Struct | FieldKind::Nested | FieldKind::Union => {
+            write_messagepack_model(
+                context,
+                value,
+                context.plan.model_object_index(value)?,
+                output,
+            )?;
+        }
+        FieldKind::VectorByte | FieldKind::VectorScalar | FieldKind::ArrayScalar => {
+            let scalar = if field.kind == FieldKind::VectorByte {
+                ScalarKind::Uint8
+            } else {
+                field.scalar.ok_or_else(|| {
+                    PyRuntimeError::new_err("numeric vector field has no scalar type")
+                })?
+            };
+            if field.enum_type.is_some() {
+                let values = value.cast::<PyList>()?;
+                rmp::encode::write_array_len(
+                    output,
+                    u32::try_from(values.len())
+                        .map_err(|_| PyValueError::new_err("enum vector is too large"))?,
+                )
+                .map_err(msgpack_error)?;
+                for item in values {
+                    write_messagepack_scalar(output, scalar, &item)?;
+                }
+            } else {
+                write_messagepack_array(value, scalar, output)?;
+            }
+        }
+        FieldKind::VectorString => {
+            let values = value.cast::<PyList>()?;
+            rmp::encode::write_array_len(
+                output,
+                u32::try_from(values.len())
+                    .map_err(|_| PyValueError::new_err("string vector is too large"))?,
+            )
+            .map_err(msgpack_error)?;
+            for item in values {
+                rmp::encode::write_str(output, item.extract()?).map_err(msgpack_error)?;
+            }
+        }
+        FieldKind::VectorTable
+        | FieldKind::VectorStruct
+        | FieldKind::ArrayStruct
+        | FieldKind::UnionVector => {
+            let values = value.cast::<PyList>()?;
+            rmp::encode::write_array_len(
+                output,
+                u32::try_from(values.len())
+                    .map_err(|_| PyValueError::new_err("object vector is too large"))?,
+            )
+            .map_err(msgpack_error)?;
+            for item in values {
+                if item.is_none() {
+                    rmp::encode::write_nil(output).map_err(msgpack_error)?;
+                } else {
+                    write_messagepack_model(
+                        context,
+                        &item,
+                        context.plan.model_object_index(&item)?,
+                        output,
+                    )?;
+                }
+            }
+        }
+        FieldKind::Dynamic => {
+            return Err(PyNotImplementedError::new_err(
+                "dynamic fields require the msgspec serde fallback",
+            ));
+        }
+        FieldKind::Fallback => {
+            let encoded = context.fallback_encoder.call1((value,))?;
+            output.extend_from_slice(encoded.cast::<PyBytes>()?.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SerdeModelChoice<'a> {
+    Known(usize),
+    Union(&'a [ArmWire]),
+}
+
+#[derive(Clone, Copy)]
+struct SerdeDecodeContext<'a, 'py> {
+    plan: &'a NativePlan,
+    py: Python<'py>,
+    is_json: bool,
+    strict: bool,
+    fallback_decoders: &'a Bound<'py, PyDict>,
+}
+
+#[derive(Clone, Copy)]
+struct SerdeModelSeed<'a, 'py> {
+    context: SerdeDecodeContext<'a, 'py>,
+    choice: SerdeModelChoice<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct SerdeFieldSeed<'a, 'py> {
+    context: SerdeDecodeContext<'a, 'py>,
+    field: &'a FieldWire,
+}
+
+struct ParsedSerdeField {
+    encode_name: String,
+    value: Py<PyAny>,
+}
+
+struct BufferedSerdeField {
+    encode_name: String,
+    encoded: Vec<u8>,
+}
+
+enum SerdeFieldResolution<'a> {
+    Missing,
+    Resolved(&'a FieldWire),
+    Ambiguous,
+}
+
+fn serde_object(plan: &NativePlan, index: usize) -> PyResult<&SerdeObject> {
+    let bound_types = plan
+        .bound_types
+        .get()
+        .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
+    bound_types
+        .serde_objects
+        .get(index)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| PyRuntimeError::new_err("generated model has no serde metadata"))
+}
+
+fn serde_field_by_name<'a>(
+    plan: &'a NativePlan,
+    object_index: usize,
+    encode_name: &str,
+) -> PyResult<Option<(&'a SerdeField, &'a FieldWire)>> {
+    let metadata = serde_object(plan, object_index)?;
+    Ok(metadata
+        .fields
+        .iter()
+        .find(|field| field.encode_name == encode_name)
+        .map(|field| {
+            (
+                field,
+                &plan.objects[object_index].fields[field.object_field_index],
+            )
+        }))
+}
+
+fn same_serde_field_shape(left: &FieldWire, right: &FieldWire) -> bool {
+    left.kind == right.kind
+        && left.scalar == right.scalar
+        && left.target_index == right.target_index
+        && left.fixed_length == right.fixed_length
+        && left.fallback_id == right.fallback_id
+        && left.serde_omit_default == right.serde_omit_default
+        && left.arms.len() == right.arms.len()
+        && left
+            .arms
+            .iter()
+            .zip(&right.arms)
+            .all(|(left, right)| left.target_index == right.target_index)
+}
+
+fn resolve_serde_field<'a>(
+    plan: &'a NativePlan,
+    choice: SerdeModelChoice<'a>,
+    encode_name: &str,
+) -> PyResult<SerdeFieldResolution<'a>> {
+    match choice {
+        SerdeModelChoice::Known(index) => {
+            Ok(match serde_field_by_name(plan, index, encode_name)? {
+                Some((_, field)) => SerdeFieldResolution::Resolved(field),
+                None => SerdeFieldResolution::Missing,
+            })
+        }
+        SerdeModelChoice::Union(arms) => {
+            let mut selected = None;
+            for arm in arms {
+                let Some((_, field)) = serde_field_by_name(plan, arm.target_index, encode_name)?
+                else {
+                    continue;
+                };
+                if let Some(previous) = selected
+                    && !same_serde_field_shape(previous, field)
+                {
+                    return Ok(SerdeFieldResolution::Ambiguous);
+                }
+                selected = Some(field);
+            }
+            Ok(match selected {
+                Some(field) => SerdeFieldResolution::Resolved(field),
+                None => SerdeFieldResolution::Missing,
+            })
+        }
+    }
+}
+
+fn serde_choice_tag_field<'a>(
+    plan: &'a NativePlan,
+    choice: SerdeModelChoice<'a>,
+) -> PyResult<Option<&'a str>> {
+    let index = match choice {
+        SerdeModelChoice::Known(index) => index,
+        SerdeModelChoice::Union(arms) => match arms.first() {
+            Some(arm) => arm.target_index,
+            None => return Ok(None),
+        },
+    };
+    Ok(serde_object(plan, index)?
+        .tag
+        .as_ref()
+        .map(|(field, _)| field.as_str()))
+}
+
+fn serde_choice_tag(
+    plan: &NativePlan,
+    choice: SerdeModelChoice<'_>,
+    tag: &str,
+) -> PyResult<Option<usize>> {
+    let matches = |index| -> PyResult<bool> {
+        Ok(serde_object(plan, index)?
+            .tag
+            .as_ref()
+            .is_some_and(|(_, value)| value == tag))
+    };
+    match choice {
+        SerdeModelChoice::Known(index) => Ok(matches(index)?.then_some(index)),
+        SerdeModelChoice::Union(arms) => {
+            for arm in arms {
+                if matches(arm.target_index)? {
+                    return Ok(Some(arm.target_index));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn serde_construct_model(
+    plan: &NativePlan,
+    py: Python<'_>,
+    object_index: usize,
+    parsed: Vec<ParsedSerdeField>,
+) -> PyResult<Py<PyAny>> {
+    let metadata = serde_object(plan, object_index)?;
+    let model_type = plan.bound_type(py, &plan.objects[object_index].name)?;
+    if parsed.len() == metadata.fields.len() {
+        let positional = metadata
+            .fields
+            .iter()
+            .map(|field| {
+                parsed
+                    .iter()
+                    .find(|parsed| parsed.encode_name == field.encode_name)
+                    .map(|parsed| parsed.value.clone_ref(py))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(positional) = positional {
+            let pointers = positional
+                .iter()
+                .map(|value| value.as_ptr())
+                .collect::<Vec<_>>();
+            // SAFETY: every pointer comes from a live owned Py object in
+            // `positional`; `keyword_names` has the same length and remains live
+            // for the call; vectorcall returns a new reference.
+            let result = unsafe {
+                ffi::PyObject_Vectorcall(
+                    model_type.as_ptr(),
+                    pointers.as_ptr(),
+                    0,
+                    metadata.keyword_names.bind(py).as_ptr(),
+                )
+            };
+            // SAFETY: a non-null vectorcall result is a new owned reference.
+            return unsafe { Bound::from_owned_ptr_or_err(py, result) }.map(Bound::unbind);
+        }
+    }
+
+    let kwargs = PyDict::new(py);
+    for parsed_field in parsed {
+        let Some((field, _)) = serde_field_by_name(plan, object_index, &parsed_field.encode_name)?
+        else {
+            return Err(PyValueError::new_err(format!(
+                "field {:?} does not belong to tagged model {}",
+                parsed_field.encode_name, plan.objects[object_index].name
+            )));
+        };
+        kwargs.set_item(field.attr_name.bind(py), parsed_field.value.bind(py))?;
+    }
+    model_type.call((), Some(&kwargs)).map(Bound::unbind)
+}
+
+fn deserialize_buffered_serde_field(
+    context: SerdeDecodeContext<'_, '_>,
+    field: &FieldWire,
+    encoded: &[u8],
+) -> PyResult<Py<PyAny>> {
+    let seed = SerdeFieldSeed { context, field };
+    if context.is_json {
+        let mut deserializer = sonic_rs::Deserializer::from_slice(encoded);
+        let value = seed.deserialize(&mut deserializer).map_err(|error| {
+            PyValueError::new_err(format!("cannot decode buffered JSON field: {error}"))
+        })?;
+        deserializer.end().map_err(|error| {
+            PyValueError::new_err(format!("cannot decode buffered JSON field: {error}"))
+        })?;
+        Ok(value)
+    } else {
+        let mut deserializer = rmp_serde::Deserializer::new(encoded);
+        let value = seed.deserialize(&mut deserializer).map_err(|error| {
+            PyValueError::new_err(format!("cannot decode buffered MessagePack field: {error}"))
+        })?;
+        if !deserializer.get_ref().is_empty() {
+            return Err(PyValueError::new_err(
+                "buffered MessagePack field contains trailing data",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+fn decode_buffered_serde_fields(
+    seed: SerdeModelSeed<'_, '_>,
+    object_index: usize,
+    buffered: &mut Vec<BufferedSerdeField>,
+    parsed: &mut Vec<ParsedSerdeField>,
+) -> PyResult<()> {
+    for buffered_field in buffered.drain(..) {
+        let Some((_, field)) =
+            serde_field_by_name(seed.context.plan, object_index, &buffered_field.encode_name)?
+        else {
+            continue;
+        };
+        parsed.push(ParsedSerdeField {
+            encode_name: buffered_field.encode_name,
+            value: deserialize_buffered_serde_field(seed.context, field, &buffered_field.encoded)?,
+        });
+    }
+    Ok(())
+}
+
+impl<'de> DeserializeSeed<'de> for SerdeModelSeed<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SerdeModelVisitor { seed: self })
+    }
+}
+
+struct SerdeModelVisitor<'a, 'py> {
+    seed: SerdeModelSeed<'a, 'py>,
+}
+
+impl<'de> Visitor<'de> for SerdeModelVisitor<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a generated model object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let tag_field = serde_choice_tag_field(self.seed.context.plan, self.seed.choice)
+            .map_err(A::Error::custom)?
+            .map(str::to_owned);
+        let mut selected = match self.seed.choice {
+            SerdeModelChoice::Known(index) => Some(index),
+            SerdeModelChoice::Union(_) => None,
+        };
+        let mut parsed = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        let mut buffered = Vec::new();
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            if tag_field.as_deref() == Some(key.as_ref()) {
+                let tag = map.next_value::<String>()?;
+                let object_index = serde_choice_tag(self.seed.context.plan, self.seed.choice, &tag)
+                    .map_err(A::Error::custom)?
+                    .ok_or_else(|| {
+                        A::Error::custom(format!("unknown generated model tag {tag:?}"))
+                    })?;
+                selected = Some(object_index);
+                decode_buffered_serde_fields(self.seed, object_index, &mut buffered, &mut parsed)
+                    .map_err(A::Error::custom)?;
+                continue;
+            }
+            let choice = selected.map_or(self.seed.choice, SerdeModelChoice::Known);
+            let field = match resolve_serde_field(self.seed.context.plan, choice, key.as_ref())
+                .map_err(A::Error::custom)?
+            {
+                SerdeFieldResolution::Missing => {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+                SerdeFieldResolution::Resolved(field) => field,
+                SerdeFieldResolution::Ambiguous => {
+                    let encoded = if self.seed.context.is_json {
+                        let value = map.next_value::<sonic_rs::LazyValue<'de>>()?;
+                        value.as_raw_str().as_bytes().to_vec()
+                    } else {
+                        let value = map.next_value::<Value>()?;
+                        rmp_serde::to_vec(&value).map_err(A::Error::custom)?
+                    };
+                    buffered.push(BufferedSerdeField {
+                        encode_name: key.into_owned(),
+                        encoded,
+                    });
+                    continue;
+                }
+            };
+            let value = map.next_value_seed(SerdeFieldSeed {
+                context: self.seed.context,
+                field,
+            })?;
+            parsed.push(ParsedSerdeField {
+                encode_name: key.into_owned(),
+                value,
+            });
+        }
+        let object_index = selected.ok_or_else(|| {
+            A::Error::custom("tagged generated model object is missing its type tag")
+        })?;
+        serde_construct_model(
+            self.seed.context.plan,
+            self.seed.context.py,
+            object_index,
+            parsed,
+        )
+        .map_err(A::Error::custom)
+    }
+}
+
+struct PythonIntVisitor<'py> {
+    py: Python<'py>,
+    coerce: bool,
+}
+
+impl<'de> Visitor<'de> for PythonIntVisitor<'_> {
+    type Value = Py<PyAny>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an integer")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        value.into_py_any(self.py).map_err(E::custom)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        value.into_py_any(self.py).map_err(E::custom)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        if !self.coerce || !value.is_finite() || value.fract() != 0.0 {
+            return Err(E::custom("float is not coercible to an integer"));
+        }
+        if value < 0.0 {
+            (value as i64).into_py_any(self.py).map_err(E::custom)
+        } else {
+            (value as u64).into_py_any(self.py).map_err(E::custom)
+        }
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        if !self.coerce {
+            return Err(E::custom("expected an integer"));
+        }
+        if let Ok(parsed) = value.parse::<i64>()
+            && parsed.to_string() == value
+        {
+            return parsed.into_py_any(self.py).map_err(E::custom);
+        }
+        if let Ok(parsed) = value.parse::<u64>()
+            && parsed.to_string() == value
+        {
+            return parsed.into_py_any(self.py).map_err(E::custom);
+        }
+        let parsed = sonic_rs::from_str::<f64>(value).map_err(E::custom)?;
+        self.visit_f64(parsed)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        self.visit_str(&value)
+    }
+}
+
+fn deserialize_python_int<'de, D>(
+    deserializer: D,
+    py: Python<'_>,
+    is_json: bool,
+    strict: bool,
+) -> Result<Py<PyAny>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    if is_json && strict {
+        let value = sonic_rs::LazyValue::deserialize(deserializer)?;
+        let raw = value.as_raw_str();
+        if !matches!(raw.as_bytes().first(), Some(b'-' | b'0'..=b'9')) {
+            return Err(D::Error::custom("expected an integer"));
+        }
+        if let Ok(value) = raw.parse::<i64>() {
+            return value.into_py_any(py).map_err(D::Error::custom);
+        }
+        if let Ok(value) = raw.parse::<u64>() {
+            return value.into_py_any(py).map_err(D::Error::custom);
+        }
+        return py
+            .get_type::<PyInt>()
+            .call1((raw,))
+            .map(|value| value.into_any().unbind())
+            .map_err(D::Error::custom);
+    }
+    deserializer.deserialize_any(PythonIntVisitor {
+        py,
+        coerce: !strict,
+    })
+}
+
+fn scalar_from_integer(kind: ScalarKind, value: i128) -> Result<ScalarValue, String> {
+    macro_rules! checked {
+        ($variant:ident, $ty:ty) => {
+            <$ty>::try_from(value)
+                .map(ScalarValue::$variant)
+                .map_err(|_| format!("integer {value} is out of range for {kind:?}"))
+        };
+    }
+    match kind {
+        ScalarKind::Bool if matches!(value, 0 | 1) => Ok(ScalarValue::Bool(value == 1)),
+        ScalarKind::Bool => Err(format!("integer {value} is not a boolean")),
+        ScalarKind::Int8 => checked!(Int8, i8),
+        ScalarKind::Uint8 => checked!(Uint8, u8),
+        ScalarKind::Int16 => checked!(Int16, i16),
+        ScalarKind::Uint16 => checked!(Uint16, u16),
+        ScalarKind::Int32 => checked!(Int32, i32),
+        ScalarKind::Uint32 => checked!(Uint32, u32),
+        ScalarKind::Int64 => checked!(Int64, i64),
+        ScalarKind::Uint64 => checked!(Uint64, u64),
+        ScalarKind::Float32 => Ok(ScalarValue::Float32(value as f32)),
+        ScalarKind::Float64 => Ok(ScalarValue::Float64(value as f64)),
+    }
+}
+
+fn scalar_from_i64(kind: ScalarKind, value: i64) -> Result<ScalarValue, String> {
+    scalar_from_integer(kind, i128::from(value))
+}
+
+fn scalar_from_u64(kind: ScalarKind, value: u64) -> Result<ScalarValue, String> {
+    scalar_from_integer(kind, i128::from(value))
+}
+
+fn scalar_from_f64(kind: ScalarKind, value: f64) -> Result<ScalarValue, String> {
+    if matches!(kind, ScalarKind::Float32) {
+        return Ok(ScalarValue::Float32(value as f32));
+    }
+    if matches!(kind, ScalarKind::Float64) {
+        return Ok(ScalarValue::Float64(value));
+    }
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(format!("float {value} is not an integer"));
+    }
+    if value < 0.0 {
+        if value < i64::MIN as f64 {
+            return Err(format!("float {value} is out of integer range"));
+        }
+        return scalar_from_i64(kind, value as i64);
+    }
+    if value >= 18_446_744_073_709_551_616.0 {
+        return Err(format!("float {value} is out of integer range"));
+    }
+    scalar_from_u64(kind, value as u64)
+}
+
+fn scalar_from_str(kind: ScalarKind, value: &str) -> Result<ScalarValue, String> {
+    if kind == ScalarKind::Bool {
+        return match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(ScalarValue::Bool(true)),
+            "false" | "0" => Ok(ScalarValue::Bool(false)),
+            _ => Err(format!("string {value:?} is not a boolean")),
+        };
+    }
+    if matches!(kind, ScalarKind::Float32 | ScalarKind::Float64) {
+        return value
+            .parse::<f64>()
+            .map_err(|_| format!("string {value:?} is not a float"))
+            .and_then(|value| scalar_from_f64(kind, value));
+    }
+    if let Ok(parsed) = value.parse::<i64>()
+        && parsed.to_string() == value
+    {
+        return scalar_from_i64(kind, parsed);
+    }
+    if let Ok(parsed) = value.parse::<u64>()
+        && parsed.to_string() == value
+    {
+        return scalar_from_u64(kind, parsed);
+    }
+    let parsed = sonic_rs::from_str::<f64>(value)
+        .map_err(|_| format!("string {value:?} is not an integer"))?;
+    scalar_from_f64(kind, parsed)
+}
+
+struct CoercedScalarVisitor {
+    kind: ScalarKind,
+}
+
+impl<'de> Visitor<'de> for CoercedScalarVisitor {
+    type Value = ScalarValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a value coercible to {:?}", self.kind)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        if self.kind == ScalarKind::Bool {
+            Ok(ScalarValue::Bool(value))
+        } else {
+            Err(E::custom("boolean is not coercible to a numeric field"))
+        }
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        scalar_from_i64(self.kind, value).map_err(E::custom)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        scalar_from_u64(self.kind, value).map_err(E::custom)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        scalar_from_f64(self.kind, value).map_err(E::custom)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        scalar_from_str(self.kind, value).map_err(E::custom)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        self.visit_str(&value)
+    }
+}
+
+fn deserialize_scalar_value<'de, D>(
+    deserializer: D,
+    kind: ScalarKind,
+    strict: bool,
+) -> Result<ScalarValue, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    if !strict {
+        return deserializer.deserialize_any(CoercedScalarVisitor { kind });
+    }
+    Ok(match kind {
+        ScalarKind::Bool => ScalarValue::Bool(bool::deserialize(deserializer)?),
+        ScalarKind::Int8 => ScalarValue::Int8(i8::deserialize(deserializer)?),
+        ScalarKind::Uint8 => ScalarValue::Uint8(u8::deserialize(deserializer)?),
+        ScalarKind::Int16 => ScalarValue::Int16(i16::deserialize(deserializer)?),
+        ScalarKind::Uint16 => ScalarValue::Uint16(u16::deserialize(deserializer)?),
+        ScalarKind::Int32 => ScalarValue::Int32(i32::deserialize(deserializer)?),
+        ScalarKind::Uint32 => ScalarValue::Uint32(u32::deserialize(deserializer)?),
+        ScalarKind::Int64 => ScalarValue::Int64(i64::deserialize(deserializer)?),
+        ScalarKind::Uint64 => ScalarValue::Uint64(u64::deserialize(deserializer)?),
+        ScalarKind::Float32 | ScalarKind::Float64 => {
+            ScalarValue::Float64(f64::deserialize(deserializer)?)
+        }
+    })
+}
+
+fn deserialize_uuid<'de, D>(
+    deserializer: D,
+    plan: &NativePlan,
+    py: Python<'_>,
+    is_json: bool,
+) -> Result<Py<PyAny>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    if is_json {
+        let value = String::deserialize(deserializer)?;
+        return plan
+            .construct_uuid_text(py, &value)
+            .map_err(D::Error::custom);
+    }
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => plan
+            .construct_uuid_text(
+                py,
+                value
+                    .as_str()
+                    .ok_or_else(|| D::Error::custom("UUID string is not valid UTF-8"))?,
+            )
+            .map_err(D::Error::custom),
+        Value::Binary(value) => plan
+            .construct_uuid_bytes(py, &value)
+            .map_err(D::Error::custom),
+        _ => Err(D::Error::custom("expected a UUID string or 16-byte value")),
+    }
+}
+
+fn deserialize_decimal<'de, D>(
+    deserializer: D,
+    plan: &NativePlan,
+    py: Python<'_>,
+    is_json: bool,
+) -> Result<Py<PyAny>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let text = if is_json {
+        let value = sonic_rs::LazyValue::deserialize(deserializer)?;
+        let raw = value.as_raw_str();
+        if raw.starts_with('"') {
+            sonic_rs::from_str::<String>(raw).map_err(D::Error::custom)?
+        } else {
+            raw.to_owned()
+        }
+    } else {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => value
+                .as_str()
+                .ok_or_else(|| D::Error::custom("Decimal string is not valid UTF-8"))?
+                .to_owned(),
+            Value::Integer(value) => value.to_string(),
+            Value::F32(value) => value.to_string(),
+            Value::F64(value) => value.to_string(),
+            _ => return Err(D::Error::custom("expected a Decimal string or number")),
+        }
+    };
+    plan.construct_decimal(py, &text).map_err(D::Error::custom)
+}
+
+impl SerdeFieldSeed<'_, '_> {
+    fn deserialize_value<'de, D>(self, deserializer: D) -> Result<Py<PyAny>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match self.field.kind {
+            FieldKind::Scalar if self.field.serde_python_int => deserialize_python_int(
+                deserializer,
+                self.context.py,
+                self.context.is_json,
+                self.context.strict,
+            ),
+            FieldKind::Scalar => {
+                let scalar = self
+                    .field
+                    .scalar
+                    .ok_or_else(|| D::Error::custom("scalar field has no scalar type"))?;
+                let value = deserialize_scalar_value(deserializer, scalar, self.context.strict)?;
+                let value = value.into_py(self.context.py).map_err(D::Error::custom)?;
+                self.context
+                    .plan
+                    .apply_enum(self.context.py, self.field, value)
+                    .map_err(D::Error::custom)
+            }
+            FieldKind::String => String::deserialize(deserializer)
+                .and_then(|value| value.into_py_any(self.context.py).map_err(D::Error::custom)),
+            FieldKind::Uuid => deserialize_uuid(
+                deserializer,
+                self.context.plan,
+                self.context.py,
+                self.context.is_json,
+            ),
+            FieldKind::Decimal => deserialize_decimal(
+                deserializer,
+                self.context.plan,
+                self.context.py,
+                self.context.is_json,
+            ),
+            FieldKind::Table | FieldKind::Struct | FieldKind::Nested => {
+                let target = self
+                    .field
+                    .target_index
+                    .ok_or_else(|| D::Error::custom("model field has no target"))?;
+                SerdeModelSeed {
+                    context: self.context,
+                    choice: SerdeModelChoice::Known(target),
+                }
+                .deserialize(deserializer)
+            }
+            FieldKind::Union => SerdeModelSeed {
+                context: self.context,
+                choice: SerdeModelChoice::Union(&self.field.arms),
+            }
+            .deserialize(deserializer),
+            FieldKind::VectorScalar | FieldKind::ArrayScalar => {
+                if self.field.enum_type.is_some() {
+                    return deserialize_enum_vector(
+                        deserializer,
+                        self.context.plan,
+                        self.context.py,
+                        self.field,
+                        self.context.strict,
+                    );
+                }
+                let scalar = self
+                    .field
+                    .scalar
+                    .ok_or_else(|| D::Error::custom("numeric vector field has no scalar type"))?;
+                deserialize_numpy_array(
+                    deserializer,
+                    self.context.py,
+                    scalar,
+                    self.field.fixed_length,
+                    self.context.strict,
+                )
+            }
+            FieldKind::VectorString => {
+                Vec::<String>::deserialize(deserializer).and_then(|values| {
+                    PyList::new(self.context.py, values)
+                        .map(|value| value.into_any().unbind())
+                        .map_err(D::Error::custom)
+                })
+            }
+            FieldKind::VectorTable | FieldKind::VectorStruct | FieldKind::ArrayStruct => {
+                let target = self
+                    .field
+                    .target_index
+                    .ok_or_else(|| D::Error::custom("model vector field has no target"))?;
+                SerdeObjectVectorSeed {
+                    context: self.context,
+                    choice: SerdeModelChoice::Known(target),
+                    fixed_length: self.field.fixed_length,
+                    element_nullable: self.field.serde_element_nullable,
+                }
+                .deserialize(deserializer)
+            }
+            FieldKind::UnionVector => SerdeObjectVectorSeed {
+                context: self.context,
+                choice: SerdeModelChoice::Union(&self.field.arms),
+                fixed_length: self.field.fixed_length,
+                element_nullable: self.field.serde_element_nullable,
+            }
+            .deserialize(deserializer),
+            FieldKind::VectorByte | FieldKind::Dynamic => Err(D::Error::custom(
+                "field requires the msgspec serde fallback",
+            )),
+            FieldKind::Fallback => {
+                let fallback_id = self
+                    .field
+                    .fallback_id
+                    .as_deref()
+                    .ok_or_else(|| D::Error::custom("fallback field has no callback id"))?;
+                let decoder = self
+                    .context
+                    .fallback_decoders
+                    .get_item(fallback_id)
+                    .map_err(D::Error::custom)?
+                    .ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "serde fallback decoder {fallback_id:?} is not bound"
+                        ))
+                    })?;
+                if self.context.is_json {
+                    let value = sonic_rs::LazyValue::deserialize(deserializer)?;
+                    decoder
+                        .call1((PyBytes::new(self.context.py, value.as_raw_str().as_bytes()),))
+                        .map(Bound::unbind)
+                        .map_err(D::Error::custom)
+                } else {
+                    let value = Value::deserialize(deserializer)?;
+                    let encoded = rmp_serde::to_vec(&value).map_err(D::Error::custom)?;
+                    decoder
+                        .call1((PyBytes::new(self.context.py, &encoded),))
+                        .map(Bound::unbind)
+                        .map_err(D::Error::custom)
+                }
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for SerdeFieldSeed<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if self.field.serde_nullable {
+            deserializer.deserialize_option(SerdeFieldOptionVisitor { seed: self })
+        } else {
+            self.deserialize_value(deserializer)
+        }
+    }
+}
+
+struct SerdeFieldOptionVisitor<'a, 'py> {
+    seed: SerdeFieldSeed<'a, 'py>,
+}
+
+impl<'de> Visitor<'de> for SerdeFieldOptionVisitor<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a generated model field")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        Ok(self.seed.context.py.None())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        self.visit_none()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        self.seed.deserialize_value(deserializer)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SerdeObjectVectorSeed<'a, 'py> {
+    context: SerdeDecodeContext<'a, 'py>,
+    choice: SerdeModelChoice<'a>,
+    fixed_length: usize,
+    element_nullable: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for SerdeObjectVectorSeed<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SerdeObjectVectorVisitor { seed: self })
+    }
+}
+
+struct SerdeObjectVectorVisitor<'a, 'py> {
+    seed: SerdeObjectVectorSeed<'a, 'py>,
+}
+
+#[derive(Clone, Copy)]
+struct OptionalSerdeModelSeed<'a, 'py> {
+    seed: SerdeModelSeed<'a, 'py>,
+}
+
+impl<'de> DeserializeSeed<'de> for OptionalSerdeModelSeed<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_option(OptionalSerdeModelVisitor { seed: self.seed })
+    }
+}
+
+struct OptionalSerdeModelVisitor<'a, 'py> {
+    seed: SerdeModelSeed<'a, 'py>,
+}
+
+impl<'de> Visitor<'de> for OptionalSerdeModelVisitor<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a generated model object or null")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        Ok(self.seed.context.py.None())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        self.visit_none()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        self.seed.deserialize(deserializer)
+    }
+}
+
+impl<'de> Visitor<'de> for SerdeObjectVectorVisitor<'_, '_> {
+    type Value = Py<PyAny>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a vector of generated model objects")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        loop {
+            let model_seed = SerdeModelSeed {
+                context: self.seed.context,
+                choice: self.seed.choice,
+            };
+            let value = if self.seed.element_nullable {
+                sequence.next_element_seed(OptionalSerdeModelSeed { seed: model_seed })?
+            } else {
+                sequence.next_element_seed(model_seed)?
+            };
+            match value {
+                Some(value) => values.push(value),
+                None => break,
+            }
+        }
+        if self.seed.fixed_length != 0 && values.len() != self.seed.fixed_length {
+            return Err(A::Error::custom(format!(
+                "fixed object array requires {} values, got {}",
+                self.seed.fixed_length,
+                values.len()
+            )));
+        }
+        PyList::new(self.seed.context.py, values)
+            .map(|value| value.into_any().unbind())
+            .map_err(A::Error::custom)
+    }
+}
+
+fn finish_numpy_values<T, E>(
+    py: Python<'_>,
+    values: Vec<T>,
+    fixed_length: usize,
+) -> Result<Py<PyAny>, E>
+where
+    T: numpy::Element,
+    E: DeserializeError,
+{
+    if fixed_length != 0 && values.len() != fixed_length {
+        return Err(E::custom(format!(
+            "fixed numeric array requires {fixed_length} values, got {}",
+            values.len()
+        )));
+    }
+    Ok(numpy::PyArray1::from_slice(py, &values).into_any().unbind())
+}
+
+fn scalar_from_value(kind: ScalarKind, value: Value, strict: bool) -> Result<ScalarValue, String> {
+    match value {
+        Value::Boolean(value) if kind == ScalarKind::Bool => Ok(ScalarValue::Bool(value)),
+        Value::Integer(value) if !strict || kind != ScalarKind::Bool => {
+            if let Some(value) = value.as_i64() {
+                scalar_from_i64(kind, value)
+            } else if let Some(value) = value.as_u64() {
+                scalar_from_u64(kind, value)
+            } else {
+                Err("integer is outside the supported range".to_owned())
+            }
+        }
+        Value::F32(value)
+            if !strict || matches!(kind, ScalarKind::Float32 | ScalarKind::Float64) =>
+        {
+            scalar_from_f64(kind, f64::from(value))
+        }
+        Value::F64(value)
+            if !strict || matches!(kind, ScalarKind::Float32 | ScalarKind::Float64) =>
+        {
+            scalar_from_f64(kind, value)
+        }
+        Value::String(value) if !strict => scalar_from_str(
+            kind,
+            value
+                .as_str()
+                .ok_or_else(|| "numeric string is not valid UTF-8".to_owned())?,
+        ),
+        Value::Nil if kind == ScalarKind::Float32 => Ok(ScalarValue::Float32(f32::NAN)),
+        Value::Nil if kind == ScalarKind::Float64 => Ok(ScalarValue::Float64(f64::NAN)),
+        _ if strict => Err(format!("expected {kind:?}")),
+        _ => Err(format!("value is not coercible to {kind:?}")),
+    }
+}
+
+fn deserialize_enum_vector<'de, D>(
+    deserializer: D,
+    plan: &NativePlan,
+    py: Python<'_>,
+    field: &FieldWire,
+    strict: bool,
+) -> Result<Py<PyAny>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let scalar = field
+        .scalar
+        .ok_or_else(|| D::Error::custom("enum vector has no scalar type"))?;
+    let raw = Vec::<Value>::deserialize(deserializer)?;
+    if field.fixed_length != 0 && raw.len() != field.fixed_length {
+        return Err(D::Error::custom(format!(
+            "fixed enum array requires {} values, got {}",
+            field.fixed_length,
+            raw.len()
+        )));
+    }
+    let mut values = Vec::with_capacity(raw.len());
+    for value in raw {
+        let value = scalar_from_value(scalar, value, strict)
+            .map_err(D::Error::custom)?
+            .into_py(py)
+            .map_err(D::Error::custom)?;
+        values.push(
+            plan.apply_enum(py, field, value)
+                .map_err(D::Error::custom)?,
+        );
+    }
+    PyList::new(py, values)
+        .map(|value| value.into_any().unbind())
+        .map_err(D::Error::custom)
+}
+
+fn finish_coerced_numpy<E>(
+    py: Python<'_>,
+    values: Vec<ScalarValue>,
+    kind: ScalarKind,
+    fixed_length: usize,
+) -> Result<Py<PyAny>, E>
+where
+    E: DeserializeError,
+{
+    macro_rules! finish {
+        ($variant:ident, $ty:ty) => {{
+            let values = values
+                .into_iter()
+                .map(|value| match value {
+                    ScalarValue::$variant(value) => Ok(value),
+                    _ => Err(E::custom("coerced numeric vector changed scalar type")),
+                })
+                .collect::<Result<Vec<$ty>, E>>()?;
+            finish_numpy_values(py, values, fixed_length)
+        }};
+    }
+    match kind {
+        ScalarKind::Bool => finish!(Bool, bool),
+        ScalarKind::Int8 => finish!(Int8, i8),
+        ScalarKind::Uint8 => finish!(Uint8, u8),
+        ScalarKind::Int16 => finish!(Int16, i16),
+        ScalarKind::Uint16 => finish!(Uint16, u16),
+        ScalarKind::Int32 => finish!(Int32, i32),
+        ScalarKind::Uint32 => finish!(Uint32, u32),
+        ScalarKind::Int64 => finish!(Int64, i64),
+        ScalarKind::Uint64 => finish!(Uint64, u64),
+        ScalarKind::Float32 => finish!(Float32, f32),
+        ScalarKind::Float64 => finish!(Float64, f64),
+    }
+}
+
+fn deserialize_numpy_values<'de, T, D>(
+    deserializer: D,
+    py: Python<'_>,
+    fixed_length: usize,
+) -> Result<Py<PyAny>, D::Error>
+where
+    T: Deserialize<'de> + numpy::Element,
+    D: Deserializer<'de>,
+{
+    finish_numpy_values(py, Vec::<T>::deserialize(deserializer)?, fixed_length)
+}
+
+fn deserialize_numpy_array<'de, D>(
+    deserializer: D,
+    py: Python<'_>,
+    scalar: ScalarKind,
+    fixed_length: usize,
+    strict: bool,
+) -> Result<Py<PyAny>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    if !strict {
+        let values = Vec::<Value>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| scalar_from_value(scalar, value, false).map_err(D::Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+        return finish_coerced_numpy(py, values, scalar, fixed_length);
+    }
+    match scalar {
+        ScalarKind::Bool => deserialize_numpy_values::<bool, D>(deserializer, py, fixed_length),
+        ScalarKind::Int8 => deserialize_numpy_values::<i8, D>(deserializer, py, fixed_length),
+        ScalarKind::Uint8 => deserialize_numpy_values::<u8, D>(deserializer, py, fixed_length),
+        ScalarKind::Int16 => deserialize_numpy_values::<i16, D>(deserializer, py, fixed_length),
+        ScalarKind::Uint16 => deserialize_numpy_values::<u16, D>(deserializer, py, fixed_length),
+        ScalarKind::Int32 => deserialize_numpy_values::<i32, D>(deserializer, py, fixed_length),
+        ScalarKind::Uint32 => deserialize_numpy_values::<u32, D>(deserializer, py, fixed_length),
+        ScalarKind::Int64 => deserialize_numpy_values::<i64, D>(deserializer, py, fixed_length),
+        ScalarKind::Uint64 => deserialize_numpy_values::<u64, D>(deserializer, py, fixed_length),
+        ScalarKind::Float32 => {
+            let values = Vec::<Option<f32>>::deserialize(deserializer)?
+                .into_iter()
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect();
+            finish_numpy_values(py, values, fixed_length)
+        }
+        ScalarKind::Float64 => {
+            let values = Vec::<Option<f64>>::deserialize(deserializer)?
+                .into_iter()
+                .map(|value| value.unwrap_or(f64::NAN))
+                .collect();
+            finish_numpy_values(py, values, fixed_length)
+        }
+    }
+}
+
+fn initialized_numpy_array<'py, T>(
+    py: Python<'py>,
+    length: usize,
+    initialize: impl FnOnce(&mut [T]),
+) -> Bound<'py, numpy::PyArray1<T>>
+where
+    T: numpy::Element,
+{
+    let array = numpy::PyArray1::<T>::zeros(py, length, false);
+    {
+        let mut writable = array.readwrite();
+        let values = writable
+            .as_slice_mut()
+            .expect("a newly allocated one-dimensional array is contiguous");
+        initialize(values);
+    }
+    array
+}
+
 #[pyclass(module = "msgspec_flatbuffers._native", frozen)]
 pub struct NativePlan {
     identity: Arc<()>,
@@ -1059,8 +3113,11 @@ pub struct NativePlan {
     bound_types: OnceLock<BoundTypes>,
     model_subclass_cache: Mutex<HashMap<usize, BoundModelSubclass>>,
     dynamic_encoder: Option<Py<PyAny>>,
+    nested_encoder: Option<Py<PyAny>>,
+    model_decoder: Option<Py<PyAny>>,
     dynamic_registry: Py<PyAny>,
-    numpy_empty: Py<PyAny>,
+    uuid_type: Option<Py<PyType>>,
+    decimal_type: Option<Py<PyType>>,
     buffer_bounds_error: Py<PyType>,
     invalid_buffer_error: Py<PyType>,
 }
@@ -1080,12 +3137,84 @@ impl NativePlan {
             .ok_or_else(|| PyValueError::new_err("native field has no target"))
     }
 
+    fn sorted_table_map_values<'py>(
+        &self,
+        field: &FieldWire,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = self.target_object(field)?;
+        let key_field = target
+            .key_field()
+            .ok_or_else(|| PyRuntimeError::new_err("keyed table has no key field"))?;
+        let mapping = value.cast::<PyDict>().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "keyed table field {:?} requires a dict",
+                field.name
+            ))
+        })?;
+        let mut entries = Vec::with_capacity(mapping.len());
+        for (mapping_key, item) in mapping {
+            let key = TableKey::extract(key_field, &mapping_key)?;
+            let model_key = item.getattr(key_field.name.as_str())?;
+            if !mapping_key.eq(&model_key)? {
+                return Err(PyValueError::new_err(format!(
+                    "keyed table field {:?} key does not match {}.{}",
+                    field.name, target.name, key_field.name
+                )));
+            }
+            entries.push((key, item));
+        }
+        entries.sort_by(|(left, _), (right, _)| left.compare(right));
+        if entries
+            .windows(2)
+            .any(|items| items[0].0.compare(&items[1].0) == Ordering::Equal)
+        {
+            return Err(PyValueError::new_err(format!(
+                "keyed table field {:?} has duplicate encoded keys",
+                field.name
+            )));
+        }
+        Ok(PyList::new(value.py(), entries.into_iter().map(|(_, item)| item))?.into_any())
+    }
+
     fn bound_type<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyType>> {
         self.bound_types
             .get()
             .and_then(|types| types.by_name.get(name))
             .map(|value| value.bind(py).clone())
             .ok_or_else(|| PyRuntimeError::new_err(format!("native type {name:?} is not bound")))
+    }
+
+    fn construct_uuid_text(&self, py: Python<'_>, value: &str) -> PyResult<Py<PyAny>> {
+        self.uuid_type
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("UUID type is not loaded"))?
+            .bind(py)
+            .call1((value,))
+            .map(Bound::into_any)
+            .map(Bound::unbind)
+    }
+
+    fn construct_uuid_bytes(&self, py: Python<'_>, value: &[u8]) -> PyResult<Py<PyAny>> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("bytes", PyBytes::new(py, value))?;
+        self.uuid_type
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("UUID type is not loaded"))?
+            .bind(py)
+            .call((), Some(&kwargs))
+            .map(Bound::into_any)
+            .map(Bound::unbind)
+    }
+
+    fn construct_decimal(&self, py: Python<'_>, value: &str) -> PyResult<Py<PyAny>> {
+        self.decimal_type
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Decimal type is not loaded"))?
+            .bind(py)
+            .call1((value,))
+            .map(Bound::into_any)
+            .map(Bound::unbind)
     }
 
     fn prepare_decode<'a, 'py>(
@@ -1442,36 +3571,33 @@ impl NativePlan {
             .checked_mul(width)
             .ok_or_else(|| self.bounds_error(py, "numeric vector byte length overflows"))?;
         self.require_span(py, data, start, byte_length, "numeric vector data")?;
-        let native_dtype = match scalar {
-            ScalarKind::Bool => "?",
-            ScalarKind::Int8 => "i1",
-            ScalarKind::Uint8 => "u1",
-            ScalarKind::Int16 => "i2",
-            ScalarKind::Uint16 => "u2",
-            ScalarKind::Int32 => "i4",
-            ScalarKind::Uint32 => "u4",
-            ScalarKind::Int64 => "i8",
-            ScalarKind::Uint64 => "u8",
-            ScalarKind::Float32 => "f4",
-            ScalarKind::Float64 => "f8",
+        let bytes = &data[start..start + byte_length];
+        macro_rules! array {
+            ($ty:ty) => {
+                initialized_numpy_array::<$ty>(py, length, |values| {
+                    cast_slice_mut(values).copy_from_slice(bytes);
+                })
+                .into_any()
+            };
+        }
+        let array = match scalar {
+            ScalarKind::Bool => initialized_numpy_array(py, length, |values| {
+                for (value, &byte) in values.iter_mut().zip(bytes) {
+                    *value = byte != 0;
+                }
+            })
+            .into_any(),
+            ScalarKind::Int8 => array!(i8),
+            ScalarKind::Uint8 => array!(u8),
+            ScalarKind::Int16 => array!(i16),
+            ScalarKind::Uint16 => array!(u16),
+            ScalarKind::Int32 => array!(i32),
+            ScalarKind::Uint32 => array!(u32),
+            ScalarKind::Int64 => array!(i64),
+            ScalarKind::Uint64 => array!(u64),
+            ScalarKind::Float32 => array!(f32),
+            ScalarKind::Float64 => array!(f64),
         };
-        let array = self.numpy_empty.bind(py).call1((length, native_dtype))?;
-        let output = PyUntypedBuffer::get(&array)?;
-        if output.readonly() || !output.is_c_contiguous() || output.len_bytes() != byte_length {
-            return Err(PyRuntimeError::new_err(
-                "NumPy returned incompatible numeric vector storage",
-            ));
-        }
-        if byte_length != 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    data[start..start + byte_length].as_ptr(),
-                    output.buf_ptr().cast(),
-                    byte_length,
-                );
-            }
-        }
-        drop(output);
         if cfg!(target_endian = "big") && width > 1 {
             array.call_method1("byteswap", (true,))?;
         }
@@ -1578,16 +3704,13 @@ impl NativePlan {
             return Ok(wrapper.call_method1("opaque", (tag, bytes))?.unbind());
         }
         let generated_type = entry.getattr("model_type")?;
-        let model = match dynamic_overrides {
+        let model_type = match dynamic_overrides {
             Some(overrides) => {
-                let model_type =
-                    overrides.call_method1("get", (generated_type.clone(), generated_type))?;
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("dynamic_overrides", overrides)?;
-                model_type.call_method("from_flatbuffer", (bytes,), Some(&kwargs))?
+                overrides.call_method1("get", (generated_type.clone(), generated_type))?
             }
-            None => generated_type.call_method1("from_flatbuffer", (bytes,))?,
+            None => generated_type,
         };
+        let model = self.decode_model_value(py, &bytes, &model_type, dynamic_overrides)?;
         Ok(wrapper.call1((model,))?.unbind())
     }
 
@@ -1653,6 +3776,33 @@ impl NativePlan {
         let tag = encoded.get_item(0)?.extract::<String>()?;
         let data = encoded.get_item(1)?;
         Ok((tag, data))
+    }
+
+    fn encode_nested_value<'py>(&self, value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        self.nested_encoder
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("native nested encoder is not loaded"))?
+            .bind(value.py())
+            .call1((value,))
+    }
+
+    fn decode_model_value<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyBytes>,
+        model_type: &Bound<'py, PyAny>,
+        dynamic_overrides: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("type", model_type)?;
+        if let Some(overrides) = dynamic_overrides {
+            kwargs.set_item("dynamic_overrides", overrides)?;
+        }
+        self.model_decoder
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("native model decoder is not loaded"))?
+            .bind(py)
+            .call((data,), Some(&kwargs))
     }
 
     fn union_arm<'a>(
@@ -1772,8 +3922,15 @@ impl NativePlan {
             .fields
             .iter()
             .map(|field| {
+                let mut value = model.getattr(field.name.as_str())?;
+                if !value.is_none()
+                    && field.kind == FieldKind::VectorTable
+                    && self.target_object(field)?.key_field().is_some()
+                {
+                    value = self.sorted_table_map_values(field, &value)?;
+                }
                 Ok(FieldState {
-                    value: model.getattr(field.name.as_str())?,
+                    value,
                     offset: None,
                     discriminator: None,
                     prepared: None,
@@ -1783,15 +3940,24 @@ impl NativePlan {
             .collect()
     }
 
-    fn estimate_table(&self, object: &ObjectWire, model: &Bound<'_, PyAny>) -> PyResult<usize> {
+    fn estimate_table(
+        &self,
+        object: &ObjectWire,
+        model: &Bound<'_, PyAny>,
+        budget: &mut SizeEstimateBudget,
+    ) -> PyResult<usize> {
+        if !budget.consume(table_estimate_work(object)) {
+            return Ok(DEFAULT_TABLE_SIZE_ESTIMATE);
+        }
         let mut fields = self.load_fields(object, model)?;
-        self.estimate_table_fields(object, &mut fields)
+        self.estimate_table_fields(object, &mut fields, budget)
     }
 
     fn estimate_table_fields(
         &self,
         object: &ObjectWire,
         fields: &mut [FieldState<'_>],
+        budget: &mut SizeEstimateBudget,
     ) -> PyResult<usize> {
         if object.is_struct {
             return Err(PyTypeError::new_err(format!(
@@ -1843,7 +4009,7 @@ impl NativePlan {
                 FieldKind::Table => {
                     size = size.saturating_add(7);
                     let target = self.target_object(field)?;
-                    self.estimate_table(target, value)?
+                    self.estimate_table(target, value, budget)?
                 }
                 FieldKind::VectorByte => {
                     size = size.saturating_add(7);
@@ -1864,21 +4030,35 @@ impl NativePlan {
                 FieldKind::VectorString => {
                     size = size.saturating_add(7);
                     let length = sequence_len(value)?;
-                    let strings = sampled_sequence_size(value, |item| {
-                        let length = item.cast::<PyString>()?.to_str()?.len();
-                        Ok(aligned_payload_size(length.saturating_add(5), 4))
-                    })?;
-                    aligned_payload_size(length.saturating_mul(4).saturating_add(4), 4)
-                        .saturating_add(strings)
+                    let sample_count = budget.take_samples(length, 1);
+                    let strings = sampled_sequence_size(
+                        value,
+                        length,
+                        sample_count,
+                        sample_seed(object, field, length),
+                        DEFAULT_STRING_SIZE_ESTIMATE,
+                        |item| {
+                            let length = item.cast::<PyString>()?.to_str()?.len();
+                            Ok(aligned_payload_size(length.saturating_add(5), 4))
+                        },
+                    )?;
+                    offset_vector_size(length).saturating_add(strings)
                 }
                 FieldKind::VectorTable => {
                     size = size.saturating_add(7);
                     let length = sequence_len(value)?;
                     let target = self.target_object(field)?;
-                    let tables =
-                        sampled_sequence_size(value, |item| self.estimate_table(target, &item))?;
-                    aligned_payload_size(length.saturating_mul(4).saturating_add(4), 4)
-                        .saturating_add(tables)
+                    let sample_count =
+                        budget.available_samples(length, table_estimate_work(target));
+                    let tables = sampled_sequence_size(
+                        value,
+                        length,
+                        sample_count,
+                        sample_seed(object, field, length),
+                        DEFAULT_TABLE_SIZE_ESTIMATE,
+                        |item| self.estimate_table(target, &item, budget),
+                    )?;
+                    offset_vector_size(length).saturating_add(tables)
                 }
                 FieldKind::VectorStruct => {
                     size = size.saturating_add(7);
@@ -1891,7 +4071,7 @@ impl NativePlan {
                 }
                 FieldKind::Nested => {
                     size = size.saturating_add(7);
-                    let data = value.call_method0("to_flatbuffer")?;
+                    let data = self.encode_nested_value(value)?;
                     let data_size = buffer_byte_length(&data)?;
                     state.prepared = Some(PreparedValue::Nested(data));
                     aligned_payload_size(data_size.saturating_add(4), 4)
@@ -1920,7 +4100,7 @@ impl NativePlan {
                     let width = scalar_size(field.type_scalar)?;
                     size = size.saturating_add(aligned_payload_size(width, width));
                     let arm = self.union_arm(field, value)?;
-                    self.estimate_table(&self.objects[arm.target_index], value)?
+                    self.estimate_table(&self.objects[arm.target_index], value, budget)?
                 }
                 FieldKind::UnionVector => {
                     size = size.saturating_add(7);
@@ -1930,14 +4110,22 @@ impl NativePlan {
                     }
                     let length = sequence_len(value)?;
                     let width = scalar_size(field.type_scalar)?;
-                    let tables = sampled_sequence_size(value, |item| {
-                        if item.is_none() {
-                            return Ok(0);
-                        }
-                        let arm = self.union_arm(field, &item)?;
-                        self.estimate_table(&self.objects[arm.target_index], &item)
-                    })?;
-                    aligned_payload_size(length.saturating_mul(4).saturating_add(4), 4)
+                    let sample_count = budget.available_samples(length, 1);
+                    let tables = sampled_sequence_size(
+                        value,
+                        length,
+                        sample_count,
+                        sample_seed(object, field, length),
+                        DEFAULT_TABLE_SIZE_ESTIMATE,
+                        |item| {
+                            if item.is_none() {
+                                return Ok(0);
+                            }
+                            let arm = self.union_arm(field, &item)?;
+                            self.estimate_table(&self.objects[arm.target_index], &item, budget)
+                        },
+                    )?;
+                    offset_vector_size(length)
                         .saturating_add(aligned_payload_size(
                             length.saturating_mul(width).saturating_add(4),
                             width.max(4),
@@ -1949,6 +4137,11 @@ impl NativePlan {
                         "fixed arrays may only be fields of structs",
                     ));
                 }
+                FieldKind::Uuid | FieldKind::Decimal | FieldKind::Fallback => {
+                    return Err(PyValueError::new_err(
+                        "serde fallback fields cannot be encoded as FlatBuffers",
+                    ));
+                }
             };
             size = size.saturating_add(referenced);
         }
@@ -1957,6 +4150,25 @@ impl NativePlan {
             size = size.saturating_add(2usize.saturating_mul(slot as usize + 1));
         }
         Ok(size)
+    }
+
+    // Keep estimation code out of the hot explicit-capacity path in `pack`.
+    #[inline(never)]
+    fn estimate_initial_capacity(
+        &self,
+        root_object: &ObjectWire,
+        root_fields: &mut [FieldState<'_>],
+        identifier: Option<&str>,
+        size_prefixed: bool,
+    ) -> PyResult<usize> {
+        let mut budget = SizeEstimateBudget::new();
+        let finish_size = 4usize
+            .saturating_add(identifier.map_or(0, |_| 4))
+            .saturating_add(if size_prefixed { 4 } else { 0 });
+        let estimate = self
+            .estimate_table_fields(root_object, root_fields, &mut budget)?
+            .saturating_add(finish_size);
+        Ok(estimated_capacity(estimate))
     }
 
     fn build_table<'fbb, 'py>(
@@ -2074,7 +4286,7 @@ impl NativePlan {
                 FieldKind::Nested => {
                     let data = match prepared {
                         Some(PreparedValue::Nested(data)) => data,
-                        _ => value.call_method0("to_flatbuffer")?,
+                        _ => self.encode_nested_value(value)?,
                     };
                     build_byte_vector(builder, &data)?
                 }
@@ -2136,6 +4348,11 @@ impl NativePlan {
                 | FieldKind::Struct
                 | FieldKind::ArrayScalar
                 | FieldKind::ArrayStruct => unreachable!(),
+                FieldKind::Uuid | FieldKind::Decimal | FieldKind::Fallback => {
+                    return Err(PyValueError::new_err(
+                        "serde fallback fields cannot be encoded as FlatBuffers",
+                    ));
+                }
             };
             states[index].offset = Some(offset);
             states[index].discriminator = discriminator;
@@ -2235,6 +4452,11 @@ impl NativePlan {
                 FieldKind::ArrayScalar | FieldKind::ArrayStruct => {
                     return Err(PyValueError::new_err(
                         "fixed arrays may only be fields of structs",
+                    ));
+                }
+                FieldKind::Uuid | FieldKind::Decimal | FieldKind::Fallback => {
+                    return Err(PyValueError::new_err(
+                        "serde fallback fields cannot be encoded as FlatBuffers",
                     ));
                 }
             }
@@ -2432,6 +4654,41 @@ impl<'plan, 'data, 'context, 'py> Materializer<'plan, 'data, 'context, 'py> {
         Ok(())
     }
 
+    fn finish_map(&mut self, value_start: usize, object_index: usize) -> PyResult<()> {
+        let object = &self.plan.objects[object_index];
+        let key_field = object
+            .key_field()
+            .ok_or_else(|| PyRuntimeError::new_err("keyed table has no key field"))?;
+        let mapping = PyDict::new(self.py);
+        let mut previous: Option<TableKey> = None;
+        for value in &self.values[value_start..] {
+            let key_value = value.bind(self.py).getattr(key_field.name.as_str())?;
+            let key = TableKey::extract(key_field, &key_value).map_err(|_| {
+                self.plan.invalid_error(
+                    self.py,
+                    format!("keyed table {} has an invalid key", object.name),
+                )
+            })?;
+            if previous
+                .as_ref()
+                .is_some_and(|previous| previous.compare(&key) != Ordering::Less)
+            {
+                return Err(self.plan.invalid_error(
+                    self.py,
+                    format!(
+                        "keyed table vector for {} is not strictly sorted",
+                        object.name
+                    ),
+                ));
+            }
+            mapping.set_item(key_value, value.bind(self.py))?;
+            previous = Some(key);
+        }
+        self.values.truncate(value_start);
+        self.values.push(mapping.into_any().unbind());
+        Ok(())
+    }
+
     fn decode_scalar_sequence(
         &self,
         field: &FieldWire,
@@ -2517,7 +4774,11 @@ impl<'plan, 'data, 'context, 'py> Materializer<'plan, 'data, 'context, 'py> {
                 }
                 DecodeFrame::ObjectVector(mut vector) => {
                     if vector.index == vector.length {
-                        self.finish_list(vector.result_start)?;
+                        if self.plan.objects[vector.object_index].key_field().is_some() {
+                            self.finish_map(vector.result_start, vector.object_index)?;
+                        } else {
+                            self.finish_list(vector.result_start)?;
+                        }
                         continue;
                     }
                     let index = vector.index;
@@ -2760,6 +5021,11 @@ impl<'plan, 'data, 'context, 'py> Materializer<'plan, 'data, 'context, 'py> {
                     "fixed arrays may only be fields of structs",
                 ));
             }
+            FieldKind::Uuid | FieldKind::Decimal | FieldKind::Fallback => {
+                return Err(PyValueError::new_err(
+                    "serde fallback fields cannot be decoded as FlatBuffers",
+                ));
+            }
         }
         Ok(())
     }
@@ -2819,14 +5085,12 @@ impl<'plan, 'data, 'context, 'py> Materializer<'plan, 'data, 'context, 'py> {
         let child_type = self.child_model_type(task, target_index)?;
         let model_type = self.model_types[child_type].bind(self.py);
         let bytes = PyBytes::new(self.py, &self.data[start..start + length]);
-        let value = match self.context.dynamic_overrides {
-            Some(overrides) => {
-                let kwargs = PyDict::new(self.py);
-                kwargs.set_item("dynamic_overrides", overrides)?;
-                model_type.call_method("from_flatbuffer", (bytes,), Some(&kwargs))?
-            }
-            None => model_type.call_method1("from_flatbuffer", (bytes,))?,
-        };
+        let value = self.plan.decode_model_value(
+            self.py,
+            &bytes,
+            model_type.as_any(),
+            self.context.dynamic_overrides,
+        )?;
         self.values.push(value.unbind());
         Ok(())
     }
@@ -2933,7 +5197,7 @@ impl NativePlan {
     fn new(data: &Bound<'_, PyBytes>) -> PyResult<Self> {
         let mut wire: ModuleWire = rmp_serde::from_slice(data.as_bytes())
             .map_err(|error| PyValueError::new_err(format!("invalid native plan: {error}")))?;
-        if wire.version != 1 {
+        if wire.version != 2 {
             return Err(PyValueError::new_err(format!(
                 "unsupported native plan version {}",
                 wire.version
@@ -2965,20 +5229,90 @@ impl NativePlan {
                     arm.target.clear();
                 }
             }
+            let mut key_fields = object
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.key);
+            object.key_field_index = key_fields.next().map(|(index, _)| index);
+            if key_fields.next().is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "native table {:?} has multiple key fields",
+                    object.name
+                )));
+            }
+            if let Some(key_field) = object.key_field()
+                && (object.is_struct
+                    || !matches!(key_field.kind, FieldKind::Scalar | FieldKind::String))
+            {
+                return Err(PyValueError::new_err(format!(
+                    "native key field on {:?} must be a table scalar or string",
+                    object.name
+                )));
+            }
         }
         let has_dynamic = wire
             .objects
             .iter()
             .flat_map(|object| &object.fields)
             .any(|field| field.kind == FieldKind::Dynamic);
+        let has_nested = wire
+            .objects
+            .iter()
+            .flat_map(|object| &object.fields)
+            .any(|field| field.kind == FieldKind::Nested);
+        let has_uuid = wire
+            .objects
+            .iter()
+            .flat_map(|object| &object.fields)
+            .any(|field| field.kind == FieldKind::Uuid);
+        let has_decimal = wire
+            .objects
+            .iter()
+            .flat_map(|object| &object.fields)
+            .any(|field| field.kind == FieldKind::Decimal);
         let dynamic = data.py().import("msgspec_flatbuffers._dynamic")?;
         let dynamic_encoder = if has_dynamic {
             Some(dynamic.getattr("encode_dynamic")?.unbind())
         } else {
             None
         };
+        let flatbuffer = if has_nested || has_dynamic {
+            Some(data.py().import("msgspec_flatbuffers._flatbuffer")?)
+        } else {
+            None
+        };
+        let nested_encoder = match &flatbuffer {
+            Some(module) if has_nested => Some(module.getattr("encode")?.unbind()),
+            _ => None,
+        };
+        let model_decoder = match &flatbuffer {
+            Some(module) => Some(module.getattr("decode")?.unbind()),
+            None => None,
+        };
         let dynamic_registry = dynamic.getattr("dynamic_types")?.unbind();
-        let numpy_empty = data.py().import("numpy")?.getattr("empty")?.unbind();
+        let uuid_type = if has_uuid {
+            Some(
+                data.py()
+                    .import("uuid")?
+                    .getattr("UUID")?
+                    .cast_into::<PyType>()?
+                    .unbind(),
+            )
+        } else {
+            None
+        };
+        let decimal_type = if has_decimal {
+            Some(
+                data.py()
+                    .import("decimal")?
+                    .getattr("Decimal")?
+                    .cast_into::<PyType>()?
+                    .unbind(),
+            )
+        } else {
+            None
+        };
         let runtime = data.py().import("msgspec_flatbuffers._runtime")?;
         let buffer_bounds_error = runtime
             .getattr("BufferBoundsError")?
@@ -2995,8 +5329,11 @@ impl NativePlan {
             bound_types: OnceLock::new(),
             model_subclass_cache: Mutex::new(HashMap::new()),
             dynamic_encoder,
+            nested_encoder,
+            model_decoder,
             dynamic_registry,
-            numpy_empty,
+            uuid_type,
+            decimal_type,
             buffer_bounds_error,
             invalid_buffer_error,
         })
@@ -3005,18 +5342,74 @@ impl NativePlan {
     fn bind_types(&self, types: &Bound<'_, PyDict>) -> PyResult<()> {
         let mut by_pointer = HashMap::with_capacity(types.len());
         let mut by_name = HashMap::with_capacity(types.len());
+        let mut serde_objects: Vec<Option<SerdeObject>> =
+            (0..self.objects.len()).map(|_| None).collect();
+        let mut serde_supported = true;
         for (name, bound_type) in types.iter() {
             let name = name.extract::<String>()?;
             let bound_type = bound_type.cast::<PyType>()?;
             if let Some(object_index) = self.by_name.get(&name) {
                 by_pointer.insert(bound_type.as_ptr() as usize, *object_index);
+                let object = &self.objects[*object_index];
+                let mut fields = Vec::with_capacity(object.serde_fields.len());
+                for serde_field in &object.serde_fields {
+                    let Some(object_field_index) = object
+                        .fields
+                        .iter()
+                        .position(|field| field.name == serde_field.attr_name)
+                    else {
+                        serde_supported = false;
+                        continue;
+                    };
+                    fields.push(SerdeField {
+                        object_field_index,
+                        attr_name: PyString::intern(bound_type.py(), &serde_field.attr_name)
+                            .unbind(),
+                        encode_name: serde_field.encode_name.clone(),
+                    });
+                }
+                if object.fields.iter().any(|field| {
+                    matches!(field.kind, FieldKind::Dynamic | FieldKind::VectorByte)
+                        || (field.kind == FieldKind::VectorTable
+                            && field
+                                .target_index
+                                .is_some_and(|index| self.objects[index].key_field().is_some()))
+                }) {
+                    serde_supported = false;
+                }
+                let tag = match (&object.serde_tag_field, &object.serde_tag) {
+                    (Some(field), Some(value)) => Some((field.clone(), value.clone())),
+                    (None, None) => None,
+                    _ => {
+                        return Err(PyValueError::new_err(
+                            "native serde tag metadata is incomplete",
+                        ));
+                    }
+                };
+                let keyword_names = PyTuple::new(
+                    bound_type.py(),
+                    fields
+                        .iter()
+                        .map(|field| field.attr_name.clone_ref(bound_type.py())),
+                )?
+                .unbind();
+                serde_objects[*object_index] = Some(SerdeObject {
+                    fields,
+                    keyword_names,
+                    tag,
+                });
             }
             by_name.insert(name, bound_type.clone().unbind());
+        }
+        if serde_objects.iter().any(Option::is_none) {
+            serde_supported = false;
         }
         self.bound_types
             .set(BoundTypes {
                 by_pointer,
                 by_name,
+                serde_objects,
+                serde_supported,
             })
             .map_err(|_| PyRuntimeError::new_err("native model types are already bound"))
     }
@@ -3171,6 +5564,118 @@ impl NativePlan {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (root, model, is_json, *, fallback_encoder, order=None, decimal_format="string", uuid_format="canonical"))]
+    fn encode_serde<'py>(
+        &self,
+        py: Python<'py>,
+        root: &str,
+        model: &Bound<'py, PyAny>,
+        is_json: bool,
+        fallback_encoder: &Bound<'py, PyAny>,
+        order: Option<&str>,
+        decimal_format: &str,
+        uuid_format: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let root = self.object(root)?;
+        let object_index = self.model_object_index(model)?;
+        if object_index != root.index {
+            return Err(PyTypeError::new_err(
+                "serde model does not match the requested generated root",
+            ));
+        }
+        let bound_types = self
+            .bound_types
+            .get()
+            .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
+        if !bound_types.serde_supported {
+            return Err(PyNotImplementedError::new_err(
+                "generated model graph requires the msgspec serde fallback",
+            ));
+        }
+        let context = SerdeEncodeContext {
+            plan: self,
+            fallback_encoder,
+            sorted: order == Some("sorted"),
+            decimal_as_number: decimal_format == "number",
+            uuid_format: match uuid_format {
+                "canonical" => SerdeUuidFormat::Canonical,
+                "hex" => SerdeUuidFormat::Hex,
+                "bytes" if !is_json => SerdeUuidFormat::Bytes,
+                _ => return Err(PyValueError::new_err("unsupported UUID format")),
+            },
+        };
+        let encoded = if is_json {
+            let value = SerdeModel {
+                context,
+                model: model.clone(),
+                object_index,
+            };
+            sonic_rs::to_vec(&value)
+                .map_err(|error| PyTypeError::new_err(format!("cannot encode JSON: {error}")))?
+        } else {
+            let mut output = Vec::new();
+            write_messagepack_model(context, model, object_index, &mut output)?;
+            output
+        };
+        Ok(PyBytes::new(py, &encoded))
+    }
+
+    #[pyo3(signature = (root, buffer, is_json, *, strict=true, fallback_decoders))]
+    fn decode_serde(
+        &self,
+        py: Python<'_>,
+        root: &str,
+        buffer: &Bound<'_, PyAny>,
+        is_json: bool,
+        strict: bool,
+        fallback_decoders: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyAny>> {
+        let root = self.object(root)?;
+        let bound_types = self
+            .bound_types
+            .get()
+            .ok_or_else(|| PyRuntimeError::new_err("native model types are not bound"))?;
+        if !bound_types.serde_supported {
+            return Err(PyNotImplementedError::new_err(
+                "generated model graph requires the msgspec serde fallback",
+            ));
+        }
+        with_input_bytes(buffer, |data| {
+            let seed = SerdeModelSeed {
+                context: SerdeDecodeContext {
+                    plan: self,
+                    py,
+                    is_json,
+                    strict,
+                    fallback_decoders,
+                },
+                choice: SerdeModelChoice::Known(root.index),
+            };
+            if is_json {
+                let mut deserializer = sonic_rs::Deserializer::from_slice(data);
+                let value = seed.deserialize(&mut deserializer).map_err(|error| {
+                    PyValueError::new_err(format!("cannot decode JSON: {error}"))
+                })?;
+                deserializer.end().map_err(|error| {
+                    PyValueError::new_err(format!("cannot decode JSON: {error}"))
+                })?;
+                Ok(value)
+            } else {
+                let mut deserializer = rmp_serde::Deserializer::new(data);
+                let value = seed.deserialize(&mut deserializer).map_err(|error| {
+                    PyValueError::new_err(format!("cannot decode MessagePack: {error}"))
+                })?;
+                if !deserializer.get_ref().is_empty() {
+                    return Err(PyValueError::new_err(
+                        "MessagePack document contains trailing data",
+                    ));
+                }
+                Ok(value)
+            }
+        })
+    }
+
     #[pyo3(signature = (root, model, *, identifier=None, size_prefixed=false, initial_size=0))]
     fn pack<'py>(
         &self,
@@ -3183,16 +5688,23 @@ impl NativePlan {
     ) -> PyResult<Bound<'py, PyMemoryView>> {
         let initial_size = nonnegative_usize(initial_size, "initial_size")?;
         validate_identifier(identifier)?;
+        if initial_size > FLATBUFFERS_MAX_BUFFER_SIZE {
+            return Err(PyValueError::new_err(
+                "initial FlatBuffer size exceeds the 2 GiB format limit",
+            ));
+        }
         let root_object = self.object(root)?;
         let mut root_fields = self.load_fields(root_object, model)?;
-        let finish_size = 4usize
-            .saturating_add(identifier.map_or(0, |_| 4))
-            .saturating_add(if size_prefixed { 4 } else { 0 });
-        let estimate = self
-            .estimate_table_fields(root_object, &mut root_fields)?
-            .saturating_add(finish_size);
-        let estimate = estimate.saturating_mul(101).saturating_add(99) / 100;
-        let capacity = initial_size.max(estimate);
+        let capacity = if initial_size > 0 {
+            initial_size
+        } else {
+            self.estimate_initial_capacity(
+                root_object,
+                &mut root_fields,
+                identifier,
+                size_prefixed,
+            )?
+        };
         if capacity > FLATBUFFERS_MAX_BUFFER_SIZE {
             return Err(PyValueError::new_err(
                 "estimated FlatBuffer size exceeds the 2 GiB format limit",
@@ -3238,7 +5750,34 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferEndian, ScalarKind, scalar_format};
+    use std::collections::HashSet;
+
+    use super::{
+        BufferEndian, ScalarKind, estimated_capacity, scalar_format, stratified_sample_index,
+    };
+
+    #[test]
+    fn stratified_samples_are_distinct_and_cover_endpoints() {
+        for length in 1..100 {
+            for count in 1..=length.min(6) {
+                let indices = (0..count)
+                    .map(|index| stratified_sample_index(length, count, index, 42))
+                    .collect::<Vec<_>>();
+                assert!(indices.iter().all(|&index| index < length));
+                assert_eq!(indices.iter().copied().collect::<HashSet<_>>().len(), count);
+                if count > 1 {
+                    assert_eq!(indices[0], 0);
+                    assert_eq!(indices[count - 1], length - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn estimates_receive_one_percent_headroom() {
+        assert_eq!(estimated_capacity(16), 17);
+        assert_eq!(estimated_capacity(16_000), 16_160);
+    }
 
     #[test]
     fn scalar_buffer_formats_use_declared_width_and_endianness() {

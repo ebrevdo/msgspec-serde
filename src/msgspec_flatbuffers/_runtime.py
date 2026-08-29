@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
+from collections.abc import Buffer, Iterator, Mapping, Sequence
 from enum import IntEnum
 from typing import Any, ClassVar, Generic, Self, TypeVar, overload
 
@@ -79,6 +79,7 @@ _INTEGER_UNPACKER_FORMATS = {
 }
 
 _T = TypeVar("_T")
+_KeyT = TypeVar("_KeyT")
 _ViewT = TypeVar("_ViewT", bound="TableView | StructView")
 _UnionT = TypeVar("_UnionT")
 
@@ -740,6 +741,52 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
                 _cache_materialized_prefix(cache, materialized)
 
 
+class TableMap(Mapping[_KeyT, _ViewT], Generic[_KeyT, _ViewT]):
+    """A read-only keyed table vector with lazy binary-search lookup."""
+
+    __slots__ = ("_key_name", "_round_float32_keys", "_values")
+
+    def __init__(
+        self,
+        buffer: memoryview,
+        start: int,
+        length: int,
+        view_type: type[_ViewT],
+        key_name: str,
+        key_type: str,
+    ) -> None:
+        self._values = TableVector(buffer, start, length, view_type)
+        self._key_name = key_name
+        self._round_float32_keys = key_type == "float32"
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self) -> Iterator[_KeyT]:
+        for value in self._values:
+            yield getattr(value, self._key_name)
+
+    def __getitem__(self, key: _KeyT) -> _ViewT:
+        lookup_key: Any = key
+        if self._round_float32_keys:
+            lookup_key = _FLOAT32.unpack(_FLOAT32.pack(key))[0]
+        values = self._values
+        key_name = self._key_name
+        start = 0
+        stop = len(values)
+        while start < stop:
+            middle = (start + stop) // 2
+            value = values[middle]
+            candidate: Any = getattr(value, key_name)
+            if candidate < lookup_key:
+                start = middle + 1
+            elif lookup_key < candidate:
+                stop = middle
+            else:
+                return value
+        raise KeyError(key)
+
+
 class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
     """A vector of cached, read-only inline struct views."""
 
@@ -888,30 +935,13 @@ class _CachedView:
 
     @property
     def _cache(self) -> dict[str, Any]:
-        """Lazily allocated compatibility cache for custom view subclasses."""
+        """Return the lazily allocated cache used by typed byte-vector helpers."""
 
         cache = self._cache_storage
         if cache is None:
             cache = {}
             self._cache_storage = cache
         return cache
-
-    @_cache.setter
-    def _cache(self, cache: dict[str, Any]) -> None:
-        self._cache_storage = cache
-
-    def _cached(self, key: str, loader: Callable[[], _T]) -> _T:
-        cache = self._cache_storage
-        if cache is None:
-            value = loader()
-            self._cache_storage = {key: value}
-            return value
-        try:
-            return cache[key]
-        except KeyError:
-            value = loader()
-            cache[key] = value
-            return value
 
 
 class StructView(_CachedView):
@@ -1091,7 +1121,7 @@ class TableView(_CachedView):
         return view
 
     @classmethod
-    def from_buffer(
+    def _from_buffer(
         cls,
         buffer: Buffer,
         *,
@@ -1343,6 +1373,26 @@ class TableView(_CachedView):
         start, length = info
         return TableVector(self._buffer, start, length, view_type)
 
+    def _read_table_map(
+        self,
+        vtable_field: int,
+        view_type: type[_ViewT],
+        key_name: str,
+        key_type: str,
+    ) -> TableMap[Any, _ViewT] | None:
+        info = self._vector_info(vtable_field, _UINT32.size)
+        if info is None:
+            return None
+        start, length = info
+        return TableMap(
+            self._buffer,
+            start,
+            length,
+            view_type,
+            key_name,
+            key_type,
+        )
+
     def _read_struct_vector(
         self,
         vtable_field: int,
@@ -1381,6 +1431,7 @@ __all__ = [
     "StringVector",
     "StructVector",
     "StructView",
+    "TableMap",
     "TableVector",
     "TableView",
     "UnionDispatch",

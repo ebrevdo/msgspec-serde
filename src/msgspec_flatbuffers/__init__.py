@@ -2,13 +2,12 @@
 
 import warnings
 
-from ._conversion import dec_hook, enc_hook
+from . import flatbuffer, json, msgpack
 from ._dynamic import (
     DynamicType,
     DynamicValue,
     DynamicView,
     dynamic_types,
-    encode_dynamic,
     register_dynamic_module,
     register_dynamic_type,
 )
@@ -21,6 +20,7 @@ from ._runtime import (
     StringVector,
     StructVector,
     StructView,
+    TableMap,
     TableVector,
     TableView,
     UnionDispatch,
@@ -122,6 +122,7 @@ __all__ = [
     "StringVector",
     "StructVector",
     "StructView",
+    "TableMap",
     "TableVector",
     "TableView",
     "TypeReference",
@@ -130,12 +131,12 @@ __all__ = [
     "__version__",
     "compile_schema",
     "compile_schema_to_bfbs",
-    "dec_hook",
     "dynamic_types",
-    "enc_hook",
-    "encode_dynamic",
+    "flatbuffer",
     "generate",
+    "json",
     "load_bfbs",
+    "msgpack",
     "parse_bfbs",
     "register_dynamic_module",
     "register_dynamic_type",
