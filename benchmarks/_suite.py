@@ -18,7 +18,7 @@ from typing import Any
 import flatbuffers
 import numpy as np
 
-from msgspec_flatbuffers import flatbuffer, generate
+from msgspec_serde import flatbuffer, generate
 
 SCHEMA = Path(__file__).with_name("schemas") / "monster.fbs"
 FILE_IDENTIFIER = b"MONS"
@@ -31,7 +31,7 @@ OPERATIONS = (
     "full_traversal",
 )
 ADAPTERS = (
-    "msgspec_flatbuffers",
+    "msgspec_serde",
     "python_flatbuffers",
 )
 
@@ -307,7 +307,7 @@ def _official_signature(model: Any) -> tuple[Any, ...]:
     )
 
 
-def _msgspec_flatbuffers_partial(
+def _msgspec_serde_partial(
     decode: Callable[[bytes], Any],
     buffer: bytes,
 ) -> object:
@@ -330,7 +330,7 @@ def _python_flatbuffers_partial(module: ModuleType, buffer: bytes) -> object:
     )
 
 
-def _msgspec_flatbuffers_traverse(
+def _msgspec_serde_traverse(
     decode: Callable[[bytes], Any],
     buffer: bytes,
 ) -> float:
@@ -430,18 +430,18 @@ class BenchmarkCase:
         self.official_model = _make_official_model(self.official, self.model)
         self.official_flatbuffer = self.serialize_python_flatbuffers()
         self.wire_sizes = {
-            "msgspec_flatbuffers": len(self.flatbuffer),
+            "msgspec_serde": len(self.flatbuffer),
             "python_flatbuffers": len(self.official_flatbuffer),
         }
         self._validate()
 
-    def serialize_msgspec_flatbuffers(self) -> object:
+    def serialize_msgspec_serde(self) -> object:
         return self.flatbuffer_encoder.encode(self.model)
 
     def serialize_python_flatbuffers(self) -> bytearray:
         return _serialize_official(self.official_model)
 
-    def deserialize_msgspec_flatbuffers(self) -> object:
+    def deserialize_msgspec_serde(self) -> object:
         return self.flatbuffer_model_decoder.decode(self.flatbuffer)
 
     def deserialize_python_flatbuffers(self) -> object:
@@ -449,8 +449,8 @@ class BenchmarkCase:
             raise ValueError("benchmark buffer has the wrong FlatBuffers identifier")
         return self.official.MonsterT.InitFromPackedBuf(self.flatbuffer)
 
-    def partial_access_msgspec_flatbuffers(self) -> object:
-        return _msgspec_flatbuffers_partial(
+    def partial_access_msgspec_serde(self) -> object:
+        return _msgspec_serde_partial(
             self.flatbuffer_view_decoder.decode,
             self.flatbuffer,
         )
@@ -458,8 +458,8 @@ class BenchmarkCase:
     def partial_access_python_flatbuffers(self) -> object:
         return _python_flatbuffers_partial(self.official, self.flatbuffer)
 
-    def full_traversal_msgspec_flatbuffers(self) -> object:
-        return _msgspec_flatbuffers_traverse(
+    def full_traversal_msgspec_serde(self) -> object:
+        return _msgspec_serde_traverse(
             self.flatbuffer_view_decoder.decode,
             self.flatbuffer,
         )
@@ -487,7 +487,7 @@ class BenchmarkCase:
             raise AssertionError(
                 "official FlatBuffers encode changed the logical value"
             )
-        ours = self.full_traversal_msgspec_flatbuffers()
+        ours = self.full_traversal_msgspec_serde()
         official = self.full_traversal_python_flatbuffers()
         if ours != official:
             raise AssertionError(
@@ -516,19 +516,19 @@ class BenchmarkSuite:
         if flatc is None:
             raise RuntimeError("flatc is required to run the benchmark suite")
         self._module_names = (
-            "_benchmark_msgspec_flatbuffers_generated",
+            "_benchmark_msgspec_serde_generated",
             "_benchmark_python_flatbuffers_generated",
         )
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         try:
             if generated_root is None:
                 self._temporary_directory = tempfile.TemporaryDirectory(
-                    prefix="msgspec-flatbuffers-comparison-"
+                    prefix="msgspec-serde-comparison-"
                 )
                 self.generated_root = Path(self._temporary_directory.name)
                 generated_path = generate(
                     SCHEMA,
-                    self.generated_root / "msgspec_flatbuffers",
+                    self.generated_root / "msgspec_serde",
                     flatc=flatc,
                     gen_onefile=True,
                 )
@@ -539,7 +539,7 @@ class BenchmarkSuite:
             else:
                 self.generated_root = generated_root.resolve()
                 generated_path = (
-                    self.generated_root / "msgspec_flatbuffers" / "monster.py"
+                    self.generated_root / "msgspec_serde" / "monster.py"
                 )
                 official_path = (
                     self.generated_root / "python_flatbuffers" / "monster_generated.py"
@@ -567,7 +567,7 @@ class BenchmarkSuite:
         self.metadata: dict[str, str | int] = {
             "benchmark_schema_sha256": hashlib.sha256(SCHEMA.read_bytes()).hexdigest(),
             "flatc_version": _flatc_version(flatc),
-            "msgspec_flatbuffers_version": _package_version("msgspec-flatbuffers"),
+            "msgspec_serde_version": _package_version("msgspec-serde"),
             "flatbuffers_version": _package_version("flatbuffers"),
             "msgspec_version": _package_version("msgspec"),
             "numpy_version": _package_version("numpy"),

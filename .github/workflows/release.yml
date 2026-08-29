@@ -49,7 +49,7 @@ jobs:
               raise SystemExit(
                   f"Release tag must be {expected_tag}, got {os.environ['REF_NAME']}"
               )
-          print(f"Building msgspec-flatbuffers {package_version}")
+          print(f"Building msgspec-serde {package_version}")
           PY
 
   wheels:
@@ -121,7 +121,7 @@ jobs:
       - name: Verify free-threaded execution remains enabled
         if: endsWith(matrix.python, 't')
         run: >-
-          python -c "import sys; import msgspec_flatbuffers;
+          python -c "import sys; import msgspec_serde;
           assert not sys._is_gil_enabled()"
 
       - name: Test generated compatibility snapshots
@@ -197,7 +197,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: pypi
-      url: https://pypi.org/p/msgspec-flatbuffers
+      url: https://pypi.org/p/msgspec-serde
     permissions:
       actions: read # Download artifacts built by this workflow.
       id-token: write # Authenticate to PyPI through Trusted Publishing.

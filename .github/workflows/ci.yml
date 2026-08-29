@@ -98,7 +98,7 @@ jobs:
       - name: Verify free-threaded execution remains enabled
         if: endsWith(matrix.python, 't')
         run: >-
-          uv run --locked python -c "import sys; import msgspec_flatbuffers;
+          uv run --locked python -c "import sys; import msgspec_serde;
           assert not sys._is_gil_enabled()"
 
       - name: Minimize uv cache

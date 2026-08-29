@@ -14,7 +14,22 @@ from ._models import validate_model_subclass
 
 
 class DynamicModelOverrides(UserDict[type[msgspec.Struct], type[msgspec.Struct]]):
-    """Validated dynamic generated-model to application-subclass mappings."""
+    """Map generated dynamic models to application subclasses.
+
+    Keys must be registered generated models. Values must be structurally
+    compatible subclasses of their keys.
+
+    Example:
+        Register an application subclass for dynamic decoding:
+
+        >>> overrides = DynamicModelOverrides()
+        >>> overrides[Monster] = AppMonster
+        >>> decoded = flatbuffer.decode(
+        ...     buffer, type=Envelope, dynamic_overrides=overrides
+        ... )
+        >>> isinstance(decoded.payload.value, AppMonster)
+        True
+    """
 
     def __setitem__(
         self,
@@ -25,6 +40,24 @@ class DynamicModelOverrides(UserDict[type[msgspec.Struct], type[msgspec.Struct]]
         self.data[key] = item
 
     def update(self, other: Any = (), /, **kwargs: Any) -> None:
+        """Validate and add several model overrides atomically.
+
+        Args:
+            other: A mapping or iterable of generated-model and subclass pairs.
+            **kwargs: Additional pairs accepted for compatibility with ``dict``.
+
+        Raises:
+            TypeError: A key is unregistered or a value is incompatible.
+
+        Example:
+            Add overrides from a mapping:
+
+            >>> overrides = DynamicModelOverrides()
+            >>> overrides.update({Monster: AppMonster})
+            >>> overrides[Monster] is AppMonster
+            True
+        """
+
         entries: dict[Any, Any] = dict(other)
         entries.update(kwargs)
         for generated, replacement in entries.items():
@@ -56,7 +89,31 @@ class DynamicModelOverrides(UserDict[type[msgspec.Struct], type[msgspec.Struct]]
         replacement: type[_ModelT] | None = None,
         /,
     ) -> type[_ModelT] | Callable[[type[_ModelT]], type[_ModelT]]:
-        """Add an override directly or decorate its replacement class."""
+        """Add an override directly or decorate its replacement class.
+
+        Args:
+            generated: The registered generated model being replaced.
+            replacement: A compatible application subclass. When omitted, the
+                returned decorator registers the decorated class.
+
+        Returns:
+            The replacement class, or a decorator when ``replacement`` is
+            omitted.
+
+        Raises:
+            TypeError: The generated model is unregistered or the replacement
+                is incompatible.
+
+        Example:
+            Register a subclass with the decorator form:
+
+            >>> overrides = DynamicModelOverrides()
+            >>> @overrides.override(Monster)
+            ... class AppMonster(Monster):
+            ...     pass
+            >>> overrides[Monster] is AppMonster
+            True
+        """
 
         if replacement is not None:
             self[generated] = replacement
@@ -69,7 +126,23 @@ class DynamicModelOverrides(UserDict[type[msgspec.Struct], type[msgspec.Struct]]
         return register
 
     def dec_hook(self, annotation: Any, value: Any) -> Any:
-        """Decode package values using these dynamic model overrides."""
+        """Decode a value while applying these dynamic model overrides.
+
+        Args:
+            annotation: The target type requested by msgspec.
+            value: The builtin value to convert.
+
+        Returns:
+            The converted package value.
+
+        Example:
+            Pass the bound method to a msgspec decoder:
+
+            >>> decoder = msgspec.json.Decoder(
+            ...     type=Envelope, dec_hook=overrides.dec_hook
+            ... )
+            >>> envelope = decoder.decode(data)
+        """
 
         if isinstance(annotation, type) and issubclass(annotation, DynamicValue):
             return dynamic_from_builtins(

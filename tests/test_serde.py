@@ -9,8 +9,8 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
-import msgspec_flatbuffers
-from msgspec_flatbuffers import json, msgpack
+import msgspec_serde
+from msgspec_serde import json, msgpack
 
 
 class NumericModel(msgspec.Struct, kw_only=True, eq=False):
@@ -118,10 +118,10 @@ class AnyModel(msgspec.Struct):
 
 
 def test_numpy_hooks_are_not_public() -> None:
-    assert "enc_hook" not in msgspec_flatbuffers.__all__
-    assert "dec_hook" not in msgspec_flatbuffers.__all__
-    assert not hasattr(msgspec_flatbuffers, "enc_hook")
-    assert not hasattr(msgspec_flatbuffers, "dec_hook")
+    assert "enc_hook" not in msgspec_serde.__all__
+    assert "dec_hook" not in msgspec_serde.__all__
+    assert not hasattr(msgspec_serde, "enc_hook")
+    assert not hasattr(msgspec_serde, "dec_hook")
 
 
 def _numeric_model() -> NumericModel:

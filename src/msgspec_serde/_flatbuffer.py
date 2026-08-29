@@ -87,7 +87,21 @@ def _model_binding(model_type: type[msgspec.Struct]) -> _ModelBinding:
 
 
 class Encoder:
-    """Encode registered generated models as FlatBuffers."""
+    """Encode registered generated models as FlatBuffers.
+
+    Args:
+        size_prefixed: Whether to prefix each encoded buffer with its byte size.
+        initial_size: The builder's initial capacity in bytes. Use ``0`` to let
+            the native encoder choose its default.
+
+    Example:
+        Reuse an encoder for several size-prefixed messages:
+
+        >>> encoder = Encoder(size_prefixed=True, initial_size=4096)
+        >>> buffer = encoder.encode(Monster(name="Orc"))
+        >>> buffer.readonly
+        True
+    """
 
     __slots__ = ("_initial_size", "_size_prefixed")
 
@@ -101,7 +115,25 @@ class Encoder:
         self._initial_size = initial_size
 
     def encode(self, value: msgspec.Struct) -> memoryview:
-        """Encode one registered model."""
+        """Encode one registered model.
+
+        Args:
+            value: A generated model or a compatible application subclass.
+
+        Returns:
+            A read-only view of the encoded FlatBuffer bytes.
+
+        Raises:
+            TypeError: The value is not a registered compatible model.
+
+        Example:
+            Encode a generated model:
+
+            >>> encoder = Encoder()
+            >>> buffer = encoder.encode(Monster(name="Orc"))
+            >>> isinstance(buffer, memoryview)
+            True
+        """
 
         if not isinstance(value, msgspec.Struct):
             raise TypeError("FlatBuffer encoders require a msgspec.Struct model")
@@ -116,7 +148,26 @@ class Encoder:
 
 
 class Decoder:
-    """Decode FlatBuffers as a materialized model or lazy table view."""
+    """Decode FlatBuffers as a materialized model or lazy table view.
+
+    Args:
+        type: A generated model, compatible model subclass, or generated root
+            view type.
+        offset: The byte offset where the FlatBuffer begins.
+        size_prefixed: Whether the buffer begins with a size prefix.
+        check_identifier: Whether to verify a declared file identifier.
+        dynamic_overrides: Optional application subclasses for materialized
+            dynamic values. Pass overrides to ``view.to_model()`` when decoding
+            a view instead.
+
+    Example:
+        Reuse a decoder for messages of the same type:
+
+        >>> decoder = Decoder(MonsterView)
+        >>> view = decoder.decode(buffer)
+        >>> view.name
+        'Orc'
+    """
 
     __slots__ = (
         "_binding",
@@ -166,7 +217,27 @@ class Decoder:
             )
 
     def decode(self, buffer: bytes | bytearray | memoryview) -> _DecodedT:
-        """Decode one FlatBuffer."""
+        """Decode one FlatBuffer.
+
+        Args:
+            buffer: The encoded bytes.
+
+        Returns:
+            A materialized model or a lazy root view, according to the decoder's
+            target type.
+
+        Raises:
+            BufferBoundsError: The buffer is truncated.
+            InvalidBufferError: The FlatBuffer metadata or identifier is invalid.
+            TypeError: The materialized data does not match the target model.
+
+        Example:
+            Decode bytes with a reusable decoder:
+
+            >>> model = Decoder(Monster).decode(buffer)
+            >>> model.name
+            'Orc'
+        """
 
         binding = self._binding
         if binding is None:
@@ -201,7 +272,27 @@ def encode(
     size_prefixed: bool = False,
     initial_size: int = 0,
 ) -> memoryview:
-    """Encode one registered model as a FlatBuffer."""
+    """Encode one registered model as a FlatBuffer.
+
+    Args:
+        value: A generated model or a compatible application subclass.
+        size_prefixed: Whether to prefix the buffer with its byte size.
+        initial_size: The builder's initial capacity in bytes. Use ``0`` to let
+            the native encoder choose its default.
+
+    Returns:
+        A read-only view of the encoded FlatBuffer bytes.
+
+    Raises:
+        TypeError: The value is not a registered compatible model.
+
+    Example:
+        Encode a generated model:
+
+        >>> buffer = encode(Monster(name="Orc"))
+        >>> buffer.readonly
+        True
+    """
 
     return Encoder(
         size_prefixed=size_prefixed,
@@ -218,7 +309,33 @@ def decode(
     check_identifier: bool = True,
     dynamic_overrides: DynamicModelOverrides | None = None,
 ) -> _DecodedT:
-    """Decode one FlatBuffer as a materialized model or lazy view."""
+    """Decode one FlatBuffer as a materialized model or lazy view.
+
+    Args:
+        buffer: The encoded bytes.
+        type: A generated model, compatible model subclass, or generated root
+            view type.
+        offset: The byte offset where the FlatBuffer begins.
+        size_prefixed: Whether the buffer begins with a size prefix.
+        check_identifier: Whether to verify a declared file identifier.
+        dynamic_overrides: Optional application subclasses for materialized
+            dynamic values.
+
+    Returns:
+        A materialized model or lazy root view of the requested type.
+
+    Raises:
+        BufferBoundsError: The buffer is truncated.
+        InvalidBufferError: The FlatBuffer metadata or identifier is invalid.
+        TypeError: The target type is unsupported or materialization fails.
+
+    Example:
+        Open a generated lazy root view:
+
+        >>> view = decode(buffer, type=MonsterView)
+        >>> view.name
+        'Orc'
+    """
 
     return Decoder(
         type,

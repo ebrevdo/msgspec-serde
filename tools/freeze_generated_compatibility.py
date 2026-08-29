@@ -49,13 +49,13 @@ def _freeze(version: str, flatc: str) -> Path:
         raise SnapshotError(f"release snapshot already exists: {target}")
 
     # Release CI runs --check before installing the package.
-    import msgspec_flatbuffers
-    from msgspec_flatbuffers import generate
+    import msgspec_serde
+    from msgspec_serde import generate
 
-    if msgspec_flatbuffers.__version__ != version:
+    if msgspec_serde.__version__ != version:
         raise SnapshotError(
-            "installed msgspec-flatbuffers version does not match the release: "
-            f"installed={msgspec_flatbuffers.__version__}, release={version}; "
+            "installed msgspec-serde version does not match the release: "
+            f"installed={msgspec_serde.__version__}, release={version}; "
             "run uv sync"
         )
 
@@ -78,7 +78,7 @@ def _check(version: str) -> Path:
     generated_source = snapshot / "core.py"
     if not generated_source.is_file():
         raise SnapshotError(f"release snapshot is missing: {snapshot}")
-    version_marker = f"__msgspec_flatbuffers_generated_version__ = {version!r}"
+    version_marker = f"__msgspec_serde_generated_version__ = {version!r}"
     if version_marker not in generated_source.read_text(encoding="utf-8"):
         raise SnapshotError(
             f"generated version marker is missing from {generated_source}"

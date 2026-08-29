@@ -19,9 +19,9 @@ from ._runtime import TableView
 if TYPE_CHECKING:
     from ._overrides import DynamicModelOverrides
 
-_MSGSPEC_TAG_FIELD = "__msgspec_flatbuffers_type__"
+_MSGSPEC_TAG_FIELD = "__msgspec_serde_type__"
 _DYNAMIC_VALUE_FIELD = "value"
-_OPAQUE_DATA_FIELD = "__msgspec_flatbuffers_data__"
+_OPAQUE_DATA_FIELD = "__msgspec_serde_data__"
 _KNOWN_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _DYNAMIC_VALUE_FIELD))
 _OPAQUE_DYNAMIC_FIELDS = frozenset((_MSGSPEC_TAG_FIELD, _OPAQUE_DATA_FIELD))
 _ABSENT: Any = object()
@@ -30,7 +30,20 @@ _MODEL_RESOLUTION_CACHE_LIMIT = 1024
 
 @dataclass(frozen=True, slots=True)
 class DynamicType:
-    """One registered dynamic FlatBuffer root table."""
+    """Describe one registered dynamic FlatBuffer root table.
+
+    Attributes:
+        tag: The stable wire discriminator for the type.
+        model_type: The generated materialized model type.
+        view_type: The generated lazy root view type.
+
+    Example:
+        Inspect a registered type:
+
+        >>> entry = register_dynamic_type("example.Monster", Monster, MonsterView)
+        >>> entry.model_type is Monster
+        True
+    """
 
     tag: str
     model_type: type[msgspec.Struct]
@@ -38,7 +51,19 @@ class DynamicType:
 
 
 class _DynamicTypeRegistry:
-    """Thread-safe registry used by dynamic FlatBuffer fields."""
+    """Store dynamic FlatBuffer types in the process-wide registry.
+
+    Use the exported :data:`msgspec_serde.dynamic_types` instance to inspect or
+    extend the registry.
+
+    Example:
+        Look up a previously registered type:
+
+        >>> dynamic_types.register("example.Monster", Monster, MonsterView)
+        DynamicType(...)
+        >>> dynamic_types.lookup_tag("example.Monster").model_type is Monster
+        True
+    """
 
     __slots__ = (
         "_by_model",
@@ -66,7 +91,29 @@ class _DynamicTypeRegistry:
         model_type: type[msgspec.Struct],
         view_type: type[TableView],
     ) -> DynamicType:
-        """Register one dynamic type name, materialized model, and view."""
+        """Register one type tag, materialized model, and lazy view.
+
+        Args:
+            tag: The stable wire discriminator for the type.
+            model_type: The generated materialized model type.
+            view_type: The generated lazy root view type.
+
+        Returns:
+            The new or identical existing registry entry.
+
+        Raises:
+            TypeError: A model or view has the wrong base type.
+            ValueError: The tag is empty or conflicts with an existing entry.
+
+        Example:
+            Register a generated root model and view:
+
+            >>> entry = dynamic_types.register(
+            ...     "example.Monster", Monster, MonsterView
+            ... )
+            >>> entry.tag
+            'example.Monster'
+        """
 
         entry = _validated_entry(tag, model_type, view_type)
         with self._lock:
@@ -88,7 +135,26 @@ class _DynamicTypeRegistry:
         return entry
 
     def register_module(self, tag: str, module: str) -> str:
-        """Associate a trusted type tag with a lazily imported module."""
+        """Associate a trusted type tag with a lazily imported module.
+
+        Args:
+            tag: The stable wire discriminator registered by the module.
+            module: The importable module name.
+
+        Returns:
+            The registered module name.
+
+        Raises:
+            ValueError: A value is empty or the tag maps to another module.
+
+        Example:
+            Defer importing generated plugin types until they are decoded:
+
+            >>> dynamic_types.register_module(
+            ...     "plugins.weather.Report", "plugins.weather.generated"
+            ... )
+            'plugins.weather.generated'
+        """
 
         _validate_tag(tag)
         if not isinstance(module, str) or not module:
@@ -103,7 +169,24 @@ class _DynamicTypeRegistry:
         return module
 
     def lookup_tag(self, tag: str) -> DynamicType | None:
-        """Return the entry for a tag, importing its trusted module if needed."""
+        """Find a tag, importing its trusted module when necessary.
+
+        Args:
+            tag: The stable wire discriminator to find.
+
+        Returns:
+            The registered dynamic type, or ``None`` when unknown.
+
+        Raises:
+            RuntimeError: A configured module does not register the requested
+                tag when imported.
+
+        Example:
+            Check whether a dynamic type is available:
+
+            >>> dynamic_types.lookup_tag("example.Missing") is None
+            True
+        """
 
         entry = self._by_tag.get(tag)
         if entry is not None:
@@ -111,7 +194,23 @@ class _DynamicTypeRegistry:
         return self._load_tag(tag)
 
     def lookup_model(self, model_type: type[object]) -> DynamicType | None:
-        """Return the entry for a registered model or unambiguous subclass."""
+        """Find the entry for a registered model or unambiguous subclass.
+
+        Args:
+            model_type: The materialized model type to find.
+
+        Returns:
+            The matching dynamic type, or ``None`` when unknown.
+
+        Raises:
+            TypeError: The model inherits from multiple registered bases.
+
+        Example:
+            Resolve a registered model type:
+
+            >>> dynamic_types.lookup_model(Monster).tag
+            'example.Monster'
+        """
 
         entry = self._by_model.get(model_type)
         if entry is not None:
@@ -157,7 +256,23 @@ class _DynamicTypeRegistry:
 
 
 class DynamicValue:
-    """A materialized registered model or an opaque dynamic payload."""
+    """Hold a registered model or a forwardable opaque dynamic payload.
+
+    Args:
+        value: An instance of a registered generated model.
+
+    Raises:
+        TypeError: The model type has not been registered.
+
+    Example:
+        Wrap a registered model for a dynamic field:
+
+        >>> register_dynamic_type("example.Monster", Monster, MonsterView)
+        DynamicType(...)
+        >>> dynamic = DynamicValue(Monster(name="Orc"))
+        >>> dynamic.tag
+        'example.Monster'
+    """
 
     __slots__ = ("_data", "_entry", "_tag", "_value")
     _allowed_prefix: ClassVar[str | None] = None
@@ -178,7 +293,25 @@ class DynamicValue:
 
     @classmethod
     def opaque(cls, tag: str, data: bytes | bytearray | memoryview) -> Self:
-        """Create a losslessly forwardable value for an unknown type tag."""
+        """Create a forwardable value for an unknown type tag.
+
+        Args:
+            tag: The unknown wire discriminator.
+            data: The nested FlatBuffer bytes to preserve.
+
+        Returns:
+            A dynamic value that retains the tag and bytes without decoding.
+
+        Raises:
+            ValueError: The tag is empty or outside the allowed namespace.
+
+        Example:
+            Preserve a payload whose schema is not installed:
+
+            >>> value = DynamicValue.opaque("plugins.Future", b"payload")
+            >>> value.data
+            b'payload'
+        """
 
         cls._require_allowed(tag)
         value = cls.__new__(cls)
@@ -204,18 +337,54 @@ class DynamicValue:
 
     @property
     def tag(self) -> str:
+        """The stable wire discriminator.
+
+        Example:
+            Inspect a dynamic value's type tag:
+
+            >>> dynamic.tag
+            'example.Monster'
+        """
+
         return self._tag
 
     @property
     def value(self) -> msgspec.Struct | None:
+        """The materialized model, or ``None`` for an opaque payload.
+
+        Example:
+            Access a known dynamic model:
+
+            >>> dynamic.value.name
+            'Orc'
+        """
+
         return self._value
 
     @property
     def data(self) -> bytes | None:
+        """The preserved bytes, or ``None`` for a known model.
+
+        Example:
+            Access the bytes of an opaque value:
+
+            >>> DynamicValue.opaque("plugins.Future", b"payload").data
+            b'payload'
+        """
+
         return self._data
 
     @property
     def is_known(self) -> bool:
+        """Whether this value contains a registered materialized model.
+
+        Example:
+            Distinguish known values from opaque payloads:
+
+            >>> DynamicValue.opaque("plugins.Future", b"payload").is_known
+            False
+        """
+
         return self._value is not None
 
     def __eq__(self, other: object) -> bool:
@@ -233,7 +402,25 @@ class DynamicValue:
 
 
 class DynamicView:
-    """A zero-copy dynamic payload resolved through the global registry."""
+    """Resolve a nested FlatBuffer lazily through the dynamic registry.
+
+    Args:
+        tag: The nested value's wire discriminator.
+        data: A read-only view of the nested FlatBuffer bytes.
+        value_type: The dynamic value class produced by :meth:`to_model`.
+
+    Raises:
+        TypeError: ``value_type`` is invalid or ``data`` is not read-only.
+        ValueError: The tag is empty or outside the value type's namespace.
+
+    Example:
+        Create a lazy view over a nested dynamic payload:
+
+        >>> nested = memoryview(payload).toreadonly()
+        >>> view = DynamicView("example.Monster", nested)
+        >>> view.tag
+        'example.Monster'
+    """
 
     __slots__ = ("_data", "_entry", "_tag", "_value", "_value_type")
 
@@ -261,14 +448,40 @@ class DynamicView:
 
     @property
     def tag(self) -> str:
+        """The nested value's stable wire discriminator.
+
+        Example:
+            Inspect the unresolved type tag:
+
+            >>> view.tag
+            'example.Monster'
+        """
+
         return self._tag
 
     @property
     def data(self) -> memoryview:
+        """The read-only nested FlatBuffer bytes.
+
+        Example:
+            Forward the nested bytes without decoding them:
+
+            >>> send(view.data)
+        """
+
         return self._data
 
     @property
     def value(self) -> TableView | None:
+        """The resolved lazy table view, or ``None`` for an unknown tag.
+
+        Example:
+            Resolve a registered payload on first access:
+
+            >>> isinstance(view.value, MonsterView)
+            True
+        """
+
         resolved = self._resolve_view()
         if resolved is None:
             return None
@@ -276,6 +489,15 @@ class DynamicView:
 
     @property
     def is_known(self) -> bool:
+        """Whether the tag resolves to a registered dynamic type.
+
+        Example:
+            Check a tag before materializing its payload:
+
+            >>> view.is_known
+            True
+        """
+
         return self._resolve_entry() is not None
 
     def to_model(
@@ -283,6 +505,26 @@ class DynamicView:
         *,
         dynamic_overrides: DynamicModelOverrides | None = None,
     ) -> DynamicValue:
+        """Materialize the nested payload as a dynamic value.
+
+        Args:
+            dynamic_overrides: Optional generated-model to application-subclass
+                mappings used for nested dynamic values.
+
+        Returns:
+            A known dynamic model, or an opaque value when the tag is unknown.
+
+        Raises:
+            TypeError: A generated view returns a model of the wrong type.
+
+        Example:
+            Convert a lazy dynamic view into an owned model:
+
+            >>> dynamic = view.to_model()
+            >>> isinstance(dynamic.value, Monster)
+            True
+        """
+
         resolved = self._resolve_view()
         if resolved is None:
             return self._value_type.opaque(self._tag, self._data)
@@ -373,7 +615,26 @@ def dynamic_allow_prefix(pattern: str) -> str:
 
 
 def register_dynamic_module(tag: str, module: str) -> str:
-    """Register a trusted module for lazy loading of one type tag."""
+    """Register a trusted module for lazy loading of one type tag.
+
+    Args:
+        tag: The stable wire discriminator registered by the module.
+        module: The importable generated module name.
+
+    Returns:
+        The registered module name.
+
+    Raises:
+        ValueError: A value is empty or the tag maps to another module.
+
+    Example:
+        Register a generated plugin module without importing it immediately:
+
+        >>> register_dynamic_module(
+        ...     "plugins.weather.Report", "plugins.weather.generated"
+        ... )
+        'plugins.weather.generated'
+    """
 
     return dynamic_types.register_module(tag, module)
 
@@ -383,7 +644,28 @@ def register_dynamic_type(
     model_type: type[msgspec.Struct],
     view_type: type[TableView],
 ) -> DynamicType:
-    """Register a dynamic type in the process-wide registry."""
+    """Register a generated dynamic model and root view.
+
+    Args:
+        tag: The stable wire discriminator for the type.
+        model_type: The registered generated model type.
+        view_type: The matching generated root view type.
+
+    Returns:
+        The new or identical existing registry entry.
+
+    Raises:
+        TypeError: The model is not a registered FlatBuffer model or the view
+            has the wrong base type.
+        ValueError: The tag is empty or conflicts with an existing entry.
+
+    Example:
+        Register a generated root type for dynamic fields:
+
+        >>> entry = register_dynamic_type("example.Monster", Monster, MonsterView)
+        >>> entry.tag
+        'example.Monster'
+    """
 
     _model_binding(model_type)
     return dynamic_types.register(tag, model_type, view_type)

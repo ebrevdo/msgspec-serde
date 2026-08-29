@@ -4,13 +4,13 @@ These results compare single-threaded serialization APIs on the same machine.  T
 
 - Intel Core i7-8650U CPU
 - CPython 3.13.5 on Linux
-- msgspec 0.21.1, NumPy 2.5.2, Python FlatBuffers 25.12.19, `flatc` 23.5.2, msgspec-flatbuffers 0.1.0
+- msgspec 0.21.1, NumPy 2.5.2, Python FlatBuffers 25.12.19, `flatc` 23.5.2, msgspec-serde 0.1.0
 
 The measured process ran on one isolated core.
 
 msgspec_serde generated API vs. official Python FlatBuffers API
 
-![msgspec_serde generated API compared with official Python FlatBuffers](/home/eug/code/msgspec_flatbuffers/benchmarks/images/python-flatbuffers-comparison.png)
+![msgspec_serde generated API compared with official Python FlatBuffers](benchmarks/images/python-flatbuffers-comparison.png)
 
 The msgspec_serde generated API is approximately 20–22 times faster to encode and 11–13 times faster to materialize in these profiles. Selected-field access is about 1.2 times faster, while full traversal ranges from 1.5 to 2.9 times faster.
 

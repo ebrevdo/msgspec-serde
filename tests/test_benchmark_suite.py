@@ -32,7 +32,7 @@ def test_comparison_benchmark_adapters_share_semantics() -> None:
         _run_all(definitions)
 
         wire_sizes = suite.cases[0].wire_sizes
-        assert wire_sizes["msgspec_flatbuffers"] == wire_sizes["python_flatbuffers"]
+        assert wire_sizes["msgspec_serde"] == wire_sizes["python_flatbuffers"]
         assert all(size > 0 for size in wire_sizes.values())
 
         with closing(

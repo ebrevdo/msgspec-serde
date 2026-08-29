@@ -29,7 +29,7 @@ available for reading and experimentation without running `flatc`. Regenerate
 it after an intentional generator change with:
 
 ```console
-uv run msgspec-flatbuffers generate \
+uv run msgspec_flatc generate \
   examples/schema_evolution/schemas/reading_v1.fbs \
   examples/schema_evolution/schemas/reading_v2.fbs \
   -o examples/schema_evolution \

@@ -185,7 +185,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "msgspec-flatbuffers-native"
+name = "msgspec-serde-native"
 version = "0.1.0"
 dependencies = [
  "bytemuck",

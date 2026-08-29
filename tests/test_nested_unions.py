@@ -18,15 +18,15 @@ import msgspec
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     BufferBoundsError,
     GenerationError,
     InvalidBufferError,
     flatbuffer,
     generate,
 )
-from msgspec_flatbuffers import json as generated_json
-from msgspec_flatbuffers import msgpack as generated_msgpack
+from msgspec_serde import json as generated_json
+from msgspec_serde import msgpack as generated_msgpack
 
 SCHEMAS = Path(__file__).parent / "fixtures" / "nested_unions"
 PAYLOAD_SCHEMA = SCHEMAS / "payload.fbs"
@@ -628,7 +628,7 @@ def test_reserved_msgspec_tag_field_is_rejected(tmp_path: Path) -> None:
         " ".join(
             (
                 "namespace Collision;",
-                "table Root { __msgspec_flatbuffers_type__:int; }",
+                "table Root { __msgspec_serde_type__:int; }",
                 "root_type Root;",
             )
         ),

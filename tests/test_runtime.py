@@ -6,7 +6,7 @@ from threading import Barrier
 
 import pytest
 
-from msgspec_flatbuffers import BufferBoundsError, CachedVector, TableView, flatbuffer
+from msgspec_serde import BufferBoundsError, CachedVector, TableView, flatbuffer
 
 
 class ExampleView(TableView):

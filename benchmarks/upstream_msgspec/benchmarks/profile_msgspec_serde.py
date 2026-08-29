@@ -10,11 +10,11 @@ import msgspec
 import numpy as np
 import numpy.typing as npt
 
-from msgspec_flatbuffers import json as generated_json
-from msgspec_flatbuffers import msgpack as generated_msgpack
+from msgspec_serde import json as generated_json
+from msgspec_serde import msgpack as generated_msgpack
 
 from .bench_encodings import Directory as UpstreamDirectory
-from .bench_msgspec_flatbuffers import generated_adapter
+from .bench_msgspec_serde import generated_adapter
 from .generate_data import DEFAULT_VECTOR_LENGTH, make_filesystem_data
 
 DEFAULT_PROFILE_VECTOR_LENGTHS = (DEFAULT_VECTOR_LENGTH, 256)

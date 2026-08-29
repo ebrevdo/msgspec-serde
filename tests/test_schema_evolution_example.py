@@ -9,7 +9,7 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import compile_schema, flatbuffer, generate, load_bfbs
+from msgspec_serde import compile_schema, flatbuffer, generate, load_bfbs
 
 ROOT = Path(__file__).parents[1]
 EXAMPLE = ROOT / "examples" / "schema_evolution"

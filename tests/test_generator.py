@@ -15,7 +15,7 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     BaseType,
     BufferBoundsError,
     FieldDefinition,
@@ -29,9 +29,9 @@ from msgspec_flatbuffers import (
     generate,
     render_module,
 )
-from msgspec_flatbuffers import json as generated_json
-from msgspec_flatbuffers import msgpack as generated_msgpack
-from msgspec_flatbuffers.cli import main
+from msgspec_serde import json as generated_json
+from msgspec_serde import msgpack as generated_msgpack
+from msgspec_serde.cli import main
 
 FIXTURE = Path(__file__).parent / "fixtures" / "monster.fbs"
 HAS_FLATC = shutil.which("flatc") is not None

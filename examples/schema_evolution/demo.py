@@ -14,7 +14,7 @@ from schema_evolution_generated.example.evolution.reading_v2 import (
     ReadingView as ReadingViewV2,
 )
 
-from msgspec_flatbuffers import flatbuffer
+from msgspec_serde import flatbuffer
 
 
 def main() -> None:

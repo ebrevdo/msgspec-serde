@@ -42,7 +42,17 @@ _KNOWN_ADVANCED_FEATURES = (
 
 
 class InvalidSchemaError(ValueError):
-    """Raised when a binary schema is malformed or unsupported."""
+    """Report a malformed or unsupported binary FlatBuffers schema.
+
+    Example:
+        Catch invalid schema data:
+
+        >>> try:
+        ...     parse_bfbs(b"not a binary schema")
+        ... except InvalidSchemaError:
+        ...     print("invalid schema")
+        invalid schema
+    """
 
 
 def _required(value: _T | None, description: str) -> _T:
@@ -330,7 +340,26 @@ def _parse_schema(root: ReflectedSchema) -> Schema:
 
 
 def parse_bfbs(buffer: bytes | bytearray | memoryview) -> Schema:
-    """Parse a binary FlatBuffers schema into normalized msgspec models."""
+    """Parse binary FlatBuffers schema data into normalized models.
+
+    Args:
+        buffer: Bytes produced by ``flatc --schema``.
+
+    Returns:
+        The normalized reflected schema.
+
+    Raises:
+        InvalidSchemaError: The data is malformed, lacks the ``BFBS`` file
+            identifier, or uses an unsupported schema feature.
+
+    Example:
+        Parse bytes returned by :func:`compile_schema_to_bfbs`:
+
+        >>> bfbs = compile_schema_to_bfbs("schemas/monster.fbs")
+        >>> schema = parse_bfbs(bfbs)
+        >>> schema.root_table
+        'example.Monster'
+    """
 
     data = bytes(buffer)
     if not ReflectedSchema.SchemaBufferHasIdentifier(data, 0):

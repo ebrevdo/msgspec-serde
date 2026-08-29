@@ -5,10 +5,10 @@
 import flatbuffers
 from flatbuffers.compat import import_numpy
 from typing import Any
-from msgspec_flatbuffers._reflection.Enum import Enum
-from msgspec_flatbuffers._reflection.Object import Object
-from msgspec_flatbuffers._reflection.SchemaFile import SchemaFile
-from msgspec_flatbuffers._reflection.Service import Service
+from msgspec_serde._reflection.Enum import Enum
+from msgspec_serde._reflection.Object import Object
+from msgspec_serde._reflection.SchemaFile import SchemaFile
+from msgspec_serde._reflection.Service import Service
 from typing import Optional
 np = import_numpy()
 

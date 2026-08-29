@@ -299,7 +299,7 @@ struct BoundModelSubclass {
 
 type ChildTypeKey = (usize, u16, usize);
 
-#[pyclass(module = "msgspec_flatbuffers._native", frozen)]
+#[pyclass(module = "msgspec_serde._native", frozen)]
 pub struct NativeModelTypes {
     plan_identity: Arc<()>,
     root_index: usize,
@@ -399,7 +399,7 @@ struct Materializer<'plan, 'data, 'context, 'py> {
     decoded_objects: usize,
 }
 
-#[pyclass(module = "msgspec_flatbuffers._native", frozen)]
+#[pyclass(module = "msgspec_serde._native", frozen)]
 struct NativeBuffer {
     data: Vec<u8>,
     start: usize,
@@ -3105,7 +3105,7 @@ where
     array
 }
 
-#[pyclass(module = "msgspec_flatbuffers._native", frozen)]
+#[pyclass(module = "msgspec_serde._native", frozen)]
 pub struct NativePlan {
     identity: Arc<()>,
     objects: Vec<ObjectWire>,
@@ -5271,14 +5271,14 @@ impl NativePlan {
             .iter()
             .flat_map(|object| &object.fields)
             .any(|field| field.kind == FieldKind::Decimal);
-        let dynamic = data.py().import("msgspec_flatbuffers._dynamic")?;
+        let dynamic = data.py().import("msgspec_serde._dynamic")?;
         let dynamic_encoder = if has_dynamic {
             Some(dynamic.getattr("encode_dynamic")?.unbind())
         } else {
             None
         };
         let flatbuffer = if has_nested || has_dynamic {
-            Some(data.py().import("msgspec_flatbuffers._flatbuffer")?)
+            Some(data.py().import("msgspec_serde._flatbuffer")?)
         } else {
             None
         };
@@ -5313,7 +5313,7 @@ impl NativePlan {
         } else {
             None
         };
-        let runtime = data.py().import("msgspec_flatbuffers._runtime")?;
+        let runtime = data.py().import("msgspec_serde._runtime")?;
         let buffer_bounds_error = runtime
             .getattr("BufferBoundsError")?
             .cast_into::<PyType>()?

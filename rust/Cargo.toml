@@ -1,9 +1,9 @@
 [package]
-name = "msgspec-flatbuffers-native"
+name = "msgspec-serde-native"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Rust serialization backend for msgspec-flatbuffers"
+description = "Rust serialization backend for msgspec-serde"
 
 [lib]
 name = "_native"

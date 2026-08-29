@@ -61,7 +61,7 @@ RESULT_CONTEXT_KEYS = (
     "platform",
     "python_version",
     "flatc_version",
-    "msgspec_flatbuffers_version",
+    "msgspec_serde_version",
     "flatbuffers_version",
     "msgspec_version",
     "numpy_version",
@@ -490,7 +490,7 @@ def _plot_codec_comparison(
                 vector_length=vector_length,
                 protocol="flatbuffers",
             ),
-            "msgspec-flatbuffers materialized",
+            "msgspec-serde materialized",
         )
         rows = (json_row, msgpack_row, flatbuffer_row)
         labels = tuple(CODEC_COLORS)
@@ -552,7 +552,7 @@ def _plot_python_flatbuffers(
         outcomes: list[str] = []
         for profile in SCALING_PROFILES:
             try:
-                ours = by_key[(operation, profile, "msgspec_flatbuffers")]
+                ours = by_key[(operation, profile, "msgspec_serde")]
                 python = by_key[(operation, profile, "python_flatbuffers")]
             except KeyError as error:
                 raise ValueError(
@@ -646,7 +646,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="+",
         type=Path,
         required=True,
-        help="JSON-lines outputs from profile_msgspec_flatbuffers",
+        help="JSON-lines outputs from profile_msgspec_serde",
     )
     parser.add_argument(
         "--encoding-results",

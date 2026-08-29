@@ -11,9 +11,9 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-import msgspec_flatbuffers
-from msgspec_flatbuffers import flatbuffer, generate, json
-from msgspec_flatbuffers._flatbuffer import register_type
+import msgspec_serde
+from msgspec_serde import flatbuffer, generate, json
+from msgspec_serde._flatbuffer import register_type
 
 ROOT = Path(__file__).parents[1]
 COMPATIBILITY = ROOT / "tests" / "generated_compatibility"
@@ -54,7 +54,7 @@ def _major(version: str) -> int:
 
 CURRENT = GeneratedCase(
     name="current",
-    version=msgspec_flatbuffers.__version__,
+    version=msgspec_serde.__version__,
     module_path=None,
 )
 RELEASE_CASES = _release_cases()
@@ -110,7 +110,7 @@ def test_generated_public_api_contract(
     generated_case: tuple[GeneratedCase, ModuleType],
 ) -> None:
     case, generated = generated_case
-    assert generated.__msgspec_flatbuffers_generated_version__ == case.version
+    assert generated.__msgspec_serde_generated_version__ == case.version
 
     model = generated.Monster(
         pos=generated.Vec3(x=1.0, y=2.0, z=3.0),

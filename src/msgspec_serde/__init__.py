@@ -1,4 +1,28 @@
-"""Lazy FlatBuffers views and msgspec model generation."""
+"""Generate msgspec models and use them with JSON, MessagePack, or FlatBuffers.
+
+Attributes:
+    __version__: The installed package version.
+    dynamic_types: The process-wide dynamic FlatBuffer type registry.
+    warn_on_older_runtime: Whether newer same-major generated code emits a
+        compatibility warning when imported by an older runtime.
+
+Example:
+    Generate Python types from a schema, then use a generated model:
+
+    >>> from msgspec_serde import flatbuffer, generate
+    >>> generate("schemas/monster.fbs", "generated")
+    PosixPath('generated/example/monster.py')
+    >>> buffer = flatbuffer.encode(Monster(name="Orc"))
+    >>> flatbuffer.decode(buffer, type=MonsterView).name
+    'Orc'
+
+    Inspect the version or change the warning policy:
+
+    >>> import msgspec_serde
+    >>> msgspec_serde.__version__
+    '0.1.0'
+    >>> msgspec_serde.warn_on_older_runtime = False
+"""
 
 import warnings
 
@@ -54,11 +78,28 @@ from .schema import (
 
 
 class GeneratedCodeVersionError(ImportError):
-    """Raised when generated code and the runtime use different major versions."""
+    """Report incompatible generated-code and runtime major versions.
+
+    Example:
+        Catch an incompatible generated module at import time:
+
+        >>> try:
+        ...     import generated.old_model
+        ... except GeneratedCodeVersionError:
+        ...     print("regenerate the model")
+        regenerate the model
+    """
 
 
 class GeneratedCodeVersionWarning(UserWarning):
-    """Issued when generated code is newer than its same-major runtime."""
+    """Warn that generated code is newer than its same-major runtime.
+
+    Example:
+        Promote the compatibility warning to an error in tests:
+
+        >>> import warnings
+        >>> warnings.simplefilter("error", GeneratedCodeVersionWarning)
+    """
 
 
 warn_on_older_runtime = True
@@ -74,8 +115,8 @@ def _check_generated_code_version(generated_version: str) -> None:
     runtime_major, runtime_minor = _major_minor(__version__)
     if generated_major != runtime_major:
         raise GeneratedCodeVersionError(
-            "generated code from msgspec-flatbuffers "
-            f"{generated_version} cannot run with msgspec-flatbuffers "
+            "generated code from msgspec-serde "
+            f"{generated_version} cannot run with msgspec-serde "
             f"{__version__}: major versions differ"
         )
     if runtime_minor >= generated_minor or not warn_on_older_runtime:
@@ -85,7 +126,7 @@ def _check_generated_code_version(generated_version: str) -> None:
         return
     _warned_version_pairs.add(pair)
     warnings.warn(
-        "generated code was produced by msgspec-flatbuffers "
+        "generated code was produced by msgspec-serde "
         f"{generated_version}, but runtime {__version__} is older; "
         "forward compatibility is not guaranteed",
         GeneratedCodeVersionWarning,

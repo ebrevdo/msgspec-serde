@@ -5,9 +5,9 @@
 import flatbuffers
 from flatbuffers.compat import import_numpy
 from typing import Any
-from msgspec_flatbuffers._reflection.EnumVal import EnumVal
-from msgspec_flatbuffers._reflection.KeyValue import KeyValue
-from msgspec_flatbuffers._reflection.Type import Type
+from msgspec_serde._reflection.EnumVal import EnumVal
+from msgspec_serde._reflection.KeyValue import KeyValue
+from msgspec_serde._reflection.Type import Type
 from typing import Optional
 np = import_numpy()
 

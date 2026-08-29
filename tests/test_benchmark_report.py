@@ -67,7 +67,7 @@ def _encoding_rows() -> tuple[EncodingResult, ...]:
                     1_000,
                     vector_length,
                     "flatbuffers",
-                    "msgspec-flatbuffers materialized",
+                    "msgspec-serde materialized",
                     60.0 * vector_length,
                     90.0 * vector_length,
                     1_200,
@@ -86,7 +86,7 @@ def _flatbuffer_measurements() -> tuple[Measurement, ...]:
                     Measurement(
                         operation,
                         profile,
-                        "msgspec_flatbuffers",
+                        "msgspec_serde",
                         index * 100,
                         index * 1_000,
                         (index * 1e-6,),

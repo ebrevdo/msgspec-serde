@@ -1,4 +1,12 @@
-"""Invoke ``flatc`` and load its binary reflection schema."""
+"""Invoke ``flatc`` and load its binary reflection schema.
+
+Example:
+    Compile an IDL file into a normalized schema:
+
+    >>> schema = compile_schema("schemas/monster.fbs")
+    >>> schema.root_table
+    'example.Monster'
+"""
 
 from __future__ import annotations
 
@@ -16,11 +24,41 @@ type StrPath = str | os.PathLike[str]
 
 
 class FlatcNotFoundError(FileNotFoundError):
-    """Raised when the requested ``flatc`` executable is unavailable."""
+    """Report that the requested ``flatc`` executable is unavailable.
+
+    Example:
+        Catch a missing compiler separately from schema compilation failures:
+
+        >>> try:
+        ...     compile_schema("monster.fbs", flatc="missing-flatc")
+        ... except FlatcNotFoundError:
+        ...     print("install flatc")
+        install flatc
+    """
 
 
 class FlatcError(RuntimeError):
-    """Raised when ``flatc`` rejects a schema or fails to create output."""
+    """Report a failed ``flatc`` invocation.
+
+    Args:
+        command: The executed command and its arguments.
+        returncode: The process exit status.
+        stdout: Text written to standard output.
+        stderr: Text written to standard error.
+
+    Attributes:
+        command: The executed command and its arguments.
+        returncode: The process exit status.
+        stdout: Text written to standard output.
+        stderr: Text written to standard error.
+
+    Example:
+        Inspect compiler diagnostics:
+
+        >>> error = FlatcError(("flatc", "broken.fbs"), 1, "", "syntax error")
+        >>> error.returncode
+        1
+    """
 
     def __init__(
         self,
@@ -56,7 +94,32 @@ def compile_schema_to_bfbs(
     flatc: StrPath = "flatc",
     project_root: StrPath | None = None,
 ) -> bytes:
-    """Compile one FlatBuffers IDL file into its ``.bfbs`` representation."""
+    """Compile one FlatBuffers IDL file to binary schema bytes.
+
+    Args:
+        schema_path: The ``.fbs`` file to compile.
+        include_dirs: Additional directories searched for included schemas.
+        flatc: The ``flatc`` executable name or path.
+        project_root: The root used for filenames stored in the binary schema.
+            The schema's parent directory is used by default.
+
+    Returns:
+        The generated ``.bfbs`` data.
+
+    Raises:
+        FileNotFoundError: The schema file does not exist.
+        NotADirectoryError: The project root or an include path is not a
+            directory.
+        FlatcNotFoundError: The requested compiler is unavailable.
+        FlatcError: The compiler fails or does not create a binary schema.
+
+    Example:
+        Compile a schema before storing or parsing it:
+
+        >>> bfbs = compile_schema_to_bfbs("schemas/monster.fbs")
+        >>> bfbs[:4] != b""
+        True
+    """
 
     source = Path(schema_path).resolve()
     if not source.is_file():
@@ -75,7 +138,7 @@ def compile_schema_to_bfbs(
             includes.append(include)
 
     executable = _resolve_flatc(flatc)
-    with tempfile.TemporaryDirectory(prefix="msgspec-flatbuffers-") as output:
+    with tempfile.TemporaryDirectory(prefix="msgspec-serde-") as output:
         output_path = Path(output)
         command = [
             executable,
@@ -132,7 +195,34 @@ def compile_schema(
     flatc: StrPath = "flatc",
     project_root: StrPath | None = None,
 ) -> Schema:
-    """Compile FlatBuffers IDL and return its normalized reflected schema."""
+    """Compile FlatBuffers IDL and return its normalized schema.
+
+    Args:
+        schema_path: The ``.fbs`` file to compile.
+        include_dirs: Additional directories searched for included schemas.
+        flatc: The ``flatc`` executable name or path.
+        project_root: The root used for filenames stored in the binary schema.
+            The schema's parent directory is used by default.
+
+    Returns:
+        The normalized reflected schema.
+
+    Raises:
+        FileNotFoundError: The schema file does not exist.
+        NotADirectoryError: The project root or an include path is not a
+            directory.
+        FlatcNotFoundError: The requested compiler is unavailable.
+        FlatcError: The compiler fails or does not create a binary schema.
+        InvalidSchemaError: The generated binary schema is invalid or uses an
+            unsupported feature.
+
+    Example:
+        Compile a schema and inspect its root table:
+
+        >>> schema = compile_schema("schemas/monster.fbs")
+        >>> schema.root_table
+        'example.Monster'
+    """
 
     data = compile_schema_to_bfbs(
         schema_path,
@@ -144,7 +234,26 @@ def compile_schema(
 
 
 def load_bfbs(path: StrPath) -> Schema:
-    """Load a previously compiled ``.bfbs`` schema."""
+    """Load a normalized schema from a compiled ``.bfbs`` file.
+
+    Args:
+        path: The binary schema file to read.
+
+    Returns:
+        The normalized reflected schema.
+
+    Raises:
+        OSError: The file cannot be read.
+        InvalidSchemaError: The file is malformed or uses an unsupported
+            feature.
+
+    Example:
+        Load a binary schema generated by ``flatc --schema``:
+
+        >>> schema = load_bfbs("monster.bfbs")
+        >>> schema.root_table
+        'example.Monster'
+    """
 
     return parse_bfbs(Path(path).read_bytes())
 

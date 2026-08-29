@@ -7,7 +7,7 @@ import flatbuffers
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     BufferBoundsError,
     InvalidBufferError,
     TableView,

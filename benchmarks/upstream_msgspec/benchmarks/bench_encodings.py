@@ -7,7 +7,7 @@ from typing import Any, Callable, Literal
 
 import msgspec
 
-from .bench_msgspec_flatbuffers import generated_adapter
+from .bench_msgspec_serde import generated_adapter
 from .generate_data import DEFAULT_VECTOR_LENGTH, make_filesystem_data
 
 
@@ -82,7 +82,7 @@ def flatbuffers_benchmarks():
     generated = generated_adapter()
     return [
         Benchmark(
-            "msgspec-flatbuffers materialized",
+            "msgspec-serde materialized",
             generated.encode_flatbuffer,
             generated.decode_flatbuffer,
             prepare=generated.prepare,

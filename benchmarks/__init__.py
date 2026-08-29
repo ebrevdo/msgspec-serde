@@ -1,1 +1,1 @@
-"""Benchmark support for msgspec-flatbuffers."""
+"""Benchmark support for msgspec-serde."""

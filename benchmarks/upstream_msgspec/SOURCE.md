@@ -20,7 +20,7 @@ Local changes:
 - The encoding runner emits only the orjson, ormsgpack, and materialized
   FlatBuffers rows used by `benchmarks.md`.
 - `schemas/filesystem.fbs` defines the same generated filesystem model for
-  `msgspec-flatbuffers`.
+  `msgspec-serde`.
 
 The IDL numeric vectors become `np.ndarray[np.int32]` and
 `np.ndarray[np.float64]` fields in the generated models. Schema compilation,

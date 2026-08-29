@@ -38,7 +38,7 @@ from tutorial.pet_list import (  # ty: ignore[unresolved-import]
     PetListView,
 )
 
-from msgspec_flatbuffers import DynamicModelOverrides, flatbuffer, json, msgpack
+from msgspec_serde import DynamicModelOverrides, flatbuffer, json, msgpack
 
 
 class ValidatedWeapon(Weapon, dict=True):

@@ -10,12 +10,12 @@ from typing import Any
 
 import numpy as np
 
-from msgspec_flatbuffers import flatbuffer, generate
-from msgspec_flatbuffers import json as generated_json
-from msgspec_flatbuffers import msgpack as generated_msgpack
+from msgspec_serde import flatbuffer, generate
+from msgspec_serde import json as generated_json
+from msgspec_serde import msgpack as generated_msgpack
 
 SCHEMA = Path(__file__).resolve().parents[1] / "schemas" / "filesystem.fbs"
-MODULE_NAME = "_upstream_benchmark_msgspec_flatbuffers_generated"
+MODULE_NAME = "_upstream_benchmark_msgspec_serde_generated"
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -54,7 +54,7 @@ def _source_signature(value: dict[str, Any]) -> tuple[Any, ...]:
 class GeneratedAdapter:
     def __init__(self) -> None:
         self._temporary_directory = tempfile.TemporaryDirectory(
-            prefix="msgspec-flatbuffers-upstream-benchmark-"
+            prefix="msgspec-serde-upstream-benchmark-"
         )
         output = Path(self._temporary_directory.name)
         module_path = generate(SCHEMA, output, gen_onefile=True)
@@ -122,7 +122,7 @@ class GeneratedAdapter:
         for buffer, decode in round_trips:
             if self._model_signature(decode(buffer)) != expected:
                 raise AssertionError(
-                    "msgspec-flatbuffers benchmark round trip changed data"
+                    "msgspec-serde benchmark round trip changed data"
                 )
 
     def prepare(self, source: dict[str, Any]) -> Any:

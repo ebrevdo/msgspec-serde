@@ -42,7 +42,7 @@ benchmark-upstream-encodings *args:
 
 # Profile upstream Structs at 16- and 256-value vector sizes by default.
 benchmark-upstream-profile *args:
-    uv run --locked --group upstream-benchmark python -m benchmarks.run_pinned --cwd benchmarks/upstream_msgspec -- python -m benchmarks.profile_msgspec_flatbuffers {{args}}
+    uv run --locked --group upstream-benchmark python -m benchmarks.run_pinned --cwd benchmarks/upstream_msgspec -- python -m benchmarks.profile_msgspec_serde {{args}}
 
 # Freeze generated code for the current release.
 freeze-release:

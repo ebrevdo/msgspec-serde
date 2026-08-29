@@ -107,15 +107,52 @@ def _supports_fast_vector_construction(
 
 
 class BufferBoundsError(ValueError):
-    """Raised when a FlatBuffers offset points outside the backing buffer."""
+    """Report an offset or span outside a FlatBuffer's backing bytes.
+
+    Example:
+        Catch truncated buffers while opening a generated view:
+
+        >>> try:
+        ...     MonsterView(b"", 0)
+        ... except BufferBoundsError:
+        ...     print("truncated")
+        truncated
+    """
 
 
 class InvalidBufferError(ValueError):
-    """Raised when FlatBuffers metadata is structurally invalid."""
+    """Report structurally invalid FlatBuffers metadata.
+
+    Example:
+        Catch invalid input while decoding a generated root view:
+
+        >>> try:
+        ...     flatbuffer.decode(b"invalid", type=MonsterView)
+        ... except InvalidBufferError:
+        ...     print("invalid")
+        invalid
+    """
 
 
 class UnionDispatch:
-    """Validated table alternatives for one generated FlatBuffers union."""
+    """Map union discriminator values to generated table view types.
+
+    Args:
+        name: The fully qualified union name.
+        none_tag: The discriminator that represents an absent value.
+        table_types: A mapping from other discriminators to table view types.
+
+    Attributes:
+        name: The fully qualified union name.
+        none_tag: The discriminator that represents an absent value.
+
+    Example:
+        Define a dispatch table for a generated union:
+
+        >>> dispatch = UnionDispatch("example.Any", 0, {1: MonsterView})
+        >>> dispatch.none_tag
+        0
+    """
 
     __slots__ = ("_has_untrusted_types", "_table_types", "name", "none_tag")
 
@@ -155,7 +192,19 @@ class UnionDispatch:
 
 
 class OpenIntEnum(IntEnum):
-    """An integer enum that preserves values unknown to the current schema."""
+    """Preserve integer values unknown to the current enum definition.
+
+    Generated FlatBuffers enums inherit from this class so newer enum values
+    can pass through an older reader without raising ``ValueError``.
+
+    Example:
+        Create an unnamed member for an unknown value:
+
+        >>> class Color(OpenIntEnum):
+        ...     RED = 1
+        >>> Color(9).name
+        'UNKNOWN_9'
+    """
 
     @classmethod
     def _missing_(cls, value: object) -> Self | None:
@@ -238,7 +287,24 @@ def _cache_materialized_prefix(
 
 
 class CachedVector(Sequence[_T], Generic[_T]):
-    """A fixed-length vector that strongly caches every accessed element."""
+    """Cache elements loaded lazily from a fixed-length vector.
+
+    Args:
+        length: The number of elements available from the vector.
+
+    This base class is useful for custom view vectors whose ``_load`` method
+    materializes one element at a time.
+
+    Example:
+        Implement a small lazy vector:
+
+        >>> class Squares(CachedVector[int]):
+        ...     def _load(self, index: int) -> int:
+        ...         return index * index
+        >>> values = Squares(3)
+        >>> values[2]
+        4
+    """
 
     __slots__ = ("_cache", "_length")
 
@@ -353,7 +419,16 @@ class CachedVector(Sequence[_T], Generic[_T]):
 
     @property
     def cached_count(self) -> int:
-        """Number of vector elements materialized so far."""
+        """The number of vector elements materialized so far.
+
+        Example:
+            Observe the cache after reading one element:
+
+            >>> values = Squares(3)
+            >>> _ = values[1]
+            >>> values.cached_count
+            1
+        """
 
         cache = self._cache
         if type(cache) is list:
@@ -362,7 +437,28 @@ class CachedVector(Sequence[_T], Generic[_T]):
 
 
 class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
-    """Parallel discriminator/payload vectors with cached typed views."""
+    """Expose parallel union discriminator and payload vectors.
+
+    Args:
+        buffer: The FlatBuffer containing the union payload offsets.
+        types: A read-only NumPy array of union discriminators.
+        value_start: The byte offset of the first payload offset.
+        value_length: The number of payload offsets.
+        tag_unpacker: The little-endian integer unpacker for one discriminator.
+        dispatch: The union's discriminator-to-view mapping.
+
+    Generated views construct this class for vector-valued union fields.
+
+    Example:
+        Read the discriminator and resolved value at the same index:
+
+        >>> isinstance(view.entities, UnionVector)
+        True
+        >>> view.entities.types[0]
+        1
+        >>> view.entities[0]
+        MonsterView(...)
+    """
 
     __slots__ = (
         "_buffer",
@@ -531,13 +627,37 @@ class UnionVector(CachedVector[_UnionT], Generic[_UnionT]):
 
     @property
     def types(self) -> npt.NDArray[Any]:
-        """The parallel read-only discriminator array."""
+        """The parallel read-only discriminator array.
+
+        Example:
+            Inspect the discriminator for the first union value:
+
+            >>> union_values.types[0]
+            1
+        """
 
         return self._types
 
 
 class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
-    """A vector of cached, read-only table views."""
+    """Expose a vector of cached, read-only table views.
+
+    Args:
+        buffer: The FlatBuffer containing the table offsets.
+        start: The byte offset of the first table offset.
+        length: The number of table offsets.
+        view_type: The generated view type for each table.
+
+    Generated views construct this class for vectors of unkeyed tables.
+
+    Example:
+        Access a table without materializing the rest of the vector:
+
+        >>> isinstance(root.weapons, TableVector)
+        True
+        >>> root.weapons[0].name
+        'Sword'
+    """
 
     __slots__ = (
         "_buffer",
@@ -742,7 +862,27 @@ class TableVector(CachedVector[_ViewT], Generic[_ViewT]):
 
 
 class TableMap(Mapping[_KeyT, _ViewT], Generic[_KeyT, _ViewT]):
-    """A read-only keyed table vector with lazy binary-search lookup."""
+    """Expose a keyed table vector as a read-only mapping.
+
+    Args:
+        buffer: The FlatBuffer containing the sorted table offsets.
+        start: The byte offset of the first table offset.
+        length: The number of table offsets.
+        view_type: The generated view type for each table.
+        key_name: The Python property name of the FlatBuffers key field.
+        key_type: The runtime scalar name used for key comparisons.
+
+    Generated views return this mapping for vectors whose table type declares a
+    FlatBuffers key.
+
+    Example:
+        Look up a keyed table without materializing the whole vector:
+
+        >>> isinstance(root.monsters, TableMap)
+        True
+        >>> root.monsters["Orc"].name
+        'Orc'
+    """
 
     __slots__ = ("_key_name", "_round_float32_keys", "_values")
 
@@ -788,7 +928,25 @@ class TableMap(Mapping[_KeyT, _ViewT], Generic[_KeyT, _ViewT]):
 
 
 class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
-    """A vector of cached, read-only inline struct views."""
+    """Expose a vector of cached, read-only inline struct views.
+
+    Args:
+        buffer: The FlatBuffer containing the inline structs.
+        start: The byte offset of the first struct.
+        length: The number of structs.
+        stride: The byte distance between adjacent structs.
+        view_type: The generated view type for each struct.
+
+    Generated views construct this class for vectors of structs.
+
+    Example:
+        Access one struct without materializing the vector:
+
+        >>> isinstance(root.positions, StructVector)
+        True
+        >>> root.positions[0].x
+        1.0
+    """
 
     __slots__ = (
         "_buffer",
@@ -885,7 +1043,22 @@ class StructVector(CachedVector[_ViewT], Generic[_ViewT]):
 
 
 class StringVector(CachedVector[str]):
-    """A vector that decodes and strongly caches UTF-8 strings by index."""
+    """Decode and cache UTF-8 strings from a FlatBuffers vector.
+
+    Args:
+        buffer: The FlatBuffer containing the string offsets and data.
+        start: The byte offset of the first string offset.
+        length: The number of strings.
+
+    Generated views construct this class for string vectors.
+
+    Example:
+        Decode the first string on demand:
+
+        >>> data = b"\x04\x00\x00\x00\x03\x00\x00\x00abc\x00"
+        >>> StringVector(memoryview(data), 0, 1)[0]
+        'abc'
+    """
 
     __slots__ = ("_buffer", "_start")
 
@@ -945,7 +1118,22 @@ class _CachedView:
 
 
 class StructView(_CachedView):
-    """Read-only location of an inline FlatBuffers struct."""
+    """Reference an inline FlatBuffers struct without copying its fields.
+
+    Args:
+        buffer: The bytes containing the struct.
+        struct_offset: The byte offset where the struct begins.
+
+    Generated struct views subclass this class and define their encoded size and
+    field properties.
+
+    Example:
+        Construct a generated struct view at a known offset:
+
+        >>> position = PositionView(buffer, struct_offset=16)
+        >>> position.x
+        1.0
+    """
 
     __slots__ = ("_buffer", "_struct_offset")
     __flatbuffer_size__: ClassVar[int] = 0
@@ -1037,15 +1225,48 @@ class StructView(_CachedView):
 
     @property
     def buffer(self) -> memoryview:
+        """The read-only bytes used by this view.
+
+        Example:
+            Access the complete backing buffer:
+
+            >>> position.buffer.readonly
+            True
+        """
+
         return self._buffer
 
     @property
     def struct_offset(self) -> int:
+        """The byte offset where this struct begins.
+
+        Example:
+            Inspect the struct's location in the backing buffer:
+
+            >>> position.struct_offset
+            16
+        """
+
         return self._struct_offset
 
 
 class TableView(_CachedView):
-    """Read-only, cached view of a FlatBuffers table."""
+    """Reference a FlatBuffers table and cache fields as they are accessed.
+
+    Args:
+        buffer: The bytes containing the table.
+        table_offset: The byte offset where the table begins.
+
+    Generated table views subclass this class and expose typed field properties.
+    Use :mod:`msgspec_serde.flatbuffer` to open a root table.
+
+    Example:
+        Decode a generated root view:
+
+        >>> view = flatbuffer.decode(buffer, type=MonsterView)
+        >>> view.name
+        'Orc'
+    """
 
     __slots__ = (
         "_buffer",
@@ -1414,12 +1635,28 @@ class TableView(_CachedView):
 
     @property
     def buffer(self) -> memoryview:
-        """The read-only bytes used by this view."""
+        """The read-only bytes used by this view.
+
+        Example:
+            Access the complete backing buffer:
+
+            >>> view.buffer.readonly
+            True
+        """
 
         return self._buffer
 
     @property
     def table_offset(self) -> int:
+        """The byte offset where this table begins.
+
+        Example:
+            Inspect the table's location in the backing buffer:
+
+            >>> view.table_offset
+            24
+        """
+
         return self._table_offset
 
 

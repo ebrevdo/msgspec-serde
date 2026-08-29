@@ -17,8 +17,8 @@ import msgspec
 import numpy as np
 import pytest
 
-import msgspec_flatbuffers._dynamic as dynamic_module
-from msgspec_flatbuffers import (
+import msgspec_serde._dynamic as dynamic_module
+from msgspec_serde import (
     DynamicModelOverrides,
     DynamicView,
     GenerationError,
@@ -29,8 +29,8 @@ from msgspec_flatbuffers import (
     flatbuffer,
     generate,
 )
-from msgspec_flatbuffers import json as generated_json
-from msgspec_flatbuffers import msgpack as generated_msgpack
+from msgspec_serde import json as generated_json
+from msgspec_serde import msgpack as generated_msgpack
 
 SCHEMAS = Path(__file__).parent / "fixtures" / "dynamic"
 PAYLOAD_SCHEMA = SCHEMAS / "payload.fbs"
@@ -116,9 +116,9 @@ def test_known_dynamic_value_round_trips_native_codecs(
         assert restored_value.values.dtype == np.dtype(np.float32)
 
     builtins = msgspec.json.decode(generated_json.encode(model))
-    assert builtins["payload"]["__msgspec_flatbuffers_type__"] == METRIC_TAG
+    assert builtins["payload"]["__msgspec_serde_type__"] == METRIC_TAG
     disallowed = copy.deepcopy(builtins)
-    disallowed["payload"]["__msgspec_flatbuffers_type__"] = "Other.Metric"
+    disallowed["payload"]["__msgspec_serde_type__"] = "Other.Metric"
     with pytest.raises(msgspec.ValidationError, match="outside"):
         generated_json.decode(
             msgspec.json.encode(disallowed),
@@ -345,8 +345,8 @@ def test_unknown_allowed_dynamic_value_is_preserved(
     encoded = generated_json.encode(model)
     builtins = msgspec.json.decode(encoded)
     assert builtins["payload"] == {
-        "__msgspec_flatbuffers_type__": "Example.Dynamic.Future",
-        "__msgspec_flatbuffers_data__": "dW5rbm93biBwYXlsb2Fk",
+        "__msgspec_serde_type__": "Example.Dynamic.Future",
+        "__msgspec_serde_data__": "dW5rbm93biBwYXlsb2Fk",
     }
     assert generated_json.decode(encoded, type=envelope.Envelope) == model
 

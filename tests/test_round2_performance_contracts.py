@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Self, cast
 
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     BaseType,
     BufferBoundsError,
     CachedVector,

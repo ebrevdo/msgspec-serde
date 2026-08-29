@@ -7,7 +7,7 @@ import flatbuffers
 import msgspec
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     AdvancedFeature,
     BaseType,
     FlatcError,
@@ -17,7 +17,7 @@ from msgspec_flatbuffers import (
     compile_schema_to_bfbs,
     parse_bfbs,
 )
-from msgspec_flatbuffers._reflection import Schema as ReflectedSchema
+from msgspec_serde._reflection import Schema as ReflectedSchema
 
 FIXTURE = Path(__file__).parent / "fixtures" / "monster.fbs"
 HAS_FLATC = shutil.which("flatc") is not None

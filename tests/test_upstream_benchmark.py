@@ -9,9 +9,9 @@ from typing import Any
 import msgspec
 import numpy as np
 
-from benchmarks.upstream_msgspec.benchmarks import profile_msgspec_flatbuffers
-from msgspec_flatbuffers import json as native_json
-from msgspec_flatbuffers import msgpack as native_msgpack
+from benchmarks.upstream_msgspec.benchmarks import profile_msgspec_serde
+from msgspec_serde import json as native_json
+from msgspec_serde import msgpack as native_msgpack
 
 ROOT = Path(__file__).parents[1]
 VENDORED = ROOT / "benchmarks" / "upstream_msgspec" / "benchmarks"
@@ -28,10 +28,10 @@ def _load_module(name: str, path: Path) -> ModuleType:
 
 
 def test_profile_uses_written_numpy_struct_experiments() -> None:
-    source = profile_msgspec_flatbuffers.make_filesystem_data(4, vector_length=3)
-    model = profile_msgspec_flatbuffers._array_model(source)
+    source = profile_msgspec_serde.make_filesystem_data(4, vector_length=3)
+    model = profile_msgspec_serde._array_model(source)
 
-    assert profile_msgspec_flatbuffers.PROFILE_LABELS == (
+    assert profile_msgspec_serde.PROFILE_LABELS == (
         "msgspec",
         "msgspec_array_hooks",
         "msgspec_array_native",
@@ -42,28 +42,28 @@ def test_profile_uses_written_numpy_struct_experiments() -> None:
 
     codec_pairs = (
         (
-            msgspec.json.Encoder(enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook),
+            msgspec.json.Encoder(enc_hook=profile_msgspec_serde.numpy_enc_hook),
             msgspec.json.Decoder(
-                profile_msgspec_flatbuffers.ArrayDirectory,
-                dec_hook=profile_msgspec_flatbuffers.numpy_dec_hook,
+                profile_msgspec_serde.ArrayDirectory,
+                dec_hook=profile_msgspec_serde.numpy_dec_hook,
             ),
         ),
         (
             msgspec.msgpack.Encoder(
-                enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook
+                enc_hook=profile_msgspec_serde.numpy_enc_hook
             ),
             msgspec.msgpack.Decoder(
-                profile_msgspec_flatbuffers.ArrayDirectory,
-                dec_hook=profile_msgspec_flatbuffers.numpy_dec_hook,
+                profile_msgspec_serde.ArrayDirectory,
+                dec_hook=profile_msgspec_serde.numpy_dec_hook,
             ),
         ),
         (
             native_json.Encoder(),
-            native_json.Decoder(profile_msgspec_flatbuffers.ArrayDirectory),
+            native_json.Decoder(profile_msgspec_serde.ArrayDirectory),
         ),
         (
             native_msgpack.Encoder(),
-            native_msgpack.Decoder(profile_msgspec_flatbuffers.ArrayDirectory),
+            native_msgpack.Decoder(profile_msgspec_serde.ArrayDirectory),
         ),
     )
     for encoder, decoder in codec_pairs:
@@ -74,11 +74,11 @@ def test_profile_uses_written_numpy_struct_experiments() -> None:
 
     assert native_json.encode(model) == msgspec.json.encode(
         model,
-        enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook,
+        enc_hook=profile_msgspec_serde.numpy_enc_hook,
     )
     assert native_msgpack.encode(model) == msgspec.msgpack.encode(
         model,
-        enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook,
+        enc_hook=profile_msgspec_serde.numpy_enc_hook,
     )
 
 
@@ -88,8 +88,8 @@ def test_generated_upstream_benchmark_round_trips_all_codecs() -> None:
         VENDORED / "generate_data.py",
     )
     benchmark = _load_module(
-        "_test_upstream_msgspec_flatbuffers",
-        VENDORED / "bench_msgspec_flatbuffers.py",
+        "_test_upstream_msgspec_serde",
+        VENDORED / "bench_msgspec_serde.py",
     )
     adapter = benchmark.GeneratedAdapter()
     try:
@@ -105,11 +105,11 @@ def test_generated_upstream_benchmark_round_trips_all_codecs() -> None:
         msgpack_buffer = adapter.msgpack_encoder.encode(model)
         assert json_buffer == msgspec.json.encode(
             model,
-            enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook,
+            enc_hook=profile_msgspec_serde.numpy_enc_hook,
         )
         assert msgpack_buffer == msgspec.msgpack.encode(
             model,
-            enc_hook=profile_msgspec_flatbuffers.numpy_enc_hook,
+            enc_hook=profile_msgspec_serde.numpy_enc_hook,
         )
         from_json = adapter.json_decoder.decode(json_buffer)
         from_msgpack = adapter.msgpack_decoder.decode(msgpack_buffer)
@@ -134,14 +134,14 @@ def test_generated_upstream_benchmark_round_trips_all_codecs() -> None:
                 return [move_tags_last(item) for item in value]
             if not isinstance(value, dict):
                 return value
-            tag = value.get("__msgspec_flatbuffers_type__")
+            tag = value.get("__msgspec_serde_type__")
             reordered = {
                 key: move_tags_last(item)
                 for key, item in value.items()
-                if key != "__msgspec_flatbuffers_type__"
+                if key != "__msgspec_serde_type__"
             }
             if tag is not None:
-                reordered["__msgspec_flatbuffers_type__"] = tag
+                reordered["__msgspec_serde_type__"] = tag
             return reordered
 
         reordered = move_tags_last(msgspec.json.decode(json_buffer))

@@ -13,7 +13,7 @@ import msgspec
 import numpy as np
 import pytest
 
-from msgspec_flatbuffers import (
+from msgspec_serde import (
     BufferBoundsError,
     flatbuffer,
     generate,
@@ -111,7 +111,7 @@ def test_native_plan_builds_compatible_flatbuffers(tmp_path: Path) -> None:
     model_buffer = flatbuffer.encode(model)
     assert model_buffer.readonly
     assert type(model_buffer.obj).__name__ == "NativeBuffer"
-    assert type(model_buffer.obj).__module__ == "msgspec_flatbuffers._native"
+    assert type(model_buffer.obj).__module__ == "msgspec_serde._native"
     assert flatbuffer.decode(model_buffer, type=generated.BasicView).to_model() == model
 
     packed_buffer = generated._FB_NATIVE_MODULE.pack(

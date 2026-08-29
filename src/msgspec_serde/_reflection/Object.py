@@ -5,8 +5,8 @@
 import flatbuffers
 from flatbuffers.compat import import_numpy
 from typing import Any
-from msgspec_flatbuffers._reflection.Field import Field
-from msgspec_flatbuffers._reflection.KeyValue import KeyValue
+from msgspec_serde._reflection.Field import Field
+from msgspec_serde._reflection.KeyValue import KeyValue
 from typing import Optional
 np = import_numpy()
 
