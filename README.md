@@ -1,19 +1,42 @@
 # msgspec-serde
 
+On the one hand:
+
+- `msgspec.Struct` objects are extremely efficient and convenient replacements
+   for `dataclass`; and `msgspec` JSON encoders and decoders are extremely efficient.
+- FlatBuffers offer both extremely efficient representations of structured data,
+  and a declaration format that allows cross-language compatibility.
+
+On the other hand:
+* FlatBuffers' Python API has extremely inefficient ser/de and an inconvenient
+  builder pattern.
+* `msgspec` ser/de of np.arrays isn't very efficient and requires encoder/decoder
+  hooks that traverse the python/C boundary.
+
+`msgspec-serde` solves these two issues.  It merges the features of FlatBuffers with `msgspec`
+and enables efficient encoding/decoding of NumPy arrays across JSON, MessagePack, and FlatBuffers
+in one convenient package!
+
 ## Features
 
 - Generate typed `msgspec.Struct` models and lazy, buffer-backed views from
   FlatBuffers IDL.
-- Encode and decode JSON, MessagePack, and FlatBuffers through dedicated
-  `Encoder` and `Decoder` APIs.
-- Serialize NumPy numeric vectors without intermediate Python lists.
-- Support tables, structs, enums, fixed arrays, unions, keyed vectors, schema
+  - Use `msgspec_flatc` tool for generating, then subclass the `Struct` classes
+    to add standard `msgspec` validation, methods, etc.  ser/de respects subclasses.
+  - Tables with `(key)`-annotated fields are converted to dicts (msgspec) / Maps (views).
+  - Additional attributes with special handling include `(nested_flatbuffer ...)`,
+    `(dynamic_extension)`, `(dynamic_flatbuffer)`, and `(dynamic_allow)`.  See the
+    tutorial for more details.
+- FAST encoding/decoding of `msgspec.Struct` containing NumPy arrays into
+  JSON, MessagePack, and FlatBuffers through dedicated `Encoder` and `Decoder` APIs.
+- Dynamic class encoding/decoding using registries is supported using constructed
+  hook objects.
+- Supports tables, structs, enums, fixed arrays, unions, keyed vectors, schema
   includes, and typed or dynamic nested FlatBuffers.
-- Extend generated models with validated application subclasses.
 
 ## Tutorial
 
-See [tutorial.md](tutorial.md) for installation, schema generation, generated
+See [TUTORIAL.md](TUTORIAL.md) for installation, schema generation, generated
 models and views, JSON and MessagePack codecs, unions, nested FlatBuffers, and
 dynamic payloads.
 
