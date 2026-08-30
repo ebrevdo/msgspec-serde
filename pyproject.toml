@@ -1,7 +1,7 @@
 [project]
 name = "msgspec-serde"
-version = "0.1.0"
-description = "Generate lazy FlatBuffers views and msgspec models from FlatBuffers schemas"
+version = "0.1.1"
+description = "Performant serialization helpers for msgspec and flatbuffers"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "src/msgspec_serde/_reflection/LICENSE.txt"]

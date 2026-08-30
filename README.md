@@ -1,21 +1,15 @@
 # msgspec-serde
 
-On the one hand:
+`msgspec` provides fast `Struct` types and JSON and MessagePack codecs.
+FlatBuffers provides compact structured-data representations, lazy access to
+serialized data, and schemas for cross-language compatibility.
 
-- `msgspec.Struct` objects are extremely efficient and convenient replacements
-   for `dataclass`; and `msgspec` JSON encoders and decoders are extremely efficient.
-- FlatBuffers offer both extremely efficient representations of structured data,
-  and a declaration format that allows cross-language compatibility.
-
-On the other hand:
-* FlatBuffers' Python API has extremely inefficient ser/de and an inconvenient
-  builder pattern.
-* `msgspec` ser/de of np.arrays isn't very efficient and requires encoder/decoder
-  hooks that traverse the python/C boundary.
-
-`msgspec-serde` solves these two issues.  It merges the features of FlatBuffers with `msgspec`
-and enables efficient encoding/decoding of NumPy arrays across JSON, MessagePack, and FlatBuffers
-in one convenient package!
+Each library leaves a gap in Python. The official FlatBuffers Python API
+serializes and deserializes very slowly in our benchmarks, and encoding requires
+callers to assemble objects through a builder API. `msgspec` needs hooks that
+traverse NumPy arrays across the Python/C boundary. `msgspec-serde` combines
+`msgspec` models with generated FlatBuffers views and encodes NumPy arrays as
+JSON, MessagePack, or FlatBuffers through one API.
 
 ## Features
 

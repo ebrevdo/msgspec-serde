@@ -20,7 +20,7 @@ Example:
 
     >>> import msgspec_serde
     >>> msgspec_serde.__version__
-    '0.1.0'
+    '0.1.1'
     >>> msgspec_serde.warn_on_older_runtime = False
 """
 
