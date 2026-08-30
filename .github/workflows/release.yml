@@ -110,8 +110,8 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: >-
-            --release --locked --compatibility pypi --out dist -i
-            ${{ endsWith(matrix.python, 't') && 'python3.14t' || 'python' }}
+            --release --locked --compatibility pypi --out dist
+            ${{ startsWith(matrix.platform, 'linux-') && endsWith(matrix.python, 't') && format('-i python{0}', matrix.python) || '' }}
 
       - name: Smoke-test wheel
         run: >-
