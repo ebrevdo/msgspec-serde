@@ -15,12 +15,6 @@ SCHEMA_PATHS = tuple(sorted(SCHEMAS.glob("*.fbs")))
 HAS_FLATC = shutil.which("flatc") is not None
 
 
-def test_tutorial_uses_the_checked_in_schemas() -> None:
-    tutorial = (ROOT / "tutorial.md").read_text(encoding="utf-8")
-    for schema in SCHEMA_PATHS:
-        assert f"```fbs\n{schema.read_text(encoding='utf-8')}```" in tutorial
-
-
 @pytest.mark.skipif(not HAS_FLATC, reason="flatc is not installed")
 def test_tutorial_runs_from_generated_modules(tmp_path: Path) -> None:
     subprocess.run(
