@@ -109,7 +109,9 @@ jobs:
           maturin-version: v1.11.5
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --locked --compatibility pypi --out dist
+          args: >-
+            --release --locked --compatibility pypi --out dist -i
+            ${{ endsWith(matrix.python, 't') && 'python3.14t' || 'python' }}
 
       - name: Smoke-test wheel
         run: >-
