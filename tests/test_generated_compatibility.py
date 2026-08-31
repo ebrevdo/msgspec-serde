@@ -19,7 +19,12 @@ ROOT = Path(__file__).parents[1]
 COMPATIBILITY = ROOT / "tests" / "generated_compatibility"
 SCHEMA = COMPATIBILITY / "core.fbs"
 RELEASES = COMPATIBILITY / "releases"
-VERSION_PATTERN = re.compile(r"v(\d+)_(\d+)_(\d+)")
+SNAPSHOT_PATTERN = re.compile(r"v(\d+)_(\d+)")
+GENERATED_VERSION_PATTERN = re.compile(
+    r"^__msgspec_serde_generated_version__ = "
+    r"['\"]((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))['\"]$",
+    re.MULTILINE,
+)
 HAS_FLATC = shutil.which("flatc") is not None
 
 
@@ -33,15 +38,23 @@ class GeneratedCase:
 def _release_cases() -> list[GeneratedCase]:
     cases: list[GeneratedCase] = []
     for directory in RELEASES.glob("v*"):
-        match = VERSION_PATTERN.fullmatch(directory.name)
+        match = SNAPSHOT_PATTERN.fullmatch(directory.name)
         if match is None:
             continue
-        version = ".".join(match.groups())
+        module_path = directory / "core.py"
+        version_match = GENERATED_VERSION_PATTERN.search(
+            module_path.read_text(encoding="utf-8")
+        )
+        assert version_match is not None, f"generated version missing from {module_path}"
+        version = version_match.group(1)
+        assert version.split(".")[:2] == list(match.groups()), (
+            f"generated version {version} does not match snapshot {directory.name}"
+        )
         cases.append(
             GeneratedCase(
                 name=directory.name,
                 version=version,
-                module_path=directory / "core.py",
+                module_path=module_path,
             )
         )
     cases.sort(key=lambda case: tuple(int(part) for part in case.version.split(".")))

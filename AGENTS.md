@@ -13,10 +13,13 @@
 ## Releases
 
 - Set the same release version in `pyproject.toml` and `rust/Cargo.toml`.
-- Before publishing, run `just freeze-release`, review and commit the new
-  `tests/generated_compatibility/releases/vX_Y_Z/` snapshot, then run
-  `just release-check`.
-- Never regenerate or edit an older release snapshot.
+- For the first release in a new `X.Y` line, run `just freeze-release`, then
+  review and commit the new `tests/generated_compatibility/releases/vX_Y/`
+  snapshot.
+- Patch releases reuse the existing `vX_Y` snapshot. Do not add
+  patch-specific compatibility snapshots.
+- Never regenerate or edit an existing minor-line snapshot.
+- Before publishing any release, run `just release-check`.
 - Push the release commit, then create and push the `vX.Y.Z` tag. The release
   workflow validates and tests the snapshot, builds the distributions, creates
   the GitHub release, and publishes to PyPI.

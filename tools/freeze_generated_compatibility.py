@@ -1,4 +1,4 @@
-"""Freeze or validate generated-code compatibility fixtures for a release."""
+"""Freeze or validate generated-code compatibility for a minor release line."""
 
 from __future__ import annotations
 
@@ -12,10 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = ROOT / "tests" / "generated_compatibility" / "core.fbs"
 RELEASES = ROOT / "tests" / "generated_compatibility" / "releases"
 VERSION_PATTERN = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+GENERATED_VERSION_PATTERN = re.compile(
+    r"^__msgspec_serde_generated_version__ = "
+    r"['\"]((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))['\"]$",
+    re.MULTILINE,
+)
 
 
 class SnapshotError(RuntimeError):
-    """Raised when a release snapshot is missing or invalid."""
+    """Raised when a minor-line snapshot is missing or invalid."""
 
 
 def _configured_version(path: Path, section: str) -> object:
@@ -40,13 +45,19 @@ def _release_version() -> str:
 
 
 def _snapshot_path(version: str) -> Path:
-    return RELEASES / f"v{version.replace('.', '_')}"
+    major, minor, _ = version.split(".")
+    return RELEASES / f"v{major}_{minor}"
 
 
 def _freeze(version: str, flatc: str) -> Path:
+    if version.rsplit(".", 1)[1] != "0":
+        raise SnapshotError(
+            "compatibility snapshots are only created for the first release "
+            f"in a minor line: {version}"
+        )
     target = _snapshot_path(version)
     if target.exists():
-        raise SnapshotError(f"release snapshot already exists: {target}")
+        raise SnapshotError(f"minor-line snapshot already exists: {target}")
 
     # Release CI runs --check before installing the package.
     import msgspec_serde
@@ -78,22 +89,29 @@ def _check(version: str) -> Path:
     generated_source = snapshot / "core.py"
     if not generated_source.is_file():
         raise SnapshotError(f"release snapshot is missing: {snapshot}")
-    version_marker = f"__msgspec_serde_generated_version__ = {version!r}"
-    if version_marker not in generated_source.read_text(encoding="utf-8"):
+    source = generated_source.read_text(encoding="utf-8")
+    marker = GENERATED_VERSION_PATTERN.search(source)
+    if marker is None:
         raise SnapshotError(
             f"generated version marker is missing from {generated_source}"
+        )
+    generated_version = marker.group(1)
+    if _snapshot_path(generated_version) != snapshot:
+        raise SnapshotError(
+            f"generated version {generated_version} does not match "
+            f"minor-line snapshot {snapshot.name}"
         )
     return snapshot
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="freeze generated code for a release compatibility test"
+        description="freeze generated code for a minor-line compatibility test"
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="validate the committed snapshot without changing files",
+        help="validate the committed snapshot for the configured minor release line",
     )
     parser.add_argument(
         "--flatc",

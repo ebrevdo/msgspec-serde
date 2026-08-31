@@ -44,11 +44,11 @@ benchmark-upstream-encodings *args:
 benchmark-upstream-profile *args:
     uv run --locked --group upstream-benchmark python -m benchmarks.run_pinned --cwd benchmarks/upstream_msgspec -- python -m benchmarks.profile_msgspec_serde {{args}}
 
-# Freeze generated code for the current release.
+# Freeze generated code for the first release in a new minor line.
 freeze-release:
     uv run python tools/freeze_generated_compatibility.py
 
-# Validate the committed generated-code snapshot.
+# Validate the committed snapshot for the current minor release line.
 check-release:
     python tools/freeze_generated_compatibility.py --check
 
