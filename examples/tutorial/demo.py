@@ -112,6 +112,15 @@ def _monster_round_trip() -> tuple[Monster, str, str, bytes]:
     packed = msgpack.encode(monster)
     assert msgpack.decode(packed, type=Monster) == monster
 
+    for codec in (flatbuffer, json, msgpack):
+        restored = codec.decode(codec.encode(validated), type=ValidatedMonster)
+        assert isinstance(restored, ValidatedMonster)
+        assert restored == validated
+        assert restored.was_validated
+        assert restored.weapons is not None
+        assert isinstance(restored.weapons[0], ValidatedWeapon)
+        assert restored.weapons[0].was_validated
+
     return monster, view.name, weapons[0].name, encoded
 
 
