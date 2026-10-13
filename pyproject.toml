@@ -1,6 +1,6 @@
 [project]
 name = "msgspec-serde"
-version = "0.1.1"
+version = "0.1.2"
 description = "Performant serialization helpers for msgspec and flatbuffers"
 readme = "README.md"
 license = "Apache-2.0"
