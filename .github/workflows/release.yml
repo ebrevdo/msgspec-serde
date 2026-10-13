@@ -53,44 +53,39 @@ jobs:
           PY
 
   wheels:
-    name: Wheel (${{ matrix.target }}, Python ${{ matrix.python }})
+    name: Wheel (${{ matrix.platform.target }}, Python ${{ matrix.python }})
     needs: validate
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.14t"]
-        platform:
-          - linux-x86_64
-          - linux-aarch64
-          - macos-x86_64
-          - macos-aarch64
-          - windows-x86_64
-        exclude:
-          - python: "3.14t"
-            platform: windows-x86_64
-        include:
-          - platform: linux-x86_64
+        python: ["3.12", "3.14t", "3.15t"]
+        platform: &wheel-platforms
+          - name: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             manylinux: "2_17"
-          - platform: linux-aarch64
+          - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: "2_17"
-          - platform: macos-x86_64
+          - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: "off"
-          - platform: macos-aarch64
+          - name: macos-aarch64
             os: macos-15
             target: aarch64-apple-darwin
             manylinux: "off"
-          - platform: windows-x86_64
+          - &windows-platform
+            name: windows-x86_64
             os: windows-2025
             target: x86_64-pc-windows-msvc
             manylinux: "off"
+        exclude:
+          - python: "3.14t"
+            platform: *windows-platform
 
     steps:
       - name: Check out repository
@@ -106,39 +101,107 @@ jobs:
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          maturin-version: v1.11.5
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
+          maturin-version: v1.15.0
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
           args: >-
             --release --locked --compatibility pypi --out dist
-            ${{ startsWith(matrix.platform, 'linux-') && endsWith(matrix.python, 't') && format('-i python{0}', matrix.python) || '' }}
-
-      - name: Smoke-test wheel
-        run: >-
-          python -c "import glob, subprocess, sys;
-          wheel, = glob.glob('dist/*.whl');
-          subprocess.check_call([sys.executable, '-m', 'pip', 'install',
-          '--force-reinstall', wheel])"
-
-      - name: Verify free-threaded execution remains enabled
-        if: endsWith(matrix.python, 't')
-        run: >-
-          python -c "import sys; import msgspec_serde;
-          assert not sys._is_gil_enabled()"
-
-      - name: Test generated compatibility snapshots
-        run: |
-          python -m pip install "pytest>=8"
-          python -m pytest -q tests/test_generated_compatibility.py
+            ${{ startsWith(matrix.platform.name, 'linux-') && format('-i python{0}', matrix.python) || '-i python' }}
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dist-${{ matrix.target }}-${{ matrix.python }}
+          name: dist-${{ matrix.platform.target }}-${{ matrix.python }}
           path: dist/*.whl
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+
+  wheel-tests:
+    name: Test wheel (${{ matrix.platform.target }}, Python ${{ matrix.python.version }})
+    needs: wheels
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - version: "3.12"
+            wheel: "3.12"
+            tag: cp312-abi3
+          - &python-314t
+            version: "3.14t"
+            wheel: "3.14t"
+            tag: cp314-cp314t
+          - version: "3.15"
+            wheel: "3.15t"
+            tag: cp315-abi3.abi3t
+          - version: "3.15t"
+            wheel: "3.15t"
+            tag: cp315-abi3.abi3t
+        platform: *wheel-platforms
+        exclude:
+          - python: *python-314t
+            platform: *windows-platform
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python.version }}
+
+      - name: Download wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.platform.target }}-${{ matrix.python.wheel }}
+          path: dist
+
+      - name: Install wheel and test dependencies
+        env:
+          EXPECTED_WHEEL_TAG: ${{ matrix.python.tag }}
+        run: |
+          python -m pip install --upgrade "pip>=26.1"
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          wheel, = Path("dist").glob("*.whl")
+          assert f"-{os.environ['EXPECTED_WHEEL_TAG']}-" in wheel.name, wheel.name
+          subprocess.check_call([
+              sys.executable, "-m", "pip", "install", "--force-reinstall",
+              str(wheel), "pytest>=8"
+          ])
+          PY
+
+      - name: Verify GIL state
+        env:
+          PYTHON_VERSION: ${{ matrix.python.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import msgspec_serde
+
+          expected_gil = not os.environ["PYTHON_VERSION"].endswith("t")
+          gil_enabled = sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True
+          assert gil_enabled == expected_gil
+          PY
+
+      - name: Test generated compatibility snapshots
+        run: python -m pytest -q tests/test_generated_compatibility.py
 
   sdist:
     name: Source distribution
@@ -155,7 +218,7 @@ jobs:
       - name: Build source distribution
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          maturin-version: v1.11.5
+          maturin-version: v1.15.0
           command: sdist
           args: --out dist
 
@@ -171,7 +234,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     if: github.event_name == 'push'
-    needs: [wheels, sdist]
+    needs: [wheel-tests, sdist]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

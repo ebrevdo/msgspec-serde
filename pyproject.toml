@@ -9,14 +9,15 @@ requires-python = ">=3.12"
 dependencies = [
     "flatbuffers>=24.3.25",
     "msgspec>=0.19",
-    "numpy>=2",
+    "numpy>=2; python_version < '3.15'",
+    "numpy>=2.5; python_version >= '3.15'",
 ]
 
 [project.scripts]
 msgspec_flatc = "msgspec_serde.cli:main"
 
 [build-system]
-requires = ["maturin>=1.10,<2"]
+requires = ["maturin>=1.15,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -33,7 +34,7 @@ benchmark = [
     "pyperf>=2.10",
 ]
 upstream-benchmark = [
-    "orjson==3.11.4",
+    "orjson==3.11.6",
     "ormsgpack==1.11.0",
 ]
 dev = [
